@@ -1,0 +1,693 @@
+"""
+scorer.py — Step 4: Score unscored jobs using a multi-stage pipeline.
+
+Pipeline per job:
+  1. keyword_prescore()  — pure Python, no API call
+  2. score_dimensions()  — single LLM call (disqualifier check + dimension scoring merged)
+  3. compute_ats_score() — pure Python, no API call
+
+Active provider and model are set in config.yaml under the `llm` key.
+No code changes needed to switch providers.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+from collections import deque
+from typing import Any, Callable, Dict, Optional, Tuple
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from db import (
+    Job,
+    get_unscored,
+    increment_score_attempts,
+    init_db,
+    load_config,
+    rescore_reset,
+    save_score,
+    write_score_error,
+)
+from candidate_profile import build_structured_profile, confirm_profile, print_profile_summary
+
+# LlmCall type: (prompt, max_tokens) -> (response_text, tokens_used)
+LlmCall = Callable[[str, int], Tuple[str, int]]
+
+# Providers that bill per token — show real cost estimate
+_PAID_PROVIDERS = {"anthropic", "openai"}
+
+
+# Provider-specific notes shown before confirmation prompt
+_PROVIDER_NOTES: Dict[str, Any] = {
+    "gemini": lambda n: f"Free tier — 15 RPM limit (est. {n * 60 / 14 / 60:.1f} min total runtime)",
+}
+
+
+class RateLimiter:
+    """
+    Tracks requests and tokens within a rolling 60-second window, plus a
+    daily request counter. Sleeps only as long as needed to stay under
+    RPM, TPM, and RPD limits.
+    """
+
+    def __init__(self, max_rpm: int, max_tpm: int, max_rpd: Optional[int] = None) -> None:
+        self.max_rpm  = max_rpm
+        self.max_tpm  = max_tpm
+        self.max_rpd  = max_rpd
+        self.requests: deque = deque()   # timestamps of recent requests (rolling 60s)
+        self.tokens:   deque = deque()   # (timestamp, token_count) tuples (rolling 60s)
+        self.daily_requests = 0
+        self.day_start      = time.time()
+
+    def wait_if_needed(self) -> None:
+        now    = time.time()
+        window = 60.0
+
+        # Reset daily counter if more than 24 hours have passed
+        if now - self.day_start > 86400:
+            self.daily_requests = 0
+            self.day_start = now
+
+        # Hard stop on RPD — clean exit, not an error
+        if self.max_rpd and self.daily_requests >= self.max_rpd:
+            reset_in = 86400 - (now - self.day_start)
+            print(f"\n[STOP] Daily request limit reached ({self.max_rpd} RPD).")
+            print(f"       Resets in {reset_in / 3600:.1f} hours. Stopping scorer.")
+            sys.exit(0)
+
+        # Drop entries outside the rolling window
+        while self.requests and now - self.requests[0] > window:
+            self.requests.popleft()
+        while self.tokens and now - self.tokens[0][0] > window:
+            self.tokens.popleft()
+
+        rpm_wait = 0.0
+        if len(self.requests) >= self.max_rpm:
+            rpm_wait = window - (now - self.requests[0])
+
+        tpm_used = sum(t for _, t in self.tokens)
+        tpm_wait = 0.0
+        if tpm_used >= self.max_tpm:
+            tpm_wait = window - (now - self.tokens[0][0])
+
+        wait = max(rpm_wait, tpm_wait)
+        if wait > 0:
+            print(f"    [rate limit] pausing {wait:.1f}s...")
+            time.sleep(wait)
+
+    def record(self, tokens_used: int) -> None:
+        now = time.time()
+        self.requests.append(now)
+        self.tokens.append((now, tokens_used))
+        self.daily_requests += 1
+
+
+# ── LLM client factory ────────────────────────────────────────────────────────
+
+def get_llm_client(config: Dict[str, Any]) -> LlmCall:
+    """
+    Returns a callable: (prompt: str, max_tokens: int) -> str
+
+    The same interface regardless of provider — the rest of the scorer
+    never knows which backend it's talking to.
+
+    SDKs are imported lazily inside each branch so a missing SDK only
+    fails if that provider is actually selected.
+    """
+    provider    = config["llm"]["provider"]
+    models      = config["llm"]["model"]
+    temperature = config["llm"].get("temperature", 0)
+
+    if provider == "anthropic":
+        import anthropic
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("Error: ANTHROPIC_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = anthropic.Anthropic(api_key=api_key)
+
+        def call_anthropic(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+            response = client.messages.create(
+                model=models["anthropic"],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = ""
+            for block in response.content:
+                if block.type == "text":
+                    text = block.text
+                    break
+            tokens = response.usage.input_tokens + response.usage.output_tokens
+            return text, tokens
+
+        return call_anthropic
+
+    elif provider == "gemini":
+        from google import genai
+        from google.genai import types as genai_types
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            print("Error: GEMINI_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = genai.Client(api_key=api_key)
+        gemini_model = models["gemini"]
+
+        def call_gemini(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+            response = client.models.generate_content(
+                model=gemini_model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(  # type: ignore[call-arg]
+                    max_output_tokens=max_tokens,
+                    temperature=temperature,
+                ),
+            )
+            tokens = getattr(response.usage_metadata, "total_token_count", 500)
+            return response.text or "", tokens
+
+        return call_gemini
+
+    elif provider == "groq":
+        from groq import Groq
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            print("Error: GROQ_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = Groq(api_key=api_key)
+
+        def call_groq(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+            response = client.chat.completions.create(
+                model=models["groq"],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content or "", response.usage.total_tokens
+
+        return call_groq
+
+    elif provider == "openai":
+        from openai import OpenAI
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            print("Error: OPENAI_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = OpenAI(api_key=api_key)
+
+        def call_openai(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+            response = client.chat.completions.create(
+                model=models["openai"],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content or "", response.usage.total_tokens
+
+        return call_openai
+
+    else:
+        print(f"Error: unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
+        sys.exit(1)
+
+
+# ── 1. Keyword pre-score ──────────────────────────────────────────────────────
+
+def keyword_prescore(job: Job, config: Dict[str, Any]) -> float:
+    """
+    Pure Python. Fraction of desired_skills present in raw_text.
+    Returns 0.0–1.0. Below 0.15 → skip the LLM call entirely.
+    """
+    text   = job.raw_text.lower()
+    skills = config["preferences"]["desired_skills"]
+    if not skills:
+        return 0.0
+    matches = sum(1 for s in skills if s.lower() in text)
+    return matches / len(skills)
+
+
+# ── 2. Merged disqualifier + dimension scoring (single LLM call) ──────────────
+
+def _llm_call_with_retry(llm_call: LlmCall, prompt: str, max_tokens: int, retries: int = 3) -> Tuple[str, int]:
+    """Calls llm_call with exponential backoff on 429 rate-limit errors."""
+    for attempt in range(retries):
+        try:
+            return llm_call(prompt, max_tokens)
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate_limit" in msg.lower()
+            if is_rate_limit and attempt < retries - 1:
+                wait = 2 ** attempt * 10  # 10s, 20s, 40s
+                print(f"    [WARN] Rate limited. Retrying in {wait}s... (attempt {attempt + 1}/{retries})")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("unreachable")
+
+
+def score_dimensions(
+    job: Job,
+    config: Dict[str, Any],
+    llm_call: LlmCall,
+    structured_profile: Optional[Dict] = None,
+) -> dict:
+    """
+    Single LLM call that handles both disqualifier detection and dimension
+    scoring. Returns a dict with:
+      disqualified, disqualify_reason, fit_score, dimension_scores,
+      reasons, flags, one_liner.
+    """
+    prefs   = config["preferences"]
+    weights = config["scoring"]["weights"]
+    max_yoe = prefs.get("filters", {}).get("max_yoe", 5)
+
+    zeroed = {
+        "disqualified": False,
+        "disqualify_reason": "",
+        "fit_score": 0,
+        "tokens_used": 0,
+        "dimension_scores": {
+            "role_fit": 0, "stack_match": 0, "seniority": 0,
+            "location": 0, "growth": 0, "compensation": 0,
+        },
+        "reasons": [],
+        "flags": ["parse error"],
+        "one_liner": "",
+    }
+
+    if structured_profile:
+        sp = structured_profile
+        remote_str = (
+            "Remote preferred"
+            if str(sp.get("remote_preference", "True")) == "True"
+            else "Open to office"
+        )
+        profile_section = f"""Name: {sp.get("name", "")}
+Experience: {sp.get("yoe", prefs.get("yoe", 0))} years
+Core Skills: {", ".join(sp.get("core_skills", []))}
+Languages: {", ".join(sp.get("languages", []))}
+Frameworks: {", ".join(sp.get("frameworks", []))}
+Cloud/Infra: {", ".join(sp.get("cloud", []))}
+Past Roles: {", ".join(sp.get("past_roles", []))}
+Education: {sp.get("education", "")}
+Target Roles: {", ".join(sp.get("target_roles", prefs.get("titles", [])))}
+Min Salary: ${sp.get("min_salary", prefs.get("compensation", {}).get("min_salary", 0)):,}
+Location: {remote_str}
+Preferred Cities: {", ".join(sp.get("preferred_locations", []))}"""
+    else:
+        profile = config["profile"]
+        profile_section = f"""Name: {profile.get('name', '')}
+Bio: {profile.get('bio', '')}
+Resume:
+{profile.get('resume', '')}
+
+Target roles: {', '.join(prefs.get('titles', []))}
+Desired skills: {', '.join(prefs.get('desired_skills', []))}
+Years of experience: {prefs.get('yoe', 0)}
+Location preferences: remote_ok={prefs.get('location', {}).get('remote_ok', True)}, preferred={prefs.get('location', {}).get('preferred_locations', [])}
+Minimum salary: ${prefs.get('compensation', {}).get('min_salary', 0):,}"""
+
+    prompt = f"""You are an expert technical recruiter evaluating a job posting for a candidate.
+
+CANDIDATE PROFILE:
+{profile_section}
+
+--- JOB POSTING ---
+{job.raw_text}
+
+--- TASK ---
+Step 1 — Hard disqualifier check.
+Set "disqualified" to true and fill "disqualify_reason" if ANY of the following apply:
+- Requires a security clearance (TS/SCI, government clearance, etc.)
+- Explicitly requires on-site relocation with no remote option
+- Requires a master's degree or PhD as a hard requirement (not just preferred)
+- Requires more than {max_yoe} years of experience as a hard minimum
+- Is an internship or co-op position
+
+If disqualified, set all dimension scores to 0 and skip Step 2.
+
+Step 2 — Dimension scoring (only if NOT disqualified).
+Score each dimension 0–10:
+- role_fit:     How well does the job title and core responsibilities match the candidate's target roles and experience?
+- stack_match:  How well do required/preferred technologies match the candidate's skills?
+- seniority:    How well does the seniority level match the candidate's experience?
+- location:     How well does the job's location/remote policy match the candidate's preferences?
+- growth:       How strong are the growth signals? (AI-native, early-stage, interesting domain)
+- compensation: How likely is the compensation to meet or exceed the candidate's minimum salary?
+
+Scoring rules:
+- Score each dimension independently before arriving at a number. Do not let one dimension bias another.
+- Required vs preferred matters — penalize missing required skills heavily, missing preferred skills lightly.
+- A seniority mismatch on title alone is not a hard disqualifier if YOE and stack match well.
+- Compensation below the candidate's minimum is a flag, not a disqualifier — it is often negotiable.
+- You may only score based on information explicitly present in the job posting. Do not assume or invent details.
+- reasons must contain exactly 2 to 4 short strings, never more than 4. If you have more than 4, combine the least important ones.
+
+Return only valid JSON. No markdown fences. No preamble. No explanation.
+
+{{
+  "disqualified": false,
+  "disqualify_reason": "",
+  "role_fit":     0,
+  "stack_match":  0,
+  "seniority":    0,
+  "location":     0,
+  "growth":       0,
+  "compensation": 0,
+  "reasons":  ["exactly 2 to 4 short strings, never more than 4"],
+  "flags":    ["<concern>"],
+  "one_liner": "<one sentence summary of fit>"
+}}"""
+
+    try:
+        raw, tokens_used = _llm_call_with_retry(llm_call, prompt, 700)
+        raw = raw.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE)
+        dims = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"    [WARN] JSON parse failed: {e}")
+        return zeroed
+    except Exception as e:
+        print(f"    [WARN] LLM call failed: {e}")
+        raise  # re-raise so score_all_jobs can record the error
+
+    if dims.get("disqualified"):
+        reason = dims.get("disqualify_reason", "unknown disqualifier")
+        return {
+            "disqualified": True,
+            "disqualify_reason": reason,
+            "fit_score": 0,
+            "tokens_used": tokens_used,
+            "dimension_scores": {
+                "role_fit": 0, "stack_match": 0, "seniority": 0,
+                "location": 0, "growth": 0, "compensation": 0,
+            },
+            "reasons": [],
+            "flags": [f"disqualified: {reason}"],
+            "one_liner": "",
+        }
+
+    # Weighted fit score computed in Python — not by the LLM
+    try:
+        fit_score = (
+            dims["role_fit"]     * weights["role_fit"]     +
+            dims["stack_match"]  * weights["stack_match"]  +
+            dims["seniority"]    * weights["seniority"]    +
+            dims["location"]     * weights["location"]     +
+            dims["growth"]       * weights["growth"]       +
+            dims["compensation"] * weights["compensation"]
+        ) * 10
+        fit_score = min(100, round(fit_score))
+    except (KeyError, TypeError) as e:
+        print(f"    [WARN] fit score computation failed: {e}")
+        fit_score = 0
+
+    return {
+        "disqualified": False,
+        "disqualify_reason": "",
+        "fit_score": fit_score,
+        "tokens_used": tokens_used,
+        "dimension_scores": {
+            "role_fit":     dims.get("role_fit", 0),
+            "stack_match":  dims.get("stack_match", 0),
+            "seniority":    dims.get("seniority", 0),
+            "location":     dims.get("location", 0),
+            "growth":       dims.get("growth", 0),
+            "compensation": dims.get("compensation", 0),
+        },
+        "reasons":   dims.get("reasons", []),
+        "flags":     dims.get("flags", []),
+        "one_liner": dims.get("one_liner", ""),
+    }
+
+
+# ── 3. ATS score ──────────────────────────────────────────────────────────────
+
+def compute_ats_score(job: Job, config: Dict[str, Any]) -> dict:
+    """
+    Pure Python. Simulates keyword-based ATS matching.
+    Measures overlap between job description words and resume text.
+    """
+    resume_text = (config["profile"].get("resume") or "").lower()
+    job_text    = job.raw_text.lower()
+
+    stopwords = {
+        "and", "or", "the", "a", "an", "to", "of", "in",
+        "for", "with", "is", "are", "we", "you", "your",
+        "be", "as", "at", "by", "it", "its", "from", "this",
+        "that", "have", "has", "will", "can", "our", "their",
+    }
+
+    jd_words = set(re.findall(r'\b[a-z][a-z0-9+#.\-]{2,}\b', job_text))
+    jd_words -= stopwords
+
+    matched       = {w for w in jd_words if w in resume_text}
+    des_skills    = [s.lower() for s in config["preferences"].get("desired_skills", [])]
+    skill_matches = [s for s in des_skills if s in job_text and s in resume_text]
+    skill_misses  = [s for s in des_skills if s in job_text and s not in resume_text]
+
+    base_score  = len(matched) / len(jd_words) if jd_words else 0
+    skill_bonus = len(skill_matches) / len(des_skills) if des_skills else 0
+    ats_score   = min(100, int((base_score * 0.6 + skill_bonus * 0.4) * 100))
+
+    return {"ats_score": ats_score, "skill_misses": skill_misses[:5]}
+
+
+# ── 4. Single-job orchestrator ────────────────────────────────────────────────
+
+def score_job(
+    job: Job,
+    config: Dict[str, Any],
+    llm_call: LlmCall,
+    structured_profile: Optional[Dict] = None,
+) -> dict:
+    """
+    Runs the full pipeline for one job. Returns a result dict.
+    Raises on unrecoverable LLM errors (caller handles and records).
+    """
+    base = {
+        "job": job,
+        "fit_score": 0,
+        "tokens_used": 0,
+        "ats_score": 0,
+        "reasons": [],
+        "flags": [],
+        "one_liner": "",
+        "dimension_scores": {},
+        "skill_misses": [],
+    }
+
+    # Stage 1: keyword pre-score — skip LLM call if no skill overlap
+    if keyword_prescore(job, config) < 0.15:
+        base["flags"] = ["no skill overlap"]
+        return base
+
+    # Stage 2: merged disqualifier + dimension scoring (single LLM call)
+    result = score_dimensions(job, config, llm_call, structured_profile)
+    base["fit_score"]        = result["fit_score"]
+    base["tokens_used"]      = result["tokens_used"]
+    base["reasons"]          = result["reasons"]
+    base["flags"]            = result["flags"]
+    base["one_liner"]        = result["one_liner"]
+    base["dimension_scores"] = result["dimension_scores"]
+
+    # Stage 3: ATS score — pure Python, always runs
+    ats = compute_ats_score(job, config)
+    base["ats_score"]    = ats["ats_score"]
+    base["skill_misses"] = ats["skill_misses"]
+
+    return base
+
+
+# ── 5. Batch scorer ───────────────────────────────────────────────────────────
+
+def _cost_estimate(provider: str, n_jobs: int) -> str:
+    """Returns a human-readable cost estimate string."""
+    if provider in _PAID_PROVIDERS:
+        est = n_jobs * 0.005
+        return f"~${est:.2f}"
+    return "~$0.00 (free tier)"
+
+
+def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
+    """
+    Scores all eligible unscored jobs. Prompts for confirmation unless yes=True.
+    Returns results sorted by fit score descending.
+    """
+    llm_cfg  = config["llm"]
+    provider = llm_cfg["provider"]
+    model    = llm_cfg["model"][provider]
+
+    llm_call = get_llm_client(config)
+    jobs     = get_unscored()
+
+    if not jobs:
+        print("No new jobs to score.")
+        return []
+
+    rate_config = config["llm"].get("rate_limits", {}).get(provider)
+    if not rate_config:
+        print(f"[WARN] No rate limits configured for '{provider}' — using conservative defaults")
+        rate_config = {"max_rpm": 10, "max_tpm": 50_000}
+
+    cost_str = _cost_estimate(provider, len(jobs))
+    rpd      = rate_config.get("max_rpd")
+    rpd_str  = f" / {rpd:,} RPD" if rpd else ""
+    print(f"\nProvider: {provider} ({model})")
+    print(f"Rate limits: {rate_config['max_rpm']} RPM / {rate_config['max_tpm']:,} TPM{rpd_str}")
+    if rpd:
+        print(f"Daily budget: {rpd:,} requests (resets midnight PT)")
+    print(f"Jobs to score: {len(jobs)}")
+    print(f"Estimated cost: {cost_str}")
+    if provider in _PROVIDER_NOTES:
+        print(f"Note: {_PROVIDER_NOTES[provider](len(jobs))}")
+
+    limiter = RateLimiter(
+        max_rpm=rate_config["max_rpm"],
+        max_tpm=rate_config["max_tpm"],
+        max_rpd=rate_config.get("max_rpd"),
+    )
+
+    # Build structured profile once — counts as 1 API call toward rate limiter
+    print("\nBuilding structured profile from resume...")
+    structured_profile = build_structured_profile(config, llm_call)
+    limiter.record(600)
+    print_profile_summary(structured_profile)
+    print(f"✓ Profile: {structured_profile.get('name')} | "
+          f"{structured_profile.get('yoe')}yr | "
+          f"{len(structured_profile.get('core_skills', []))} skills extracted")
+
+    if not yes:
+        if not confirm_profile():
+            print("Update your resume PDF or bio in config.yaml and re-run.")
+            sys.exit(0)
+
+    print("\nNote: If you had previously scored jobs, run: python scorer.py --rescore")
+    print("      to clear old scores and re-score with the updated profile and salary.\n")
+
+    if not yes:
+        try:
+            confirm = input("Proceed with scoring? [y/n]: ").strip().lower()
+        except EOFError:
+            confirm = "y"  # non-interactive context — proceed automatically
+        if confirm != "y":
+            print("Aborted.")
+            return []
+
+    results = []
+    print()
+
+    for i, job in enumerate(jobs, 1):
+        limiter.wait_if_needed()
+        print(f"[{i}/{len(jobs)}] Scoring: {job.company} — {job.title}")
+
+        increment_score_attempts(job.id)
+
+        try:
+            result = score_job(job, config, llm_call, structured_profile)
+            limiter.record(result.get("tokens_used", 500))
+
+            dims = result["dimension_scores"]
+            save_score(
+                job_id=job.id,
+                fit_score=result["fit_score"],
+                role_fit=dims.get("role_fit", 0),
+                stack_match=dims.get("stack_match", 0),
+                seniority=dims.get("seniority", 0),
+                loc_score=dims.get("location", 0),
+                growth=dims.get("growth", 0),
+                compensation=dims.get("compensation", 0),
+                reasons=json.dumps(result["reasons"]),
+                flags=json.dumps(result["flags"]),
+                skill_misses=json.dumps(result["skill_misses"]),
+                one_liner=result["one_liner"],
+                ats_score=result["ats_score"],
+            )
+
+            results.append(result)
+            liner = result["one_liner"][:60] if result["one_liner"] else "(skipped)"
+            print(f"    fit={result['fit_score']}  ats={result['ats_score']}  {liner}")
+
+        except Exception as e:
+            write_score_error(job.id, str(e))
+            limiter.record(500)  # count failed attempts toward rate limit
+            print(f"    [ERROR] {e}")
+
+    scored = [r for r in results if r["fit_score"] > 0]
+    if scored:
+        avg_fit = sum(r["fit_score"] for r in scored) / len(scored)
+        avg_ats = sum(r["ats_score"] for r in scored) / len(scored)
+        print(f"\nDone. {len(scored)}/{len(jobs)} scored  |  avg fit={avg_fit:.0f}  avg ats={avg_ats:.0f}")
+
+    return sorted(results, key=lambda r: r["fit_score"], reverse=True)
+
+
+# ── 6. Display ────────────────────────────────────────────────────────────────
+
+def _score_bar(score: int, width: int = 14) -> str:
+    filled = round(score / 100 * width)
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def print_results(results: list, config: Dict[str, Any]):
+    """Print ranked job results to terminal."""
+    min_score = config["scoring"].get("min_display_score", 60)
+    visible   = [r for r in results if r["fit_score"] >= min_score]
+
+    if not visible:
+        print(f"\nNo jobs scored above {min_score}. Lower min_display_score in config.yaml to see more.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  TOP JOBS  (showing {len(visible)} above score {min_score})")
+    print(f"{'='*60}\n")
+
+    for r in visible:
+        job = r["job"]
+        fit = r["fit_score"]
+        ats = r["ats_score"]
+
+        if fit >= 85:
+            dot = "\U0001f7e2"
+        elif fit >= 70:
+            dot = "\U0001f7e1"
+        elif fit >= 55:
+            dot = "\U0001f7e0"
+        else:
+            dot = "\U0001f534"
+
+        print(f"{dot} {job.title} \u2014 {job.company} ({job.location})")
+        print(f"   Fit: {fit}/100  {_score_bar(fit)}  |  ATS: {ats}/100  {_score_bar(ats)}")
+
+        if r["one_liner"]:
+            print(f"   \u2192 {r['one_liner']}")
+
+        if r["reasons"]:
+            print(f"   \u2713 " + " \u00b7 ".join(r["reasons"]))
+
+        if r["flags"]:
+            print(f"   \u26a0 " + " \u00b7 ".join(r["flags"]))
+
+        if r["skill_misses"]:
+            misses = ", ".join(f'"{s}"' for s in r["skill_misses"])
+            print(f"   \u2717 Missing from resume: {misses}")
+
+        print(f"   {job.url}")
+        print()
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if "--rescore" in sys.argv:
+        print("--rescore: clearing scores table and resetting score_attempts...")
+        rescore_reset()
+
+    config = load_config()
+    init_db()
+    results = score_all_jobs(config, yes="--yes" in sys.argv)
+    print_results(results, config)

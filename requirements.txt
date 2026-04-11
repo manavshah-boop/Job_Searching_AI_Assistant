@@ -1,0 +1,21 @@
+# Install all: pip install -r requirements.txt
+# Or install only what you need for your current provider
+
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# step 2 — scraper
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+
+# step 3 — resume
+pdfplumber>=0.11.0
+
+# step 4 — scorer: install only the SDK for your active provider
+# anthropic>=0.40.0                # provider: "anthropic"
+# google-generativeai>=0.8.0    # provider: "gemini"   — pip install google-generativeai
+groq>=0.9.0                   # provider: "groq"     — pip install groq
+# openai>=1.50.0                # provider: "openai"   — pip install openai
+
+# step 6 — GUI config editor
+streamlit>=1.28.0

@@ -1,0 +1,133 @@
+llm:
+  provider: "groq"        # options: "anthropic", "gemini", "groq", "openai"
+  model:
+    anthropic:        "claude-sonnet-4-20250514"
+    gemini:           "gemini-2.5-flash"
+    groq_production:  "meta-llama/llama-4-scout-17b-16e-instruct"
+    groq_testing:     "llama-3.1-8b-instant"
+    groq_balanced:    "llama-3.3-70b-versatile"
+    groq:             "meta-llama/llama-4-scout-17b-16e-instruct"  # active default
+    openai:           "gpt-4o-mini"
+  temperature: 0            # 0 for deterministic, consistent scoring
+  rate_limits:
+    anthropic:
+      max_rpm: 50
+      max_tpm: 9000000
+    gemini:
+      max_rpm: 9        # buffer under 10 RPM for gemini-2.5-flash
+      max_tpm: 240000   # buffer under 250K TPM
+      max_rpd: 250
+    groq_production:    # llama-4-scout
+      max_rpm: 28
+      max_tpm: 28000
+      max_rpd: 950
+    groq_testing:       # llama-3.1-8b
+      max_rpm: 28
+      max_tpm: 5500
+      max_rpd: 14000
+    groq_balanced:      # llama-3.3-70b
+      max_rpm: 28
+      max_tpm: 11000
+      max_rpd: 950
+    groq:               # alias — matches active default (llama-4-scout)
+      max_rpm: 28
+      max_tpm: 28000
+      max_rpd: 950
+    openai:
+      max_rpm: 50
+      max_tpm: 9000000
+
+profile:
+  name: Manav Shah
+  resume_file: C:\Users\Manav Shah\Documents\Job_Searching_AI_Assistant\resume.pdf
+  bio: Software Engineer specializing in cloud-native, AI-integrated backend systems
+    and data pipelines, with experience across medical devices, machine learning,
+    and simulation platforms. Proven ability to design scalable systems, improve reliability,
+    and integrate ML models into production workflows to drive real-world decision
+    making.
+  resume: null
+preferences:
+  titles:
+  - Software Engineer
+  - Software Developer
+  - Software Development Engineer
+  - SDE
+  - SWE
+  - Backend Engineer
+  - AI Engineer
+  desired_skills:
+  - Python
+  - ML Infrastructure
+  - LLM
+  - backend
+  - AWS
+  hard_no_keywords:
+  - security clearance required
+  - 5+ years of experience
+  - internship   # blocks "internship" in job descriptions
+  - intern       # blocks "intern" as a standalone word (not "internal")
+  location:
+    remote_ok: true
+    preferred_locations:
+    - Seattle, WA
+    - Washington
+    - New York
+    - California
+  compensation:
+    min_salary: 130000
+  yoe: 3
+  filters:
+    countries_allowed:
+      - "United States"
+      - "US"
+      - "USA"
+      - "Remote"        # remote is assumed US-eligible
+    min_yoe: 0          # 0 means entry level is fine
+    max_yoe: 5          # skip anything requiring more than this
+    require_degree_filter: true  # skip jobs that require a master's or PhD
+    title_blocklist:    # skip if job title contains any of these (word-boundary matched)
+      - "Staff"
+      - "Principal"
+      - "VP"
+      - "Director"
+      - "Head of"
+      - "Manager"
+      - "Lead"
+      - "Executive"
+      - "Intern"      # catches "Software Intern", "ML Intern" (not "Internal Platform")
+
+sources:
+  greenhouse:
+    enabled: true
+    # Priority companies — always scraped first regardless of TheirStack discovery
+    # Get slugs from company career pages (boards-api.greenhouse.io/v1/boards/<slug>/jobs)
+    companies:
+      - anthropic      # Anthropic
+      - stripe         # Stripe
+      - figma          # Figma
+      - databricks     # Databricks
+  lever:
+    enabled: true
+    # Priority companies — always scraped first regardless of TheirStack discovery
+    # Slugs from api.lever.co/v0/postings/<slug>?mode=json
+    companies:
+      - stripe
+      - linear
+      - vercel
+      - notion
+      - retool
+      - figma
+      - rippling
+      - brex
+      - ramp
+      - scale
+
+scoring:
+  min_display_score: 60
+  weights:
+    role_fit:     0.30
+    stack_match:  0.25
+    seniority:    0.20
+    location:     0.10
+    growth:       0.10
+    compensation: 0.05

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python test_filters.py)",
+      "Bash(.venv/Scripts/python -c ':*)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(python scorer.py)",
+      "Bash(pip install:*)",
+      "Bash(python scraper.py)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(python -c \"import scorer; print\\('OK'\\)\")"
+    ]
+  }
+}
