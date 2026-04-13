@@ -38,7 +38,7 @@ llm:
       max_tpm: 9000000
 profile:
   name: Manav Shah
-  resume_file: C:\Users\Manav Shah\Documents\Job_Searching_AI_Assistant\resume.pdf
+  resume_file: /home/ubuntu/job-agent/profiles/manav_shah1/resume.pdf
   bio: Software Engineer specializing in cloud-native, AI-integrated backend systems
     and data pipelines, with experience across medical devices, machine learning,
     and simulation platforms. Proven ability to design scalable systems, improve reliability,
@@ -56,10 +56,34 @@ preferences:
   - AI Engineer
   desired_skills:
   - Python
-  - ML Infrastructure
-  - LLM
-  - backend
+  - Machine learning infrastructure
+  - LLM systems
+  - Backend development
+  - REST APIs
+  - API design
+  - Microservices
+  - Authentication and authorization
+  - Database design
+  - SQL
+  - PostgreSQL
+  - MySQL
+  - Redis
+  - Data modeling
+  - Query optimization
   - AWS
+  - Cloud architecture
+  - Scalability design
+  - System design
+  - Distributed systems
+  - Docker
+  - CI/CD pipelines
+  - Git version control
+  - Logging and monitoring
+  - Data pipelines
+  - Model evaluation
+  - Problem solving
+  - Data structures and algorithms
+  - Object oriented programming
   hard_no_keywords:
   - security clearance required
   - 5+ years of experience

@@ -32,6 +32,15 @@ from onboarding import render_onboarding
 from scraper import scrape_greenhouse, scrape_lever, scrape_hn
 from scorer import score_all_jobs
 from theirstack import get_or_discover_slugs
+from progress_tracker import ProgressTracker, Stage, StageStatus, ActivityType
+from dashboard_ui import (
+    render_progress_header,
+    render_pipeline_stages,
+    render_source_progress,
+    render_activity_feed,
+    render_summary,
+    render_debug_logs,
+)
 
 _BASE_DIR     = Path(__file__).parent
 _PROFILES_DIR = _BASE_DIR / "profiles"
@@ -208,57 +217,137 @@ def _results_to_df(results: list) -> pd.DataFrame:
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
-def _run_pipeline(config: dict, slug: str) -> dict:
+def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
     """
     Run the full scrape + score pipeline for a profile.
-    Writes progress messages via st.write (visible in the spinner container).
-    Returns a summary dict; catches SystemExit from the daily rate limiter.
+    
+    Uses a ProgressTracker to emit user-friendly events instead of raw logs.
+    Returns (summary_dict, tracker) where tracker contains all progress events.
+    Catches SystemExit from the daily rate limiter.
     """
-    sources   = config.get("sources", {})
+    tracker = ProgressTracker()
+    sources = config.get("sources", {})
     total_new = 0
 
     gh_enabled = sources.get("greenhouse", {}).get("enabled", True)
-    lv_enabled = sources.get("lever",      {}).get("enabled", True)
-    hn_enabled = sources.get("hn",         {}).get("enabled", True)
+    lv_enabled = sources.get("lever", {}).get("enabled", True)
+    hn_enabled = sources.get("hn", {}).get("enabled", True)
 
-    if gh_enabled or lv_enabled:
-        st.write("Discovering company slugs…")
-        slug_map = get_or_discover_slugs(config, profile=slug)
-    else:
-        slug_map = {"greenhouse": [], "lever": []}
-
-    if gh_enabled:
-        st.write("Scraping Greenhouse…")
-        r = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=slug)
-        total_new += r.get("new_jobs_saved", 0)
-
-    if lv_enabled:
-        st.write("Scraping Lever…")
-        r = scrape_lever(config, slugs=slug_map["lever"], profile=slug)
-        total_new += r.get("new_jobs_saved", 0)
-
-    if hn_enabled:
-        st.write("Scraping HN Who's Hiring…")
-        r = scrape_hn(config, profile=slug)
-        total_new += r.get("new_jobs_saved", 0)
-
-    st.write("Scoring new jobs…")
     try:
-        scored = score_all_jobs(config, yes=True, profile=slug)
-    except SystemExit:
-        # scorer calls sys.exit(0) when daily RPD limit is hit — catch it here
-        # so the Streamlit server doesn't die
-        scored = []
-        st.warning("Daily rate limit reached — scoring stopped early.")
+        # Stage 1: Discovery
+        tracker.start_stage(Stage.DISCOVERING)
+        if gh_enabled or lv_enabled:
+            tracker.add_activity_log("Discovering company slugs from TheirStack…")
+            slug_map = get_or_discover_slugs(config, profile=slug)
+            tracker.stages[Stage.DISCOVERING].metrics = {
+                "companies": len(slug_map.get("greenhouse", [])) + len(slug_map.get("lever", []))
+            }
+            tracker.add_activity_log(
+                f"Found {len(slug_map.get('greenhouse', []))} Greenhouse + {len(slug_map.get('lever', []))} Lever companies"
+            )
+        else:
+            slug_map = {"greenhouse": [], "lever": []}
+        tracker.complete_stage(Stage.DISCOVERING)
 
-    scored_ok  = [r for r in scored if r.get("fit_score", 0) > 0]
-    avg_fit    = round(sum(r["fit_score"] for r in scored_ok) / len(scored_ok), 1) if scored_ok else 0.0
+        # Stage 2: Fetching
+        tracker.start_stage(Stage.FETCHING)
+        tracker.stages[Stage.FETCHING].metrics = {
+            "sources_active": sum(
+                [gh_enabled, lv_enabled, hn_enabled]
+            )
+        }
+        tracker.complete_stage(Stage.FETCHING)
 
-    return {
-        "total_new":    total_new,
-        "scored_count": len(scored_ok),
-        "avg_fit":      avg_fit,
-    }
+        # Stage 3: Scraping
+        tracker.start_stage(Stage.SCRAPING)
+        
+        if gh_enabled:
+            tracker.start_source("Greenhouse")
+            tracker.register_source(
+                "Greenhouse",
+                len(slug_map.get("greenhouse", []))
+            )
+            r = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=slug)
+            jobs_found = r.get("new_jobs_saved", 0)
+            tracker.complete_source("Greenhouse", jobs_found)
+            total_new += jobs_found
+
+        if lv_enabled:
+            tracker.start_source("Lever")
+            tracker.register_source(
+                "Lever",
+                len(slug_map.get("lever", []))
+            )
+            r = scrape_lever(config, slugs=slug_map["lever"], profile=slug)
+            jobs_found = r.get("new_jobs_saved", 0)
+            tracker.complete_source("Lever", jobs_found)
+            total_new += jobs_found
+
+        if hn_enabled:
+            tracker.start_source("HN Who's Hiring")
+            tracker.register_source("HN Who's Hiring", 1)
+            r = scrape_hn(config, profile=slug)
+            jobs_found = r.get("new_jobs_saved", 0)
+            tracker.complete_source("HN Who's Hiring", jobs_found)
+            total_new += jobs_found
+
+        tracker.stages[Stage.SCRAPING].metrics = {"jobs_found": total_new}
+        tracker.complete_stage(Stage.SCRAPING)
+
+        # Stage 4: Scoring
+        tracker.start_stage(Stage.SCORING)
+        tracker.add_activity_log("Beginning LLM scoring and filtering…")
+        
+        try:
+            scored = score_all_jobs(config, yes=True, profile=slug)
+            tracker.add_activity_log(f"Scored {len(scored)} jobs")
+        except SystemExit:
+            # scorer calls sys.exit(0) when daily RPD limit is hit
+            scored = []
+            tracker.add_warning("Daily rate limit reached — scoring stopped early")
+            tracker.fail_stage(Stage.SCORING, "Daily rate limit hit")
+            return {
+                "total_new": total_new,
+                "scored_count": 0,
+                "avg_fit": 0.0,
+                "error": "Daily rate limit reached",
+            }, tracker
+
+        scored_ok = [r for r in scored if r.get("fit_score", 0) > 0]
+        avg_fit = (
+            round(sum(r["fit_score"] for r in scored_ok) / len(scored_ok), 1)
+            if scored_ok
+            else 0.0
+        )
+        
+        tracker.stages[Stage.SCORING].metrics = {
+            "jobs_scored": len(scored_ok),
+            "avg_fit": avg_fit,
+        }
+        tracker.add_activity_log(
+            f"Scoring complete: {len(scored_ok)} jobs with avg fit {avg_fit}/10"
+        )
+        tracker.complete_stage(Stage.SCORING)
+
+        # Stage 5: Finalizing
+        tracker.start_stage(Stage.FINALIZING)
+        tracker.add_activity_log("Finalizing results…")
+        tracker.complete_stage(Stage.FINALIZING)
+
+        return {
+            "total_new": total_new,
+            "scored_count": len(scored_ok),
+            "avg_fit": avg_fit,
+        }, tracker
+
+    except Exception as e:
+        tracker.add_error(f"Pipeline failed: {str(e)}")
+        return {
+            "error": str(e),
+            "total_new": total_new,
+            "scored_count": 0,
+            "avg_fit": 0.0,
+        }, tracker
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -896,13 +985,61 @@ def _render_profile_dashboard(slug: str) -> None:
             st.rerun()
             return
 
-        st.subheader("Running job search…")
-        with st.spinner("Scraping and scoring — this may take a few minutes…"):
-            result = _run_pipeline(config, slug)
+        # NEW: Modern progress dashboard
+        st.title("🚀 Job Search in Progress")
+        progress_placeholder = st.empty()
+        stages_placeholder = st.empty()
+        sources_placeholder = st.empty()
+        activities_placeholder = st.empty()
+
+        # Run pipeline with progress tracking
+        with st.spinner("Running…"):
+            result, tracker = _run_pipeline(config, slug)
+
+        # Display final result
+        progress_placeholder.empty()
+        stages_placeholder.empty()
+        sources_placeholder.empty()
+        activities_placeholder.empty()
+
+        # Show final state
+        with progress_placeholder.container():
+            render_progress_header(tracker)
+
+        with stages_placeholder.container():
+            render_pipeline_stages(tracker)
+
+        if tracker.sources:
+            with sources_placeholder.container():
+                render_source_progress(tracker)
+
+        with activities_placeholder.container():
+            render_activity_feed(tracker)
+
+        # Summary
+        render_summary(tracker)
+
+        # Debug logs
+        render_debug_logs(tracker)
+
+        # Results
+        st.divider()
+        st.subheader("Results")
+        if "error" in result:
+            st.error(f"Error: {result['error']}")
+        else:
+            st.success(
+                f"✅ Pipeline complete: Found **{result['total_new']}** new jobs, "
+                f"scored **{result['scored_count']}** with avg fit **{result['avg_fit']}/10**"
+            )
 
         st.session_state.pipeline_running = False
-        st.session_state.pipeline_result  = result
-        st.rerun()
+        st.session_state.pipeline_result = result
+
+        # Button to return to main dashboard
+        if st.button("← Return to Dashboard"):
+            st.rerun()
+        
         return
 
     # ── Normal render ─────────────────────────────────────────────────────────
