@@ -3,6 +3,12 @@ db.py — SQLite setup, job helpers, and configuration loader.
 
 This is the only place that touches the database.
 All other files import load_config and DB helpers from here.
+
+Profile support:
+  Call set_active_profile("manav") at startup to scope all DB operations to
+  profiles/manav/jobs.db. With no active profile, falls back to root jobs.db.
+  Every public function also accepts an explicit profile= kwarg for one-off
+  overrides (e.g. onboarding creating a new profile's DB).
 """
 
 import json
@@ -14,7 +20,25 @@ from typing import Any, Dict, Optional
 # Re-export load_config so every file imports from one place.
 from config import load_config  # noqa: F401
 
-DB_PATH = Path(__file__).parent / "jobs.db"
+_PROFILES_DIR = Path(__file__).parent / "profiles"
+_ACTIVE_PROFILE: Optional[str] = None
+
+
+def set_active_profile(profile: Optional[str]) -> None:
+    """Set the module-level active profile for all subsequent DB operations."""
+    global _ACTIVE_PROFILE
+    _ACTIVE_PROFILE = profile
+
+
+def get_db_path(profile: Optional[str] = None) -> Path:
+    """
+    Returns the DB path for the given profile.
+    Resolution order: explicit arg → _ACTIVE_PROFILE → root jobs.db
+    """
+    resolved = profile or _ACTIVE_PROFILE
+    if resolved:
+        return _PROFILES_DIR / resolved / "jobs.db"
+    return Path(__file__).parent / "jobs.db"
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -26,8 +50,8 @@ class Job:
     company: str
     location: str
     url: str
-    raw_text: str        # full text sent to Claude for scoring
-    source: str          # "greenhouse" | "hackernews"
+    raw_text: str        # full text sent to LLM for scoring
+    source: str          # "greenhouse" | "lever" | "hackernews"
     score_attempts: int = 0
     score_error: Optional[str] = None
     status: str = "new"  # new | applied | skipped
@@ -40,14 +64,13 @@ def make_id(source: str, source_id: str) -> str:
 
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
-def migrate_db():
+def _migrate_db(db_path: Path) -> None:
     """
     Safe, idempotent schema migrations. Adds new columns/tables if missing.
     Run automatically inside init_db().
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
 
-    # Add score_attempts and score_error to jobs table
     for col, col_type in [
         ("score_attempts", "INTEGER DEFAULT 0"),
         ("score_error",    "TEXT"),
@@ -58,7 +81,6 @@ def migrate_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
-    # Create scores table (separate from jobs)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scores (
             job_id       TEXT PRIMARY KEY REFERENCES jobs(id),
@@ -81,9 +103,15 @@ def migrate_db():
     conn.close()
 
 
-def init_db():
-    """Creates the jobs table if it doesn't exist. Safe to call on every run."""
-    conn = sqlite3.connect(DB_PATH)
+def init_db(profile: Optional[str] = None) -> None:
+    """
+    Creates the jobs table if it doesn't exist. Safe to call on every run.
+    Creates the profile folder if it doesn't already exist.
+    """
+    db_path = get_db_path(profile)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id             TEXT PRIMARY KEY,
@@ -101,17 +129,17 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    migrate_db()
+    _migrate_db(db_path)
 
 
 # ── Write operations ──────────────────────────────────────────────────────────
 
-def insert_job(job: Job) -> bool:
+def insert_job(job: Job, profile: Optional[str] = None) -> bool:
     """
     Inserts a job. Returns True if new, False if already in DB.
     Dedup is enforced via PRIMARY KEY.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     try:
         conn.execute("""
             INSERT INTO jobs (id, title, company, location, url, raw_text, source, status)
@@ -140,9 +168,10 @@ def save_score(
     skill_misses: str,  # JSON array string
     one_liner: str,
     ats_score: int,
-):
+    profile: Optional[str] = None,
+) -> None:
     """Writes scoring results to the scores table (INSERT OR REPLACE)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.execute("""
         INSERT OR REPLACE INTO scores
             (job_id, fit_score, role_fit, stack_match, seniority, location,
@@ -154,9 +183,9 @@ def save_score(
     conn.close()
 
 
-def increment_score_attempts(job_id: str):
+def increment_score_attempts(job_id: str, profile: Optional[str] = None) -> None:
     """Increment score_attempts before each scoring attempt."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.execute(
         "UPDATE jobs SET score_attempts = score_attempts + 1 WHERE id = ?",
         (job_id,)
@@ -165,9 +194,9 @@ def increment_score_attempts(job_id: str):
     conn.close()
 
 
-def write_score_error(job_id: str, error: str):
+def write_score_error(job_id: str, error: str, profile: Optional[str] = None) -> None:
     """Record the last error message for a failed scoring attempt."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.execute(
         "UPDATE jobs SET score_error = ? WHERE id = ?",
         (str(error)[:500], job_id)
@@ -176,11 +205,19 @@ def write_score_error(job_id: str, error: str):
     conn.close()
 
 
-def rescore_reset():
+def rescore_reset(profile: Optional[str] = None) -> None:
     """Clear all scores and reset attempt counters. Used with --rescore."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.execute("DELETE FROM scores")
     conn.execute("UPDATE jobs SET score_attempts = 0, score_error = NULL")
+    conn.commit()
+    conn.close()
+
+
+def update_job_status(job_id: str, status: str, profile: Optional[str] = None) -> None:
+    """Update a job's status (new | applied | skipped)."""
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
     conn.commit()
     conn.close()
 
@@ -190,7 +227,6 @@ def rescore_reset():
 def _row_to_job(row: sqlite3.Row) -> Job:
     """Convert a DB row to a Job, mapping only known Job fields."""
     keys = row.keys()
-    # Support aliased column name from JOIN queries (job_location)
     location = row["job_location"] if "job_location" in keys else row["location"]
     return Job(
         id=row["id"],
@@ -206,12 +242,12 @@ def _row_to_job(row: sqlite3.Row) -> Job:
     )
 
 
-def get_unscored() -> list:
+def get_unscored(profile: Optional[str] = None) -> list:
     """
     Jobs that have not yet been scored successfully and have fewer than
     3 scoring attempts — so persistently failing jobs don't block every run.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT * FROM jobs
@@ -223,12 +259,12 @@ def get_unscored() -> list:
     return [_row_to_job(r) for r in rows]
 
 
-def get_top_jobs(min_score: int = 60) -> list:
+def get_top_jobs(min_score: int = 60, profile: Optional[str] = None) -> list:
     """
     Scored jobs above threshold, sorted best first.
     Returns result dicts compatible with print_results().
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT j.id, j.title, j.company, j.location AS job_location, j.url,
@@ -266,9 +302,9 @@ def get_top_jobs(min_score: int = 60) -> list:
     return results
 
 
-def get_all_jobs() -> list:
+def get_all_jobs(profile: Optional[str] = None) -> list:
     """Everything in the jobs table (no score data), unscored or not."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT * FROM jobs ORDER BY created_at DESC"
@@ -277,9 +313,9 @@ def get_all_jobs() -> list:
     return [_row_to_job(r) for r in rows]
 
 
-def count_jobs() -> dict:
+def count_jobs(profile: Optional[str] = None) -> dict:
     """Quick stats — useful for end-of-run summary."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     total  = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     scored = conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0]
     conn.close()
@@ -306,9 +342,14 @@ def _ensure_discovered_slugs_table(conn: sqlite3.Connection, ats: str) -> None:
     conn.commit()
 
 
-def save_discovered_slug(slug: str, company_name: str, ats: str = "greenhouse") -> None:
+def save_discovered_slug(
+    slug: str,
+    company_name: str,
+    ats: str = "greenhouse",
+    profile: Optional[str] = None,
+) -> None:
     """Caches a resolved slug for the given ATS so we don't re-resolve it next run."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     try:
         _ensure_discovered_slugs_table(conn, ats)
         table = f"discovered_{ats}_slugs"
@@ -321,9 +362,9 @@ def save_discovered_slug(slug: str, company_name: str, ats: str = "greenhouse") 
         conn.close()
 
 
-def load_discovered_slugs(ats: str = "greenhouse") -> list:
+def load_discovered_slugs(ats: str = "greenhouse", profile: Optional[str] = None) -> list:
     """Returns all previously cached slugs for the given ATS, newest first."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     try:
         _ensure_discovered_slugs_table(conn, ats)
         table = f"discovered_{ats}_slugs"
@@ -335,13 +376,13 @@ def load_discovered_slugs(ats: str = "greenhouse") -> list:
         conn.close()
 
 
-def clear_discovered_slugs(ats: Optional[str] = None) -> None:
+def clear_discovered_slugs(ats: Optional[str] = None, profile: Optional[str] = None) -> None:
     """
     Clears the slug cache.
     Pass ats='greenhouse' or 'lever' to clear one table, or None to clear both.
     """
     targets = _VALID_ATS if ats is None else {ats}
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_db_path(profile))
     try:
         for target in targets:
             _ensure_discovered_slugs_table(conn, target)
@@ -355,7 +396,7 @@ def clear_discovered_slugs(ats: Optional[str] = None) -> None:
 
 if __name__ == "__main__":
     init_db()
-    print(f"DB initialized at {DB_PATH}")
+    print(f"DB initialized at {get_db_path()}")
 
     test_job = Job(
         id=make_id("test", "1"),

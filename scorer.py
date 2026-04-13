@@ -22,6 +22,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ensure Unicode output works on Windows terminals.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
 from db import (
     Job,
     get_unscored,
@@ -33,6 +37,7 @@ from db import (
     write_score_error,
 )
 from candidate_profile import build_structured_profile, confirm_profile, print_profile_summary
+from models import ScoreResult, StructuredProfile
 
 # LlmCall type: (prompt, max_tokens) -> (response_text, tokens_used)
 LlmCall = Callable[[str, int], Tuple[str, int]]
@@ -214,6 +219,72 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         sys.exit(1)
 
 
+# ── Instructor client factory (for structured outputs) ────────────────────────
+
+def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
+    """
+    Returns (instructor_client, model, temperature) for structured LLM outputs.
+    Uses instructor to wrap the provider's client for reliable JSON parsing.
+    
+    Returns:
+      - instructor_client: instructor-wrapped client ready for structured calls
+      - model: model name string for that provider
+      - temperature: temperature setting from config
+    """
+    provider    = config["llm"]["provider"]
+    models      = config["llm"]["model"]
+    temperature = config["llm"].get("temperature", 0)
+
+    if provider == "anthropic":
+        import anthropic
+        import instructor
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("Error: ANTHROPIC_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = anthropic.Anthropic(api_key=api_key)
+        client = instructor.from_anthropic(client)
+        return client, models["anthropic"], temperature
+
+    elif provider == "gemini":
+        from google import genai
+        import instructor
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            print("Error: GEMINI_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = genai.Client(api_key=api_key)
+        # Gemini doesn't have direct instructor support yet, so we use raw client
+        # Fall back to get_llm_client for gemini
+        return None, models["gemini"], temperature
+
+    elif provider == "groq":
+        from groq import Groq
+        import instructor
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            print("Error: GROQ_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = Groq(api_key=api_key)
+        client = instructor.from_groq(client)
+        return client, models["groq"], temperature
+
+    elif provider == "openai":
+        from openai import OpenAI
+        import instructor
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            print("Error: OPENAI_API_KEY not set in environment or .env")
+            sys.exit(1)
+        client = OpenAI(api_key=api_key)
+        client = instructor.from_openai(client)
+        return client, models["openai"], temperature
+
+    else:
+        print(f"Error: unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
+        sys.exit(1)
+
+
 # ── 1. Keyword pre-score ──────────────────────────────────────────────────────
 
 def keyword_prescore(job: Job, config: Dict[str, Any]) -> float:
@@ -253,12 +324,16 @@ def score_dimensions(
     config: Dict[str, Any],
     llm_call: LlmCall,
     structured_profile: Optional[Dict] = None,
+    instructor_client: Optional[Any] = None,
 ) -> dict:
     """
     Single LLM call that handles both disqualifier detection and dimension
     scoring. Returns a dict with:
       disqualified, disqualify_reason, fit_score, dimension_scores,
       reasons, flags, one_liner.
+    
+    If instructor_client is provided, uses instructor for reliable structured output.
+    Otherwise falls back to raw LLM call with JSON parsing.
     """
     prefs   = config["preferences"]
     weights = config["scoring"]["weights"]
@@ -277,6 +352,9 @@ def score_dimensions(
         "flags": ["parse error"],
         "one_liner": "",
     }
+
+    job_type = config.get("profile", {}).get("job_type", "fulltime")
+    is_intern = job_type == "internship"
 
     if structured_profile:
         sp = structured_profile
@@ -310,6 +388,29 @@ Years of experience: {prefs.get('yoe', 0)}
 Location preferences: remote_ok={prefs.get('location', {}).get('remote_ok', True)}, preferred={prefs.get('location', {}).get('preferred_locations', [])}
 Minimum salary: ${prefs.get('compensation', {}).get('min_salary', 0):,}"""
 
+    # Append internship context when candidate is a student
+    if is_intern:
+        prof_cfg = config.get("profile", {})
+        season_year = prof_cfg.get("target_season", "")
+        school = prof_cfg.get("school", "")
+        major  = prof_cfg.get("major", "")
+        profile_section += f"""
+
+IMPORTANT — INTERNSHIP CANDIDATE:
+This candidate is a student targeting a {season_year} internship.
+School: {school}  |  Major: {major}
+They are NOT a full-time hire — score accordingly."""
+
+    # Dimension instructions differ for interns vs full-time candidates
+    if is_intern:
+        seniority_desc    = "Does this posting explicitly target students, new grads, or interns? Score 10 if yes, 0 if the role is clearly for experienced hires only."
+        compensation_desc = "Is a stipend, hourly rate, or intern-level pay mentioned? Score higher if compensation is explicitly offered."
+        disqualifier_intern_rule = ""  # interns WANT internship postings — don't disqualify them
+    else:
+        seniority_desc    = "How well does the seniority level match the candidate's experience?"
+        compensation_desc = "How likely is the compensation to meet or exceed the candidate's minimum salary?"
+        disqualifier_intern_rule = "\n- Is an internship or co-op position"
+
     prompt = f"""You are an expert technical recruiter evaluating a job posting for a candidate.
 
 CANDIDATE PROFILE:
@@ -324,8 +425,7 @@ Set "disqualified" to true and fill "disqualify_reason" if ANY of the following 
 - Requires a security clearance (TS/SCI, government clearance, etc.)
 - Explicitly requires on-site relocation with no remote option
 - Requires a master's degree or PhD as a hard requirement (not just preferred)
-- Requires more than {max_yoe} years of experience as a hard minimum
-- Is an internship or co-op position
+- Requires more than {max_yoe} years of experience as a hard minimum{disqualifier_intern_rule}
 
 If disqualified, set all dimension scores to 0 and skip Step 2.
 
@@ -333,10 +433,10 @@ Step 2 — Dimension scoring (only if NOT disqualified).
 Score each dimension 0–10:
 - role_fit:     How well does the job title and core responsibilities match the candidate's target roles and experience?
 - stack_match:  How well do required/preferred technologies match the candidate's skills?
-- seniority:    How well does the seniority level match the candidate's experience?
+- seniority:    {seniority_desc}
 - location:     How well does the job's location/remote policy match the candidate's preferences?
 - growth:       How strong are the growth signals? (AI-native, early-stage, interesting domain)
-- compensation: How likely is the compensation to meet or exceed the candidate's minimum salary?
+- compensation: {compensation_desc}
 
 Scoring rules:
 - Score each dimension independently before arriving at a number. Do not let one dimension bias another.
@@ -362,18 +462,52 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
   "one_liner": "<one sentence summary of fit>"
 }}"""
 
-    try:
-        raw, tokens_used = _llm_call_with_retry(llm_call, prompt, 700)
-        raw = raw.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE)
-        dims = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"    [WARN] JSON parse failed: {e}")
-        return zeroed
-    except Exception as e:
-        print(f"    [WARN] LLM call failed: {e}")
-        raise  # re-raise so score_all_jobs can record the error
+    tokens_used = 0
+    dims = None
+
+    # Use instructor-based structured output if available
+    if instructor_client:
+        try:
+            # Try up to 3 times with exponential backoff
+            for attempt in range(3):
+                try:
+                    result = instructor_client.messages.create(
+                        model=config["llm"]["model"][config["llm"]["provider"]],
+                        max_tokens=700,
+                        temperature=config["llm"].get("temperature", 0),
+                        messages=[{"role": "user", "content": prompt}],
+                        response_model=ScoreResult,
+                    )
+                    # Convert ScoreResult model to dict
+                    dims = result.model_dump()
+                    tokens_used = getattr(result, "_full_output", {}).get("usage", {}).get("total_tokens", 500) if hasattr(result, "_full_output") else 500
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        wait = 2 ** attempt * 10
+                        print(f"    [WARN] Structured LLM call failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
+                        time.sleep(wait)
+                    else:
+                        raise
+        except Exception as e:
+            print(f"    [WARN] Instructor call failed: {e}")
+            # Fall through to raw LLM fallback below
+            dims = None
+
+    # Fallback to raw LLM call with JSON parsing if instructor unavailable or failed
+    if dims is None:
+        try:
+            raw, tokens_used = _llm_call_with_retry(llm_call, prompt, 700)
+            raw = raw.strip()
+            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+            raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE)
+            dims = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"    [WARN] JSON parse failed: {e}")
+            return zeroed
+        except Exception as e:
+            print(f"    [WARN] LLM call failed: {e}")
+            raise  # re-raise so score_all_jobs can record the error
 
     if dims.get("disqualified"):
         reason = dims.get("disqualify_reason", "unknown disqualifier")
@@ -464,6 +598,7 @@ def score_job(
     config: Dict[str, Any],
     llm_call: LlmCall,
     structured_profile: Optional[Dict] = None,
+    instructor_client: Optional[Any] = None,
 ) -> dict:
     """
     Runs the full pipeline for one job. Returns a result dict.
@@ -487,7 +622,7 @@ def score_job(
         return base
 
     # Stage 2: merged disqualifier + dimension scoring (single LLM call)
-    result = score_dimensions(job, config, llm_call, structured_profile)
+    result = score_dimensions(job, config, llm_call, structured_profile, instructor_client)
     base["fit_score"]        = result["fit_score"]
     base["tokens_used"]      = result["tokens_used"]
     base["reasons"]          = result["reasons"]
@@ -513,17 +648,26 @@ def _cost_estimate(provider: str, n_jobs: int) -> str:
     return "~$0.00 (free tier)"
 
 
-def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
+def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[str] = None) -> list:
     """
     Scores all eligible unscored jobs. Prompts for confirmation unless yes=True.
     Returns results sorted by fit score descending.
+    Uses instructor for structured output when available.
     """
     llm_cfg  = config["llm"]
     provider = llm_cfg["provider"]
     model    = llm_cfg["model"][provider]
 
     llm_call = get_llm_client(config)
-    jobs     = get_unscored()
+    
+    # Try to get instructor client for structured output
+    instructor_client = None
+    try:
+        instructor_client, _, _ = get_instructor_client(config)
+    except Exception as e:
+        print(f"[INFO] Instructor client unavailable ({provider} may not support it yet). Falling back to raw LLM with JSON parsing.")
+    
+    jobs     = get_unscored(profile=profile)
 
     if not jobs:
         print("No new jobs to score.")
@@ -545,6 +689,8 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
     print(f"Estimated cost: {cost_str}")
     if provider in _PROVIDER_NOTES:
         print(f"Note: {_PROVIDER_NOTES[provider](len(jobs))}")
+    if instructor_client:
+        print(f"Using instructor for structured output (max_retries=3)")
 
     limiter = RateLimiter(
         max_rpm=rate_config["max_rpm"],
@@ -554,7 +700,13 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
 
     # Build structured profile once — counts as 1 API call toward rate limiter
     print("\nBuilding structured profile from resume...")
-    structured_profile = build_structured_profile(config, llm_call)
+    if instructor_client:
+        structured_profile = build_structured_profile(
+            config, llm_call, instructor_client, 
+            model=model, temperature=config["llm"].get("temperature", 0)
+        )
+    else:
+        structured_profile = build_structured_profile(config, llm_call)
     limiter.record(600)
     print_profile_summary(structured_profile)
     print(f"✓ Profile: {structured_profile.get('name')} | "
@@ -585,10 +737,10 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
         limiter.wait_if_needed()
         print(f"[{i}/{len(jobs)}] Scoring: {job.company} — {job.title}")
 
-        increment_score_attempts(job.id)
+        increment_score_attempts(job.id, profile=profile)
 
         try:
-            result = score_job(job, config, llm_call, structured_profile)
+            result = score_job(job, config, llm_call, structured_profile, instructor_client)
             limiter.record(result.get("tokens_used", 500))
 
             dims = result["dimension_scores"]
@@ -606,6 +758,7 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
                 skill_misses=json.dumps(result["skill_misses"]),
                 one_liner=result["one_liner"],
                 ats_score=result["ats_score"],
+                profile=profile,
             )
 
             results.append(result)
@@ -613,7 +766,7 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False) -> list:
             print(f"    fit={result['fit_score']}  ats={result['ats_score']}  {liner}")
 
         except Exception as e:
-            write_score_error(job.id, str(e))
+            write_score_error(job.id, str(e), profile=profile)
             limiter.record(500)  # count failed attempts toward rate limit
             print(f"    [ERROR] {e}")
 

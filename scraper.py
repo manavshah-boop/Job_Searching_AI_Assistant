@@ -393,19 +393,19 @@ def passes_filters(
     return True
 
 
-def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None) -> Dict[str, int]:
+def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, int]:
     """
     Scrape all configured Greenhouse companies.
     Returns dict with: {companies_checked, new_jobs_saved}
     """
-    init_db()
+    init_db(profile=profile)
 
     companies = slugs if slugs is not None else []
     preferences = config.get('preferences', {})
-    profile = config.get('profile', {})
+    profile_info = config.get('profile', {})
 
-    preferred_titles = preferences.get('titles', [])
-    desired_skills = preferences.get('desired_skills', [])
+    preferred_titles = profile_info.get('titles') or preferences.get('titles', [])
+    desired_skills = profile_info.get('desired_skills') or preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
     min_salary = preferences.get('compensation', {}).get('min_salary', 0)
     remote_ok = preferences.get('location', {}).get('remote_ok', False)
@@ -503,7 +503,7 @@ Description:
                 job.id = make_id("greenhouse", str(job_posting["id"]))
 
                 # Insert and track
-                if insert_job(job):
+                if insert_job(job, profile=profile):
                     new_jobs_saved += 1
                     company_new_count += 1
 
@@ -535,12 +535,12 @@ LEVER_API_BASE = "https://api.lever.co/v0/postings"
 _MAX_JOB_AGE_DAYS = 30
 
 
-def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None) -> Dict[str, int]:
+def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, int]:
     """
     Scrape all configured Lever companies.
     Returns dict with: {companies_checked, new_jobs_saved}
     """
-    init_db()
+    init_db(profile=profile)
 
     companies = slugs if slugs is not None else []
     preferences = config.get('preferences', {})
@@ -640,7 +640,7 @@ Description:
                     source="lever",
                 )
 
-                if insert_job(job):
+                if insert_job(job, profile=profile):
                     new_jobs_saved += 1
                     company_new_count += 1
 
@@ -667,15 +667,15 @@ Description:
     }
 
 
-def scrape_hn(config: Dict[str, Any]) -> Dict[str, int]:
+def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str, int]:
     """
     Scrape HN Who's Hiring thread via Algolia API.
     Returns dict with: {thread_found, new_jobs_saved}
     """
-    init_db()
+    init_db(profile=profile)
 
     preferences = config.get('preferences', {})
-    profile = config.get('profile', {})
+    profile_info = config.get('profile', {})
 
     preferred_titles = preferences.get('titles', [])
     desired_skills = preferences.get('desired_skills', [])
@@ -809,7 +809,7 @@ Thread: {thread_title}
                 job.id = make_id("hackernews", str(comment_id))
 
                 # Insert and track
-                if insert_job(job):
+                if insert_job(job, profile=profile):
                     new_jobs_saved += 1
 
         print(f"[+] Saved {new_jobs_saved} new HN jobs")

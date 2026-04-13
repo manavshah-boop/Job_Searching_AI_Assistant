@@ -15,6 +15,9 @@ import time
 from typing import Optional
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from db import load_discovered_slugs, save_discovered_slug
 
@@ -152,7 +155,7 @@ def resolve_lever_slug(company: dict) -> Optional[str]:
     return None
 
 
-def get_or_discover_slugs(config: dict) -> dict:
+def get_or_discover_slugs(config: dict, profile: Optional[str] = None) -> dict:
     """
     Returns slug lists per ATS:
       {
@@ -172,8 +175,8 @@ def get_or_discover_slugs(config: dict) -> dict:
     )
 
     # Load cached slugs from DB
-    gh_cached = load_discovered_slugs(ats="greenhouse")
-    lv_cached = load_discovered_slugs(ats="lever")
+    gh_cached = load_discovered_slugs(ats="greenhouse", profile=profile)
+    lv_cached = load_discovered_slugs(ats="lever", profile=profile)
 
     # Discover new slugs via TheirStack if key is set
     gh_new: list = []
@@ -187,13 +190,13 @@ def get_or_discover_slugs(config: dict) -> dict:
             gh_slug = resolve_greenhouse_slug(company)
             if gh_slug and gh_slug not in gh_priority and gh_slug not in gh_cached:
                 gh_new.append(gh_slug)
-                save_discovered_slug(gh_slug, name, ats="greenhouse")
+                save_discovered_slug(gh_slug, name, ats="greenhouse", profile=profile)
                 print(f"  + [GH] {name} -> {gh_slug}")
 
             lv_slug = resolve_lever_slug(company)
             if lv_slug and lv_slug not in lv_priority and lv_slug not in lv_cached:
                 lv_new.append(lv_slug)
-                save_discovered_slug(lv_slug, name, ats="lever")
+                save_discovered_slug(lv_slug, name, ats="lever", profile=profile)
                 print(f"  + [LV] {name} -> {lv_slug}")
 
             if not gh_slug and not lv_slug:
