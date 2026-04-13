@@ -1,0 +1,28 @@
+[Unit]
+Description=Job Agent Dashboard — %i
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/job-agent
+# Global API keys (GROQ_API_KEY etc.)
+EnvironmentFile=/home/ubuntu/job-agent/.env
+# Per-profile settings — must define PORT=<number>
+# e.g. deploy/env/manav.env contains: PORT=8501
+#      deploy/env/sister.env contains: PORT=8502
+EnvironmentFile=/home/ubuntu/job-agent/deploy/env/%i.env
+# Shell wrapper required so $PORT is expanded at exec time
+ExecStart=/bin/bash -c 'exec /home/ubuntu/job-agent/.venv/bin/streamlit run \
+    /home/ubuntu/job-agent/dashboard.py \
+    --server.port "$PORT" \
+    --server.address 0.0.0.0 \
+    --server.headless true'
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Job Agent Daily Worker — %i
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/job-agent
+EnvironmentFile=/home/ubuntu/job-agent/.env
+ExecStart=/home/ubuntu/job-agent/.venv/bin/python \
+    /home/ubuntu/job-agent/worker/run_pipeline.py --profile %i
+# Do not retry on failure — a bad run should surface, not loop.
+# The timer's Persistent=true will retry at the next calendar window.
+Restart=on-failure
+StartLimitBurst=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

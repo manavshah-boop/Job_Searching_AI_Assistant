@@ -9,8 +9,10 @@ Routing:
   - show_onboarding flag set            → onboarding flow
 """
 
+import json
 import os
 import sqlite3
+import time
 import yaml
 from pathlib import Path
 from typing import Optional
@@ -108,6 +110,31 @@ def _last_scored_at(slug: str) -> Optional[str]:
         row  = conn.execute("SELECT MAX(scored_at) FROM scores").fetchone()
         conn.close()
         return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+_LOCKFILE_NAME  = ".worker_running"
+_STATUS_NAME    = ".last_run"
+_STALE_SECONDS  = 3 * 3600
+
+
+def _worker_is_running(slug: str) -> bool:
+    """Return True if a fresh (< 3h) lockfile exists for this profile."""
+    lock = _PROFILES_DIR / slug / _LOCKFILE_NAME
+    if not lock.exists():
+        return False
+    age = time.time() - lock.stat().st_mtime
+    return age < _STALE_SECONDS
+
+
+def _read_last_run(slug: str) -> Optional[dict]:
+    """Return the parsed .last_run JSON for this profile, or None."""
+    path = _PROFILES_DIR / slug / _STATUS_NAME
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
     except Exception:
         return None
 
@@ -279,6 +306,19 @@ def _render_sidebar(config: dict, slug: str) -> None:
             )
         if last_run:
             st.caption(f"Last scored: {last_run[:16]}")
+
+        # ── Worker status (maintenance mode) ─────────────────────────────────
+        last_run_data = _read_last_run(slug)
+        if _worker_is_running(slug):
+            st.warning("⚙️ Daily update in progress — data may be stale")
+        elif last_run_data:
+            finished = last_run_data.get("finished_at", "")[:16]
+            scored   = last_run_data.get("jobs_scored", 0)
+            if last_run_data.get("status") == "failed":
+                err = last_run_data.get("error_message", "unknown error")
+                st.error(f"⚠️ Last run failed: {err[:80]}")
+            else:
+                st.caption(f"Last updated: {finished} · {scored} jobs scored")
 
         st.divider()
 

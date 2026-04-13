@@ -1,0 +1,17 @@
+[Unit]
+Description=Job Agent Daily Worker Timer — %i
+Requires=jobagent-worker@%i.service
+
+[Timer]
+# Fire at 04:00 UTC every day
+OnCalendar=*-*-* 04:00:00
+# Stagger profiles by up to 15 minutes so two workers don't start simultaneously.
+# systemd uses the unit name as the random seed — manav and sister will
+# consistently land at different offsets within the window.
+RandomizedDelaySec=900
+# If the system was off at 04:00, run as soon as it comes back up.
+Persistent=true
+Unit=jobagent-worker@%i.service
+
+[Install]
+WantedBy=timers.target
