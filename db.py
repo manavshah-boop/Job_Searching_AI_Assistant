@@ -13,9 +13,11 @@ Profile support:
 
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Re-export load_config so every file imports from one place.
 from config import load_config  # noqa: F401
@@ -97,6 +99,22 @@ def _migrate_db(db_path: Path) -> None:
             one_liner    TEXT,
             ats_score    INTEGER,
             scored_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_runs (
+            run_id        TEXT PRIMARY KEY,
+            profile       TEXT,
+            started_at    TIMESTAMP NOT NULL,
+            finished_at   TIMESTAMP,
+            source        TEXT,
+            jobs_scraped  INTEGER DEFAULT 0,
+            jobs_filtered INTEGER DEFAULT 0,
+            jobs_saved    INTEGER DEFAULT 0,
+            jobs_scored   INTEGER DEFAULT 0,
+            avg_fit_score REAL,
+            errors        TEXT DEFAULT '[]',
+            status        TEXT DEFAULT 'running'
         )
     """)
     conn.commit()
@@ -390,6 +408,95 @@ def clear_discovered_slugs(ats: Optional[str] = None, profile: Optional[str] = N
         conn.commit()
     finally:
         conn.close()
+
+
+# ── Pipeline run tracking ─────────────────────────────────────────────────────
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def start_run(profile: Optional[str] = None, source: str = "pipeline") -> str:
+    """
+    Insert a new scrape_run record with status='running'.
+    Returns the run_id (UUID4 string).
+    """
+    run_id = str(uuid.uuid4())
+    conn   = sqlite3.connect(get_db_path(profile))
+    conn.execute(
+        """
+        INSERT INTO scrape_runs (run_id, profile, started_at, source, status)
+        VALUES (?, ?, ?, ?, 'running')
+        """,
+        (run_id, profile or "", _now_utc(), source),
+    )
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def finish_run(
+    run_id: str,
+    jobs_scraped:  int = 0,
+    jobs_filtered: int = 0,
+    jobs_saved:    int = 0,
+    jobs_scored:   int = 0,
+    avg_fit_score: Optional[float] = None,
+    errors:        Optional[List[str]] = None,
+    status:        str = "complete",
+    profile:       Optional[str] = None,
+) -> None:
+    """Update an existing scrape_run record with final stats."""
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.execute(
+        """
+        UPDATE scrape_runs
+        SET finished_at   = ?,
+            jobs_scraped  = ?,
+            jobs_filtered = ?,
+            jobs_saved    = ?,
+            jobs_scored   = ?,
+            avg_fit_score = ?,
+            errors        = ?,
+            status        = ?
+        WHERE run_id = ?
+        """,
+        (
+            _now_utc(),
+            jobs_scraped,
+            jobs_filtered,
+            jobs_saved,
+            jobs_scored,
+            avg_fit_score,
+            json.dumps(errors or []),
+            status,
+            run_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_runs(limit: int = 20, profile: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return the most recent pipeline runs as a list of dicts, newest first."""
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT * FROM scrape_runs
+        ORDER BY started_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["errors"] = json.loads(d.get("errors") or "[]")
+        result.append(d)
+    return result
 
 
 # ── Smoke test ────────────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ if hasattr(sys.stdout, "reconfigure"):
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
+from loguru import logger
 from db import Job, clear_discovered_slugs, init_db, insert_job, load_config, make_id
 from text_utils import extract_job_context
 from theirstack import get_or_discover_slugs
@@ -301,7 +302,7 @@ def passes_filters(
     for blocked in title_blocklist:
         if re.search(r'\b' + re.escape(blocked) + r'\b', check_text):
             if debug:
-                print(f"  [SKIP] title_blocklist matched '{blocked}' | {title!r}")
+                logger.debug(f"[SKIP] title_blocklist matched '{blocked}' | {title!r}")
             return False
 
     # ------------------------------------------------------------------
@@ -313,11 +314,11 @@ def passes_filters(
         yoe_min_found = min(yoe_numbers)
         if yoe_max_found > max_yoe:
             if debug:
-                print(f"  [SKIP] yoe_max {yoe_max_found} > {max_yoe} | {title!r}")
+                logger.debug(f"[SKIP] yoe_max {yoe_max_found} > {max_yoe} | {title!r}")
             return False
         if yoe_min_found < min_yoe:
             if debug:
-                print(f"  [SKIP] yoe_min {yoe_min_found} < {min_yoe} | {title!r}")
+                logger.debug(f"[SKIP] yoe_min {yoe_min_found} < {min_yoe} | {title!r}")
             return False
 
     # ------------------------------------------------------------------
@@ -347,7 +348,7 @@ def passes_filters(
                 break
         if not found_intent:
             if debug:
-                print(f"  [SKIP] no hiring intent near title/skill keyword | {title!r}")
+                logger.debug(f"[SKIP] no hiring intent near title/skill keyword | {title!r}")
             return False
 
     # ------------------------------------------------------------------
@@ -355,7 +356,7 @@ def passes_filters(
     # ------------------------------------------------------------------
     if filters.get('require_degree_filter', False) and requires_advanced_degree(text):
         if debug:
-            print(f"  [SKIP] requires advanced degree | {title!r}")
+            logger.debug(f"[SKIP] requires advanced degree | {title!r}")
         return False
 
     # ------------------------------------------------------------------
@@ -365,8 +366,7 @@ def passes_filters(
         # Use structured location field + comprehensive US detector
         if not _is_us_location(location):
             if debug:
-                print(f"  [SKIP] non-US location '{location}' | {title!r}")
-            return False
+                logger.debug(f"[SKIP] non-US location '{location}' | {title!r}")
 
     elif source == "hackernews":
         # Unstructured free text — look for US signals and absence of non-US geo
@@ -387,16 +387,16 @@ def passes_filters(
             pass  # explicit US mention
         else:
             if debug:
-                print(f"  [SKIP] no US/remote signal in HN post | {title!r}")
+                logger.debug("[SKIP] no US/remote signal in HN post | %s", title)
             return False
 
     return True
 
 
-def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, int]:
+def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Scrape all configured Greenhouse companies.
-    Returns dict with: {companies_checked, new_jobs_saved}
+    Returns dict with: {companies_checked, new_jobs_saved, jobs_scraped, jobs_filtered, errors}
     """
     init_db(profile=profile)
 
@@ -413,11 +413,13 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
 
     companies_checked = 0
     new_jobs_saved = 0
+    jobs_scraped = 0
+    jobs_filtered = 0
     errors = []
 
-    print(f"\n[*] Scraping {len(companies)} Greenhouse companies...")
-    print(f"   Looking for: {', '.join(preferred_titles)}")
-    print(f"   Hard no keywords: {', '.join(hard_no_keywords)}\n")
+    logger.info("Scraping %s Greenhouse companies...", len(companies))
+    logger.info("Looking for: %s", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
 
     for company_slug in companies:
         companies_checked += 1
@@ -480,11 +482,14 @@ Description:
 
                 # Check for hard no keywords in full posting
                 full_text = title + " " + description_clean
+                jobs_scraped += 1
                 if contains_hard_no_keyword(full_text, hard_no_keywords):
+                    jobs_filtered += 1
                     continue
 
                 # Pre-filter (title blocklist, YOE, US location)
                 if not passes_filters(full_text, title, location, config, source="greenhouse", debug=True):
+                    jobs_filtered += 1
                     continue
 
                 # Create Job object
@@ -508,25 +513,24 @@ Description:
                     company_new_count += 1
 
             status = "[+]" if company_new_count > 0 else "[-]"
-            print(f"{status} {company_slug:15} -> {company_new_count} new jobs")
+            logger.info("%s %s -> %d new jobs", status, company_slug, company_new_count)
 
         except Exception as e:
             errors.append(f"[!] {company_slug}: {str(e)}")
-            print(f"[!] {company_slug:15} -> ERROR: {str(e)}")
+            logger.error("%s %s -> ERROR: %s", "[!]", company_slug, str(e))
 
-    # Print summary
-    print(f"\n{'='*50}")
-    print(f"Companies checked: {companies_checked}")
-    print(f"New jobs saved:    {new_jobs_saved}")
+    logger.info("Greenhouse companies checked: %d", companies_checked)
+    logger.info("New jobs saved: %d", new_jobs_saved)
     if errors:
-        print(f"\nErrors ({len(errors)}):")
+        logger.warning("Errors (%d):", len(errors))
         for error in errors:
-            print(f"  {error}")
-    print(f"{'='*50}\n")
+            logger.warning(error)
 
     return {
         'companies_checked': companies_checked,
         'new_jobs_saved': new_jobs_saved,
+        'jobs_scraped': jobs_scraped,
+        'jobs_filtered': jobs_filtered,
         'errors': errors
     }
 
@@ -535,10 +539,10 @@ LEVER_API_BASE = "https://api.lever.co/v0/postings"
 _MAX_JOB_AGE_DAYS = 30
 
 
-def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, int]:
+def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Scrape all configured Lever companies.
-    Returns dict with: {companies_checked, new_jobs_saved}
+    Returns dict with: {companies_checked, new_jobs_saved, jobs_scraped, jobs_filtered, errors}
     """
     init_db(profile=profile)
 
@@ -550,11 +554,13 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
 
     companies_checked = 0
     new_jobs_saved = 0
+    jobs_scraped = 0
+    jobs_filtered = 0
     errors = []
 
-    print(f"\n[*] Scraping {len(companies)} Lever companies...")
-    print(f"   Looking for: {', '.join(preferred_titles)}")
-    print(f"   Hard no keywords: {', '.join(hard_no_keywords)}\n")
+    logger.info("Scraping %s Lever companies...", len(companies))
+    logger.info("Looking for: %s", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
 
     max_age = timedelta(days=_MAX_JOB_AGE_DAYS)
 
@@ -616,8 +622,10 @@ Description:
                 raw_text = extract_job_context(raw_text, max_chars=2000)
 
                 full_text = title + " " + description_clean
+                jobs_scraped += 1
 
                 if contains_hard_no_keyword(full_text, hard_no_keywords):
+                    jobs_filtered += 1
                     continue
 
                 # Normalize location: remote workplaceType with no non-US signal -> "Remote"
@@ -628,6 +636,7 @@ Description:
                     effective_location = "Remote"
 
                 if not passes_filters(full_text, title, effective_location, config, source="lever", debug=True):
+                    jobs_filtered += 1
                     continue
 
                 job = Job(
@@ -645,32 +654,32 @@ Description:
                     company_new_count += 1
 
             status = "[+]" if company_new_count > 0 else "[-]"
-            print(f"{status} {slug:15} -> {company_new_count} new jobs")
+            logger.info("%s %s -> %d new jobs", status, slug, company_new_count)
 
         except Exception as e:
             errors.append(f"[!] {slug}: {str(e)}")
-            print(f"[!] {slug:15} -> ERROR: {str(e)}")
+            logger.error("%s %s -> ERROR: %s", "[!]", slug, str(e))
 
-    print(f"\n{'='*50}")
-    print(f"Companies checked: {companies_checked}")
-    print(f"New jobs saved:    {new_jobs_saved}")
+    logger.info("Lever companies checked: %d", companies_checked)
+    logger.info("New jobs saved: %d", new_jobs_saved)
     if errors:
-        print(f"\nErrors ({len(errors)}):")
+        logger.warning("Errors (%d):", len(errors))
         for error in errors:
-            print(f"  {error}")
-    print(f"{'='*50}\n")
+            logger.warning(error)
 
     return {
         'companies_checked': companies_checked,
         'new_jobs_saved': new_jobs_saved,
+        'jobs_scraped': jobs_scraped,
+        'jobs_filtered': jobs_filtered,
         'errors': errors,
     }
 
 
-def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str, int]:
+def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Scrape HN Who's Hiring thread via Algolia API.
-    Returns dict with: {thread_found, new_jobs_saved}
+    Returns dict with: {thread_found, new_jobs_saved, jobs_scraped, jobs_filtered, errors}
     """
     init_db(profile=profile)
 
@@ -685,11 +694,13 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
     preferred_locations = preferences.get('location', {}).get('preferred_locations', [])
 
     new_jobs_saved = 0
+    jobs_scraped = 0
+    jobs_filtered = 0
     errors = []
 
-    print(f"\n[*] Scraping HN Who's Hiring...")
-    print(f"   Looking for: {', '.join(preferred_titles)}")
-    print(f"   Hard no keywords: {', '.join(hard_no_keywords)}\n")
+    logger.info("Scraping HN Who's Hiring...")
+    logger.info("Looking for: %s", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
 
     try:
         with httpx.Client(timeout=10.0) as client:
@@ -708,7 +719,13 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             
             if response.status_code != 200:
                 errors.append(f"[!] HN search failed: HTTP {response.status_code}")
-                return {'thread_found': False, 'new_jobs_saved': new_jobs_saved, 'errors': errors}
+                return {
+                    'thread_found': False,
+                    'new_jobs_saved': new_jobs_saved,
+                    'jobs_scraped': jobs_scraped,
+                    'jobs_filtered': jobs_filtered,
+                    'errors': errors,
+                }
 
             data = response.json()
             hits = data.get('hits', [])
@@ -717,10 +734,15 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             whoishiring_posts = [hit for hit in hits if hit.get('author') == 'whoishiring']
             
             if not whoishiring_posts:
-                print("[!]  WARNING: No 'Who is Hiring?' threads found in the last 45 days")
-                print("   This might mean the monthly thread hasn't been posted yet,")
-                print("   or there could be an issue with the HN API.")
-                return {'thread_found': False, 'new_jobs_saved': new_jobs_saved, 'errors': errors}
+                logger.warning("No 'Who is Hiring?' threads found in the last 45 days")
+                logger.warning("This might mean the monthly thread hasn't been posted yet, or there could be an issue with the HN API.")
+                return {
+                    'thread_found': False,
+                    'new_jobs_saved': new_jobs_saved,
+                    'jobs_scraped': jobs_scraped,
+                    'jobs_filtered': jobs_filtered,
+                    'errors': errors,
+                }
 
             # Sort by creation time (newest first) and take the first
             whoishiring_posts.sort(key=lambda x: x.get('created_at_i', 0), reverse=True)
@@ -728,8 +750,8 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             thread_id = thread['objectID']
             thread_title = thread['title']
             
-            print(f"[+] Found thread: {thread_title}")
-            print(f"   Thread ID: {thread_id}")
+            logger.info("Found thread: %s", thread_title)
+            logger.info("Thread ID: %s", thread_id)
 
             # Step 2: Fetch top-level comments using HN Firebase API
             hn_api_base = "https://hacker-news.firebaseio.com/v0"
@@ -740,12 +762,18 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             
             if response.status_code != 200:
                 errors.append(f"[!] HN thread fetch failed: HTTP {response.status_code}")
-                return {'thread_found': True, 'new_jobs_saved': new_jobs_saved, 'errors': errors}
+                return {
+                    'thread_found': True,
+                    'new_jobs_saved': new_jobs_saved,
+                    'jobs_scraped': jobs_scraped,
+                    'jobs_filtered': jobs_filtered,
+                    'errors': errors,
+                }
 
             thread_data = response.json()
             comment_ids = thread_data.get('kids', [])
             
-            print(f"   Found {len(comment_ids)} top-level comments")
+            logger.info("Found %d top-level comments", len(comment_ids))
 
             for comment_id in comment_ids[:100]:  # Limit to first 100 to avoid too many requests
                 comment_url = f"{hn_api_base}/item/{comment_id}.json"
@@ -764,6 +792,8 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
                 if len(comment_text) < 50:
                     continue
 
+                jobs_scraped += 1
+
                 # Extract basic info from text (Claude will do better parsing)
                 # For now, just use the first line as title, rest as description
                 lines = comment_text.split('\n', 1)
@@ -772,6 +802,7 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
 
                 # Skip if title doesn't match keywords
                 if not title_matches(title, preferred_titles):
+                    jobs_filtered += 1
                     continue
 
                 # Build raw_text for Claude (include full comment)
@@ -787,10 +818,12 @@ Thread: {thread_title}
 
                 # Check for hard no keywords in full posting
                 if contains_hard_no_keyword(comment_text, hard_no_keywords):
+                    jobs_filtered += 1
                     continue
 
                 # Pre-filter (title blocklist, YOE, hiring intent, US location)
                 if not passes_filters(comment_text, title, "", config, source="hackernews", debug=True):
+                    jobs_filtered += 1
                     continue
 
                 # Create Job object
@@ -812,26 +845,26 @@ Thread: {thread_title}
                 if insert_job(job, profile=profile):
                     new_jobs_saved += 1
 
-        print(f"[+] Saved {new_jobs_saved} new HN jobs")
+        logger.info("Saved %d new HN jobs", new_jobs_saved)
 
     except Exception as e:
         errors.append(f"[!] HN scraping error: {str(e)}")
-        print(f"[!] ERROR: {str(e)}")
+        logger.error("HN scraping error: %s", e)
 
-    # Print summary
-    print(f"\n{'='*50}")
-    print(f"Thread found: {'Yes' if not errors else 'No'}")
-    print(f"New jobs saved: {new_jobs_saved}")
+    # Summary
+    logger.info("Thread found: %s", 'Yes' if not errors else 'No')
+    logger.info("New jobs saved: %d", new_jobs_saved)
     if errors:
-        print(f"\nErrors ({len(errors)}):")
+        logger.warning("Errors (%d):", len(errors))
         for error in errors:
-            print(f"  {error}")
-    print(f"{'='*50}\n")
+            logger.warning(error)
 
     return {
         'thread_found': len(errors) == 0,
         'new_jobs_saved': new_jobs_saved,
-        'errors': errors
+        'jobs_scraped': jobs_scraped,
+        'jobs_filtered': jobs_filtered,
+        'errors': errors,
     }
 
 

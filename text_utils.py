@@ -8,6 +8,8 @@ boilerplate when truncating long job descriptions for LLM scoring.
 import os
 import re
 
+from loguru import logger
+
 # Sections ordered by scoring relevance — highest signal first
 PRIORITY_SECTIONS = [
     # Requirements / qualifications
@@ -135,16 +137,16 @@ def _print_debug(
     used: int,
     max_chars: int,
 ) -> None:
-    """Print extraction decisions to stdout for the first N jobs."""
+    """Print extraction decisions to log for the first N jobs."""
     section_names = [
         "requirements", "tech stack", "role description",
         "compensation", "experience", "location", "about company",
     ]
-    print(f"\n  [extract_job_context] {used}/{max_chars} chars used")
+    logger.debug(f"[extract_job_context] {used}/{max_chars} chars used")
     for priority, para in scored[:8]:
         name = section_names[priority] if priority < len(section_names) else "unclassified"
         kept = "KEPT" if para in selected or any(
             para.startswith(s[:-3]) for s in selected if s.endswith("...")
         ) else "skip"
         preview = para[:60].replace("\n", " ")
-        print(f"    [{kept}] pri={priority} ({name}): {preview!r}")
+        logger.debug(f"[{kept}] pri={priority} ({name}): {preview!r}")

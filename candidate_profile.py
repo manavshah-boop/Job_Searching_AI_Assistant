@@ -13,6 +13,8 @@ import re
 import time
 from typing import Any, Callable, Optional, Tuple
 
+from loguru import logger
+
 LlmCall = Callable[[str, int], Tuple[str, int]]
 
 
@@ -102,12 +104,12 @@ Rules:
                 except Exception as e:
                     if attempt < 2:
                         wait = 2 ** attempt * 10
-                        print(f"    [WARN] Profile extraction failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
+                        logger.warning(f"Profile extraction failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
                         time.sleep(wait)
                     else:
                         raise
         except Exception as e:
-            print(f"    [INFO] Instructor profile extraction failed: {e}. Falling back to raw LLM.")
+            logger.info(f"Instructor profile extraction failed: {e}. Falling back to raw LLM.")
             profile_dict = None
 
     # Fallback to raw LLM call with JSON parsing if instructor unavailable
@@ -158,18 +160,18 @@ def print_profile_summary(profile: dict) -> None:
     locs = ", ".join(profile.get("preferred_locations", []))
     remote_str = "Remote preferred" if remote == "True" else "Open to office"
 
-    print("\n-- Candidate Profile ------------------------------")
-    print(f"  Name:       {profile.get('name', '')}")
-    print(f"  Experience: {profile.get('yoe', '?')} years")
-    print(f"  Skills:     {skills}")
+    logger.info("-- Candidate Profile ------------------------------")
+    logger.info(f"  Name:       {profile.get('name', '')}")
+    logger.info(f"  Experience: {profile.get('yoe', '?')} years")
+    logger.info(f"  Skills:     {skills}")
     if languages:
-        print(f"  Languages:  {languages}")
+        logger.info(f"  Languages:  {languages}")
     if past_roles:
-        print(f"  Past Roles: {past_roles}")
-    print(f"  Target:     {target}")
-    print(f"  Salary:     ${min_sal:,}+")
-    print(f"  Location:   {remote_str} ({locs})")
-    print("-----------------------------------------------")
+        logger.info(f"  Past Roles: {past_roles}")
+    logger.info(f"  Target:     {target}")
+    logger.info(f"  Salary:     ${min_sal:,}+")
+    logger.info(f"  Location:   {remote_str} ({locs})")
+    logger.info("-----------------------------------------------")
 
 
 def confirm_profile() -> bool:

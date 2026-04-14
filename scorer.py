@@ -19,6 +19,7 @@ from collections import deque
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
+from loguru import logger
 
 load_dotenv()
 
@@ -38,6 +39,10 @@ from db import (
 )
 from candidate_profile import build_structured_profile, confirm_profile, print_profile_summary
 from models import ScoreResult, StructuredProfile
+
+class RateLimitReached(Exception):
+    """Raised when the provider's daily RPD limit is exhausted."""
+
 
 # LlmCall type: (prompt, max_tokens) -> (response_text, tokens_used)
 LlmCall = Callable[[str, int], Tuple[str, int]]
@@ -77,12 +82,12 @@ class RateLimiter:
             self.daily_requests = 0
             self.day_start = now
 
-        # Hard stop on RPD — clean exit, not an error
+        # Hard stop on RPD — raise exception so callers can record status
         if self.max_rpd and self.daily_requests >= self.max_rpd:
             reset_in = 86400 - (now - self.day_start)
-            print(f"\n[STOP] Daily request limit reached ({self.max_rpd} RPD).")
-            print(f"       Resets in {reset_in / 3600:.1f} hours. Stopping scorer.")
-            sys.exit(0)
+            msg = f"Daily request limit reached ({self.max_rpd} RPD). Resets in {reset_in / 3600:.1f} hours."
+            logger.warning(msg)
+            raise RateLimitReached(msg)
 
         # Drop entries outside the rolling window
         while self.requests and now - self.requests[0] > window:
@@ -101,7 +106,7 @@ class RateLimiter:
 
         wait = max(rpm_wait, tpm_wait)
         if wait > 0:
-            print(f"    [rate limit] pausing {wait:.1f}s...")
+            logger.warning(f"Rate limit — pausing {wait:.1f}s...")
             time.sleep(wait)
 
     def record(self, tokens_used: int) -> None:
@@ -131,7 +136,7 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         import anthropic
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
-            print("Error: ANTHROPIC_API_KEY not set in environment or .env")
+            logger.error("ANTHROPIC_API_KEY not set in environment or .env")
             sys.exit(1)
         client = anthropic.Anthropic(api_key=api_key)
 
@@ -157,7 +162,7 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         from google.genai import types as genai_types
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            print("Error: GEMINI_API_KEY not set in environment or .env")
+            logger.error("GEMINI_API_KEY not set in environment or .env")
             sys.exit(1)
         client = genai.Client(api_key=api_key)
         gemini_model = models["gemini"]
@@ -180,7 +185,7 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         from groq import Groq
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
-            print("Error: GROQ_API_KEY not set in environment or .env")
+            logger.error("GROQ_API_KEY not set in environment or .env")
             sys.exit(1)
         client = Groq(api_key=api_key)
 
@@ -199,7 +204,7 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         from openai import OpenAI
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
-            print("Error: OPENAI_API_KEY not set in environment or .env")
+            logger.error("OPENAI_API_KEY not set in environment or .env")
             sys.exit(1)
         client = OpenAI(api_key=api_key)
 
@@ -215,7 +220,7 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         return call_openai
 
     else:
-        print(f"Error: unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
+        logger.error(f"Unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
         sys.exit(1)
 
 
@@ -240,7 +245,7 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
         import instructor
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
-            print("Error: ANTHROPIC_API_KEY not set in environment or .env")
+            logger.error("ANTHROPIC_API_KEY not set in environment or .env")
             sys.exit(1)
         client = anthropic.Anthropic(api_key=api_key)
         client = instructor.from_anthropic(client)
@@ -251,7 +256,7 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
         import instructor
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            print("Error: GEMINI_API_KEY not set in environment or .env")
+            logger.error("GEMINI_API_KEY not set in environment or .env")
             sys.exit(1)
         client = genai.Client(api_key=api_key)
         # Gemini doesn't have direct instructor support yet, so we use raw client
@@ -263,7 +268,7 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
         import instructor
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
-            print("Error: GROQ_API_KEY not set in environment or .env")
+            logger.error("GROQ_API_KEY not set in environment or .env")
             sys.exit(1)
         client = Groq(api_key=api_key)
         client = instructor.from_groq(client)
@@ -274,14 +279,14 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
         import instructor
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
-            print("Error: OPENAI_API_KEY not set in environment or .env")
+            logger.error("OPENAI_API_KEY not set in environment or .env")
             sys.exit(1)
         client = OpenAI(api_key=api_key)
         client = instructor.from_openai(client)
         return client, models["openai"], temperature
 
     else:
-        print(f"Error: unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
+        logger.error(f"Unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
         sys.exit(1)
 
 
@@ -312,7 +317,7 @@ def _llm_call_with_retry(llm_call: LlmCall, prompt: str, max_tokens: int, retrie
             is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate_limit" in msg.lower()
             if is_rate_limit and attempt < retries - 1:
                 wait = 2 ** attempt * 10  # 10s, 20s, 40s
-                print(f"    [WARN] Rate limited. Retrying in {wait}s... (attempt {attempt + 1}/{retries})")
+                logger.warning(f"Rate limited. Retrying in {wait}s... (attempt {attempt + 1}/{retries})")
                 time.sleep(wait)
             else:
                 raise
@@ -485,12 +490,12 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
                 except Exception as e:
                     if attempt < 2:
                         wait = 2 ** attempt * 10
-                        print(f"    [WARN] Structured LLM call failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
+                        logger.warning(f"Structured LLM call failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
                         time.sleep(wait)
                     else:
                         raise
         except Exception as e:
-            print(f"    [WARN] Instructor call failed: {e}")
+            logger.warning(f"Instructor call failed: {e}")
             # Fall through to raw LLM fallback below
             dims = None
 
@@ -503,10 +508,10 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
             raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE)
             dims = json.loads(raw)
         except json.JSONDecodeError as e:
-            print(f"    [WARN] JSON parse failed: {e}")
+            logger.error(f"JSON parse failed: {e}")
             return zeroed
         except Exception as e:
-            print(f"    [WARN] LLM call failed: {e}")
+            logger.error(f"LLM call failed: {e}")
             raise  # re-raise so score_all_jobs can record the error
 
     if dims.get("disqualified"):
@@ -537,7 +542,7 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
         ) * 10
         fit_score = min(100, round(fit_score))
     except (KeyError, TypeError) as e:
-        print(f"    [WARN] fit score computation failed: {e}")
+        logger.warning(f"Fit score computation failed: {e}")
         fit_score = 0
 
     return {
@@ -665,32 +670,32 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
     try:
         instructor_client, _, _ = get_instructor_client(config)
     except Exception as e:
-        print(f"[INFO] Instructor client unavailable ({provider} may not support it yet). Falling back to raw LLM with JSON parsing.")
-    
-    jobs     = get_unscored(profile=profile)
+        logger.info(f"Instructor client unavailable ({provider} may not support it yet). Falling back to raw LLM with JSON parsing.")
+
+    jobs = get_unscored(profile=profile)
 
     if not jobs:
-        print("No new jobs to score.")
+        logger.info("No new jobs to score.")
         return []
 
     rate_config = config["llm"].get("rate_limits", {}).get(provider)
     if not rate_config:
-        print(f"[WARN] No rate limits configured for '{provider}' — using conservative defaults")
+        logger.warning(f"No rate limits configured for '{provider}' — using conservative defaults")
         rate_config = {"max_rpm": 10, "max_tpm": 50_000}
 
     cost_str = _cost_estimate(provider, len(jobs))
     rpd      = rate_config.get("max_rpd")
     rpd_str  = f" / {rpd:,} RPD" if rpd else ""
-    print(f"\nProvider: {provider} ({model})")
-    print(f"Rate limits: {rate_config['max_rpm']} RPM / {rate_config['max_tpm']:,} TPM{rpd_str}")
+    logger.info(f"Provider: {provider} ({model})")
+    logger.info(f"Rate limits: {rate_config['max_rpm']} RPM / {rate_config['max_tpm']:,} TPM{rpd_str}")
     if rpd:
-        print(f"Daily budget: {rpd:,} requests (resets midnight PT)")
-    print(f"Jobs to score: {len(jobs)}")
-    print(f"Estimated cost: {cost_str}")
+        logger.info(f"Daily budget: {rpd:,} requests (resets midnight PT)")
+    logger.info(f"Jobs to score: {len(jobs)}")
+    logger.info(f"Estimated cost: {cost_str}")
     if provider in _PROVIDER_NOTES:
-        print(f"Note: {_PROVIDER_NOTES[provider](len(jobs))}")
+        logger.info(f"Note: {_PROVIDER_NOTES[provider](len(jobs))}")
     if instructor_client:
-        print(f"Using instructor for structured output (max_retries=3)")
+        logger.info("Using instructor for structured output (max_retries=3)")
 
     limiter = RateLimiter(
         max_rpm=rate_config["max_rpm"],
@@ -699,7 +704,7 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
     )
 
     # Build structured profile once — counts as 1 API call toward rate limiter
-    print("\nBuilding structured profile from resume...")
+    logger.info("Building structured profile from resume...")
     if instructor_client:
         structured_profile = build_structured_profile(
             config, llm_call, instructor_client, 
@@ -709,17 +714,18 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         structured_profile = build_structured_profile(config, llm_call)
     limiter.record(600)
     print_profile_summary(structured_profile)
-    print(f"✓ Profile: {structured_profile.get('name')} | "
-          f"{structured_profile.get('yoe')}yr | "
-          f"{len(structured_profile.get('core_skills', []))} skills extracted")
+    logger.info(
+        f"Profile: {structured_profile.get('name')} | "
+        f"{structured_profile.get('yoe')}yr | "
+        f"{len(structured_profile.get('core_skills', []))} skills extracted"
+    )
 
     if not yes:
         if not confirm_profile():
-            print("Update your resume PDF or bio in config.yaml and re-run.")
+            logger.info("Aborted — update resume PDF or bio in config.yaml and re-run.")
             sys.exit(0)
 
-    print("\nNote: If you had previously scored jobs, run: python scorer.py --rescore")
-    print("      to clear old scores and re-score with the updated profile and salary.\n")
+    logger.info("Note: run `python scorer.py --rescore` to clear old scores and re-score.")
 
     if not yes:
         try:
@@ -727,15 +733,14 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         except EOFError:
             confirm = "y"  # non-interactive context — proceed automatically
         if confirm != "y":
-            print("Aborted.")
+            logger.info("Aborted.")
             return []
 
     results = []
-    print()
 
     for i, job in enumerate(jobs, 1):
         limiter.wait_if_needed()
-        print(f"[{i}/{len(jobs)}] Scoring: {job.company} — {job.title}")
+        logger.debug(f"[{i}/{len(jobs)}] Scoring: {job.company} — {job.title}")
 
         increment_score_attempts(job.id, profile=profile)
 
@@ -763,18 +768,20 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
 
             results.append(result)
             liner = result["one_liner"][:60] if result["one_liner"] else "(skipped)"
-            print(f"    fit={result['fit_score']}  ats={result['ats_score']}  {liner}")
+            logger.debug(f"    fit={result['fit_score']}  ats={result['ats_score']}  {liner}")
 
+        except RateLimitReached:
+            raise  # propagate — don't treat as a per-job error
         except Exception as e:
             write_score_error(job.id, str(e), profile=profile)
             limiter.record(500)  # count failed attempts toward rate limit
-            print(f"    [ERROR] {e}")
+            logger.error(f"Scoring failed for job {job.id}: {e}")
 
     scored = [r for r in results if r["fit_score"] > 0]
     if scored:
         avg_fit = sum(r["fit_score"] for r in scored) / len(scored)
         avg_ats = sum(r["ats_score"] for r in scored) / len(scored)
-        print(f"\nDone. {len(scored)}/{len(jobs)} scored  |  avg fit={avg_fit:.0f}  avg ats={avg_ats:.0f}")
+        logger.info(f"Done. {len(scored)}/{len(jobs)} scored  |  avg fit={avg_fit:.0f}  avg ats={avg_ats:.0f}")
 
     return sorted(results, key=lambda r: r["fit_score"], reverse=True)
 
@@ -792,7 +799,7 @@ def print_results(results: list, config: Dict[str, Any]):
     visible   = [r for r in results if r["fit_score"] >= min_score]
 
     if not visible:
-        print(f"\nNo jobs scored above {min_score}. Lower min_display_score in config.yaml to see more.")
+        logger.info(f"No jobs scored above {min_score}. Lower min_display_score in config.yaml to see more.")
         return
 
     print(f"\n{'='*60}")
@@ -836,8 +843,11 @@ def print_results(results: list, config: Dict[str, Any]):
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from logging_config import configure_logging
+    configure_logging(profile="default", debug="--debug" in sys.argv)
+
     if "--rescore" in sys.argv:
-        print("--rescore: clearing scores table and resetting score_attempts...")
+        logger.info("--rescore: clearing scores table and resetting score_attempts...")
         rescore_reset()
 
     config = load_config()

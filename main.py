@@ -24,11 +24,13 @@ if hasattr(sys.stdout, "reconfigure"):
 from dotenv import load_dotenv
 load_dotenv()
 
-from db import count_jobs, init_db, load_config, rescore_reset, set_active_profile
+from db import count_jobs, init_db, load_config, rescore_reset, set_active_profile, start_run, finish_run
 from db import get_top_jobs
 from scraper import scrape_greenhouse, scrape_hn, scrape_lever
-from scorer import print_results, score_all_jobs
+from scorer import RateLimitReached, print_results, score_all_jobs
 from theirstack import get_or_discover_slugs
+from logging_config import configure_logging
+from loguru import logger
 
 
 # Map provider name -> expected environment variable
@@ -61,6 +63,8 @@ def parse_args() -> argparse.Namespace:
                         help="Override min_display_score from config for this run")
     parser.add_argument("--profile",   type=str, default=None, metavar="NAME",
                         help="Load config from profiles/<NAME>/config.yaml (Step 7)")
+    parser.add_argument("--debug",     action="store_true",
+                        help="Enable debug-level console output")
     return parser.parse_args()
 
 
@@ -68,9 +72,9 @@ def _check_api_key(provider: str) -> None:
     """Exit with a clear message if the required API key is missing."""
     env_var = _PROVIDER_ENV_VARS.get(provider)
     if env_var and not os.environ.get(env_var):
-        print(f"\n[ERROR] Scoring requires {env_var} but it is not set.")
-        print(f"  Add it to your .env file:  {env_var}=your_key_here")
-        print(f"  Or export it:              export {env_var}=your_key_here\n")
+        logger.error(f"Scoring requires {env_var} but it is not set.")
+        logger.error(f"Add it to your .env file:  {env_var}=your_key_here")
+        logger.error(f"Or export it:              export {env_var}=your_key_here")
         sys.exit(1)
 
 
@@ -90,13 +94,13 @@ def _print_banner(config: dict) -> None:
 
     stats = count_jobs()
 
-    width = 44
-    print("\n" + "\u2550" * width)
-    print("  Job Agent")
-    print(f"  Provider: {provider} ({model})")
-    print(f"  Sources: Greenhouse {gh_mark}  Lever {lv_mark}  HN {hn_mark}")
-    print(f"  DB: {stats['total']} jobs total, {stats['scored']} scored")
-    print("\u2550" * width + "\n")
+    logger.info("Job Agent")
+    logger.info(f"Provider: {provider} ({model})")
+    logger.info(
+        f"Sources: Greenhouse {'yes' if gh_enabled else 'no'}  "
+        f"Lever {'yes' if lv_enabled else 'no'}  HN {'yes' if hn_enabled else 'no'}"
+    )
+    logger.info(f"DB: {stats['total']} jobs total, {stats['scored']} scored")
 
 
 def _run_scrapers(config: dict, profile: str | None = None) -> dict:
@@ -108,10 +112,13 @@ def _run_scrapers(config: dict, profile: str | None = None) -> dict:
     hn_enabled = sources.get("hn",         {}).get("enabled", True)
 
     if not any([gh_enabled, lv_enabled, hn_enabled]):
-        print("[ERROR] No sources are enabled in config.yaml. Nothing to scrape.")
-        sys.exit(1)
+        logger.error("No sources are enabled in config.yaml. Nothing to scrape.")
+        raise ValueError("No sources are enabled in config.yaml. Nothing to scrape.")
 
     total_new = 0
+    total_scraped = 0
+    total_filtered = 0
+    total_saved = 0
 
     # Resolve slugs once for Greenhouse + Lever (includes TheirStack discovery)
     if gh_enabled or lv_enabled:
@@ -120,16 +127,30 @@ def _run_scrapers(config: dict, profile: str | None = None) -> dict:
     if gh_enabled:
         result = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=profile)
         total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
 
     if lv_enabled:
         result = scrape_lever(config, slugs=slug_map["lever"], profile=profile)
         total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
 
     if hn_enabled:
         result = scrape_hn(config, profile=profile)
         total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
 
-    return {"total_new": total_new}
+    return {
+        "total_new": total_new,
+        "jobs_scraped": total_scraped,
+        "jobs_filtered": total_filtered,
+        "jobs_saved": total_saved,
+    }
 
 
 def main() -> None:
@@ -139,14 +160,17 @@ def main() -> None:
     if args.profile:
         profiles_dir = Path(__file__).parent / "profiles"
         if not (profiles_dir / args.profile).exists():
-            print(f"\n[ERROR] Profile '{args.profile}' not found.")
-            print(f"  Run the dashboard to create it:  streamlit run dashboard.py")
-            print(f"  Expected location: profiles/{args.profile}/config.yaml\n")
+            logger.error("Profile '%s' not found.", args.profile)
+            logger.error("Run the dashboard to create it: streamlit run dashboard.py")
+            logger.error("Expected location: profiles/%s/config.yaml", args.profile)
             sys.exit(1)
         set_active_profile(args.profile)
 
     config = load_config(profile=args.profile)
     init_db(profile=args.profile)
+
+    # Configure logging after profile is set
+    configure_logging(profile=args.profile or "default", debug=args.debug)
 
     # Apply --min-score override before any display or scoring
     if args.min_score is not None:
@@ -160,7 +184,7 @@ def main() -> None:
         min_score = config["scoring"].get("min_display_score", 60)
         results   = get_top_jobs(min_score)
         if not results:
-            print(f"No scored jobs above {min_score} in DB.")
+            logger.info("No scored jobs above %d in DB.", min_score)
         else:
             print_results(results, config)
         return
@@ -172,6 +196,13 @@ def main() -> None:
 
     _print_banner(config)
 
+    run_id = start_run(profile=args.profile, source="cli")
+    scrape_stats = {"total_new": 0, "jobs_scraped": 0, "jobs_filtered": 0, "jobs_saved": 0}
+    score_results = []
+    avg_fit = 0.0
+    final_status = "complete"
+    final_errors: list[str] = []
+
     # --rescore: clear scores table before scoring
     if args.rescore:
         if not args.score_only and not args.yes:
@@ -180,53 +211,67 @@ def main() -> None:
             except EOFError:
                 confirm = "y"
             if confirm != "y":
-                print("Aborted.")
+                logger.info("Aborted rescore.")
                 return
-        print("[rescore] Clearing scores table and resetting score_attempts...")
+        logger.info("[rescore] Clearing scores table and resetting score_attempts...")
         rescore_reset()
 
     try:
-        scrape_stats = {"total_new": 0}
-        score_results: list = []
-
         # ── Scrape ──────────────────────────────────────────────────────────
         if not args.score_only:
             scrape_stats = _run_scrapers(config, profile=args.profile)
 
         # ── Score ────────────────────────────────────────────────────────────
         if not args.scrape_only:
-            score_results = score_all_jobs(config, yes=args.yes)
+            score_results = score_all_jobs(config, yes=args.yes, profile=args.profile)
             if score_results:
                 print_results(score_results, config)
 
-        # ── Final summary ────────────────────────────────────────────────────
-        final_stats = count_jobs()
+        # ── Final summary ──────────────────────────────────────────────────
+        final_stats = count_jobs(profile=args.profile)
         scored_this_run = [r for r in score_results if r.get("fit_score", 0) > 0]
 
-        print("\n" + "─" * 44)
-        print("  Run complete")
-        print(f"  DB: {final_stats['total']} jobs total, {final_stats['scored']} scored")
+        logger.info("Run complete")
+        logger.info("DB: %d jobs total, %d scored", final_stats['total'], final_stats['scored'])
         if not args.score_only:
-            print(f"  New jobs this run: {scrape_stats['total_new']}")
+            logger.info("New jobs this run: %d", scrape_stats.get('total_new', 0))
         if scored_this_run:
             avg_fit = sum(r["fit_score"] for r in scored_this_run) / len(scored_this_run)
             avg_ats = sum(r["ats_score"] for r in scored_this_run) / len(scored_this_run)
-            print(f"  Scored this run:   {len(scored_this_run)}")
-            print(f"  Avg fit score:     {avg_fit:.0f}")
-            print(f"  Avg ATS score:     {avg_ats:.0f}")
-        print("─" * 44 + "\n")
+            logger.info("Scored this run: %d", len(scored_this_run))
+            logger.info("Avg fit score: %.0f", avg_fit)
+            logger.info("Avg ATS score: %.0f", avg_ats)
+        logger.info("%s", "─" * 44)
 
     except KeyboardInterrupt:
-        print("\n\n[Interrupted]")
-        stats = count_jobs()
-        print(f"DB state: {stats['total']} jobs total, {stats['scored']} scored")
-        sys.exit(1)
+        final_status = "failed"
+        final_errors = ["Interrupted by user"]
+        logger.warning("Interrupted by user")
+        stats = count_jobs(profile=args.profile)
+        logger.info("DB state: %d jobs total, %d scored", stats['total'], stats['scored'])
+        raise
 
     except Exception as e:
-        print(f"\n[ERROR] Pipeline crashed: {e}")
-        stats = count_jobs()
-        print(f"DB state: {stats['total']} jobs total, {stats['scored']} scored")
+        final_status = "failed"
+        final_errors = [str(e)]
+        logger.error("Pipeline crashed: %s", e)
+        stats = count_jobs(profile=args.profile)
+        logger.info("DB state: %d jobs total, %d scored", stats['total'], stats['scored'])
         raise
+
+    finally:
+        if run_id:
+            finish_run(
+                run_id,
+                jobs_scraped=scrape_stats.get('jobs_scraped', 0),
+                jobs_filtered=scrape_stats.get('jobs_filtered', 0),
+                jobs_saved=scrape_stats.get('jobs_saved', 0),
+                jobs_scored=len([r for r in score_results if r.get('fit_score', 0) > 0]),
+                avg_fit_score=avg_fit if scored_this_run else 0.0,
+                errors=final_errors,
+                status=final_status,
+                profile=args.profile,
+            )
 
 
 if __name__ == "__main__":

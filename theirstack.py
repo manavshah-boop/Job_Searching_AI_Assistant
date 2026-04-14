@@ -16,6 +16,7 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
+from loguru import logger
 
 load_dotenv()
 
@@ -30,7 +31,7 @@ def fetch_companies(config: dict) -> list:
     """
     api_key = os.environ.get("THEIRSTACK_API_KEY")
     if not api_key:
-        print("[theirstack] No API key found, skipping discovery")
+        logger.debug("No THEIRSTACK_API_KEY found, skipping discovery")
         return []
 
     payload = {
@@ -63,11 +64,11 @@ def fetch_companies(config: dict) -> list:
             timeout=30,
         )
     except Exception as e:
-        print(f"[theirstack] Request failed: {e}")
+        logger.warning(f"TheirStack request failed: {e}")
         return []
 
     if resp.status_code != 200:
-        print(f"[theirstack] API error: {resp.status_code} — {resp.text[:200]}")
+        logger.warning(f"TheirStack API error: {resp.status_code} — {resp.text[:200]}")
         return []
 
     return resp.json().get("data", [])
@@ -183,7 +184,7 @@ def get_or_discover_slugs(config: dict, profile: Optional[str] = None) -> dict:
     lv_new: list = []
     if os.environ.get("THEIRSTACK_API_KEY"):
         companies = fetch_companies(config)
-        print(f"[theirstack] {len(companies)} companies returned, resolving slugs...")
+        logger.info("[theirstack] %d companies returned, resolving slugs...", len(companies))
         for company in companies:
             name = company.get("name", "")
 
@@ -191,26 +192,26 @@ def get_or_discover_slugs(config: dict, profile: Optional[str] = None) -> dict:
             if gh_slug and gh_slug not in gh_priority and gh_slug not in gh_cached:
                 gh_new.append(gh_slug)
                 save_discovered_slug(gh_slug, name, ats="greenhouse", profile=profile)
-                print(f"  + [GH] {name} -> {gh_slug}")
+                logger.info("  + [GH] %s -> %s", name, gh_slug)
 
             lv_slug = resolve_lever_slug(company)
             if lv_slug and lv_slug not in lv_priority and lv_slug not in lv_cached:
                 lv_new.append(lv_slug)
                 save_discovered_slug(lv_slug, name, ats="lever", profile=profile)
-                print(f"  + [LV] {name} -> {lv_slug}")
+                logger.info("  + [LV] %s -> %s", name, lv_slug)
 
             if not gh_slug and not lv_slug:
-                print(f"  x {name} -> no slug found (GH or LV)")
+                logger.warning("  x %s -> no slug found (GH or LV)", name)
 
     gh_all = gh_priority + [s for s in gh_cached if s not in gh_priority] + gh_new
     lv_all = lv_priority + [s for s in lv_cached if s not in lv_priority] + lv_new
 
-    print(
-        f"[greenhouse] {len(gh_all)} companies "
-        f"({len(gh_priority)} priority, {len(gh_cached)} cached, {len(gh_new)} new)"
+    logger.info(
+        "[greenhouse] %d companies (%d priority, %d cached, %d new)",
+        len(gh_all), len(gh_priority), len(gh_cached), len(gh_new)
     )
-    print(
-        f"[lever]      {len(lv_all)} companies "
-        f"({len(lv_priority)} priority, {len(lv_cached)} cached, {len(lv_new)} new)"
+    logger.info(
+        "[lever] %d companies (%d priority, %d cached, %d new)",
+        len(lv_all), len(lv_priority), len(lv_cached), len(lv_new)
     )
     return {"greenhouse": gh_all, "lever": lv_all}

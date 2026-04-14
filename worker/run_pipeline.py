@@ -27,6 +27,9 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+from logging_config import configure_logging
+from loguru import logger
+
 _LOCKFILE_NAME  = ".worker_running"
 _STATUS_NAME    = ".last_run"
 _STALE_SECONDS  = 3 * 3600  # 3 hours
@@ -59,16 +62,14 @@ def _acquire_lock(profile: str) -> bool:
     if lock.exists():
         age = time.time() - lock.stat().st_mtime
         if age < _STALE_SECONDS:
-            print(
-                f"[run_pipeline] Lock exists and is {age / 60:.0f} min old "
-                f"(< 3h) — another worker may be running. Aborting.",
-                file=sys.stderr,
+            logger.warning(
+                f"Lock exists and is {age / 60:.0f} min old "
+                f"(< 3h) — another worker may be running. Aborting."
             )
             return False
-        print(
-            f"[run_pipeline] Stale lockfile found ({age / 3600:.1f}h old) — "
-            "treating as crashed run, proceeding.",
-            file=sys.stderr,
+        logger.info(
+            f"Stale lockfile found ({age / 3600:.1f}h old) — "
+            "treating as crashed run, proceeding."
         )
         lock.unlink()
 
@@ -82,7 +83,7 @@ def _release_lock(profile: str) -> None:
     try:
         lock.unlink(missing_ok=True)
     except Exception as exc:
-        print(f"[run_pipeline] Warning: could not remove lockfile: {exc}", file=sys.stderr)
+        logger.warning(f"Could not remove lockfile: {exc}")
 
 
 def _write_status(
@@ -157,31 +158,30 @@ def main() -> None:
     parser.add_argument("--profile", required=True, help="Profile name (e.g. manav)")
     args = parser.parse_args()
 
-    profile    = args.profile
+    profile = args.profile
+    configure_logging(profile=profile, debug=False)
+
     profile_dir = _profiles_dir() / profile
 
     if not profile_dir.exists():
-        print(f"[run_pipeline] ERROR: profiles/{profile}/ does not exist.", file=sys.stderr)
+        logger.error(f"profiles/{profile}/ does not exist.")
         sys.exit(1)
 
     if not (profile_dir / "config.yaml").exists():
-        print(
-            f"[run_pipeline] ERROR: profiles/{profile}/config.yaml not found.",
-            file=sys.stderr,
-        )
+        logger.error(f"profiles/{profile}/config.yaml not found.")
         sys.exit(1)
 
     if not _acquire_lock(profile):
         sys.exit(1)
 
     started_at = _now_iso()
-    print(f"[run_pipeline] Starting pipeline for profile '{profile}' at {started_at}")
+    logger.info(f"Starting pipeline for profile '{profile}' at {started_at}")
 
     try:
         jobs_scored = _run(profile)
         _write_status(profile, started_at, "success", jobs_scored=jobs_scored)
-        print(
-            f"[run_pipeline] Pipeline complete for '{profile}'. "
+        logger.info(
+            f"Pipeline complete for '{profile}'. "
             f"Jobs scored this run: {jobs_scored}"
         )
         sys.exit(0)
@@ -191,17 +191,22 @@ def main() -> None:
         code = exc.code if isinstance(exc.code, int) else 1
         if code == 0:
             _write_status(profile, started_at, "success")
-            print(f"[run_pipeline] Pipeline exited cleanly for '{profile}'.")
+            logger.info(f"Pipeline exited cleanly for '{profile}'.")
             sys.exit(0)
         else:
             _write_status(profile, started_at, "failed", error_message=f"sys.exit({code})")
-            print(f"[run_pipeline] Pipeline exited with code {code} for '{profile}'.", file=sys.stderr)
+            logger.error(f"Pipeline exited with code {code} for '{profile}'.")
             sys.exit(1)
 
     except Exception as exc:
-        msg = str(exc)
-        _write_status(profile, started_at, "failed", error_message=msg)
-        print(f"[run_pipeline] ERROR: {msg}", file=sys.stderr)
+        from scorer import RateLimitReached
+        if isinstance(exc, RateLimitReached):
+            _write_status(profile, started_at, "failed", error_message="rate_limited")
+            logger.warning(f"Pipeline rate limited for '{profile}'.")
+        else:
+            msg = str(exc)
+            _write_status(profile, started_at, "failed", error_message=msg)
+            logger.error(f"Pipeline error: {msg}")
         sys.exit(1)
 
     finally:

@@ -25,12 +25,13 @@ load_dotenv()
 
 from config import load_config
 from db import (
-    count_jobs, get_db_path, get_top_jobs, init_db,
-    load_discovered_slugs, rescore_reset, set_active_profile, update_job_status,
+    count_jobs, get_db_path, get_recent_runs, get_top_jobs, init_db,
+    load_discovered_slugs, rescore_reset, set_active_profile, start_run,
+    finish_run, update_job_status,
 )
 from onboarding import render_onboarding
 from scraper import scrape_greenhouse, scrape_lever, scrape_hn
-from scorer import score_all_jobs
+from scorer import score_all_jobs, RateLimitReached
 from theirstack import get_or_discover_slugs
 from progress_tracker import ProgressTracker, Stage, StageStatus, ActivityType
 from dashboard_ui import (
@@ -41,6 +42,7 @@ from dashboard_ui import (
     render_summary,
     render_debug_logs,
 )
+from logging_config import configure_logging
 
 _BASE_DIR     = Path(__file__).parent
 _PROFILES_DIR = _BASE_DIR / "profiles"
@@ -220,18 +222,26 @@ def _results_to_df(results: list) -> pd.DataFrame:
 def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
     """
     Run the full scrape + score pipeline for a profile.
-    
+
     Uses a ProgressTracker to emit user-friendly events instead of raw logs.
     Returns (summary_dict, tracker) where tracker contains all progress events.
-    Catches SystemExit from the daily rate limiter.
     """
     tracker = ProgressTracker()
     sources = config.get("sources", {})
     total_new = 0
+    total_scraped = 0
+    total_filtered = 0
+    total_saved = 0
+    jobs_scored = 0
+    avg_fit = 0.0
+    errors: list[str] = []
+    status = "complete"
 
     gh_enabled = sources.get("greenhouse", {}).get("enabled", True)
     lv_enabled = sources.get("lever", {}).get("enabled", True)
     hn_enabled = sources.get("hn", {}).get("enabled", True)
+
+    run_id = start_run(profile=slug, source="dashboard")
 
     try:
         # Stage 1: Discovery
@@ -269,6 +279,9 @@ def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
             )
             r = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=slug)
             jobs_found = r.get("new_jobs_saved", 0)
+            total_scraped += r.get("jobs_scraped", 0)
+            total_filtered += r.get("jobs_filtered", 0)
+            total_saved += jobs_found
             tracker.complete_source("Greenhouse", jobs_found)
             total_new += jobs_found
 
@@ -280,6 +293,9 @@ def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
             )
             r = scrape_lever(config, slugs=slug_map["lever"], profile=slug)
             jobs_found = r.get("new_jobs_saved", 0)
+            total_scraped += r.get("jobs_scraped", 0)
+            total_filtered += r.get("jobs_filtered", 0)
+            total_saved += jobs_found
             tracker.complete_source("Lever", jobs_found)
             total_new += jobs_found
 
@@ -288,6 +304,9 @@ def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
             tracker.register_source("HN Who's Hiring", 1)
             r = scrape_hn(config, profile=slug)
             jobs_found = r.get("new_jobs_saved", 0)
+            total_scraped += r.get("jobs_scraped", 0)
+            total_filtered += r.get("jobs_filtered", 0)
+            total_saved += jobs_found
             tracker.complete_source("HN Who's Hiring", jobs_found)
             total_new += jobs_found
 
@@ -301,19 +320,24 @@ def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
         try:
             scored = score_all_jobs(config, yes=True, profile=slug)
             tracker.add_activity_log(f"Scored {len(scored)} jobs")
-        except SystemExit:
-            # scorer calls sys.exit(0) when daily RPD limit is hit
+        except RateLimitReached as exc:
             scored = []
+            errors.append(str(exc))
+            status = "failed"
             tracker.add_warning("Daily rate limit reached — scoring stopped early")
             tracker.fail_stage(Stage.SCORING, "Daily rate limit hit")
             return {
                 "total_new": total_new,
+                "jobs_scraped": total_scraped,
+                "jobs_filtered": total_filtered,
+                "jobs_saved": total_saved,
                 "scored_count": 0,
                 "avg_fit": 0.0,
                 "error": "Daily rate limit reached",
             }, tracker
 
         scored_ok = [r for r in scored if r.get("fit_score", 0) > 0]
+        jobs_scored = len(scored_ok)
         avg_fit = (
             round(sum(r["fit_score"] for r in scored_ok) / len(scored_ok), 1)
             if scored_ok
@@ -321,11 +345,11 @@ def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
         )
         
         tracker.stages[Stage.SCORING].metrics = {
-            "jobs_scored": len(scored_ok),
+            "jobs_scored": jobs_scored,
             "avg_fit": avg_fit,
         }
         tracker.add_activity_log(
-            f"Scoring complete: {len(scored_ok)} jobs with avg fit {avg_fit}/10"
+            f"Scoring complete: {jobs_scored} jobs with avg fit {avg_fit}/10"
         )
         tracker.complete_stage(Stage.SCORING)
 
@@ -336,18 +360,40 @@ def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
 
         return {
             "total_new": total_new,
-            "scored_count": len(scored_ok),
+            "jobs_scraped": total_scraped,
+            "jobs_filtered": total_filtered,
+            "jobs_saved": total_saved,
+            "scored_count": jobs_scored,
             "avg_fit": avg_fit,
         }, tracker
 
     except Exception as e:
+        errors.append(str(e))
+        status = "failed"
         tracker.add_error(f"Pipeline failed: {str(e)}")
         return {
             "error": str(e),
             "total_new": total_new,
+            "jobs_scraped": total_scraped,
+            "jobs_filtered": total_filtered,
+            "jobs_saved": total_saved,
             "scored_count": 0,
             "avg_fit": 0.0,
         }, tracker
+
+    finally:
+        if run_id:
+            finish_run(
+                run_id,
+                jobs_scraped=total_scraped,
+                jobs_filtered=total_filtered,
+                jobs_saved=total_saved,
+                jobs_scored=jobs_scored,
+                avg_fit_score=avg_fit,
+                errors=errors,
+                status=status,
+                profile=slug,
+            )
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -397,7 +443,8 @@ def _render_sidebar(config: dict, slug: str) -> None:
             st.caption(f"Last scored: {last_run[:16]}")
 
         # ── Worker status (maintenance mode) ─────────────────────────────────
-        last_run_data = _read_last_run(slug)
+        recent_runs = get_recent_runs(profile=slug)
+        last_run_data = recent_runs[0] if recent_runs else _read_last_run(slug)
         if _worker_is_running(slug):
             st.warning("⚙️ Daily update in progress — data may be stale")
         elif last_run_data:
@@ -663,7 +710,7 @@ def _render_tab_jobs(results: list, slug: str, min_score_default: int = 60) -> N
 
 # ── Tab 2: Analytics ──────────────────────────────────────────────────────────
 
-def _render_tab_analytics(results: list) -> None:
+def _render_tab_analytics(results: list, slug: str) -> None:
     if not results:
         st.info("No scored jobs yet. Run a job search to see analytics.")
         return
@@ -671,6 +718,30 @@ def _render_tab_analytics(results: list) -> None:
     df     = _results_to_df(results)
     scores = df["fit_score"]
 
+    st.markdown("### Pipeline run history")
+    recent_runs = get_recent_runs(profile=slug)
+    if recent_runs:
+        history_rows = []
+        for run in recent_runs:
+            history_rows.append({
+                "Started": run["started_at"][:19],
+                "Finished": run["finished_at"][:19] if run.get("finished_at") else "running",
+                "Status": "✅ Complete" if run["status"] == "complete" else "⚠️ " + run["status"],
+                "Saved": run["jobs_saved"],
+                "Scraped": run["jobs_scraped"],
+                "Filtered": run["jobs_filtered"],
+                "Scored": run["jobs_scored"],
+                "Avg fit": round(run.get("avg_fit_score") or 0, 1),
+                "Errors": len(run.get("errors", [])),
+            })
+        st.dataframe(
+            pd.DataFrame(history_rows),
+            use_container_width=True,
+        )
+    else:
+        st.info("No pipeline runs recorded yet. Run the job search to populate history.")
+
+    st.markdown("---")
     row1c1, row1c2 = st.columns(2)
 
     with row1c1:
@@ -844,7 +915,7 @@ def _render_tab_settings(config: dict, slug: str) -> None:
                         rescore_reset(profile=slug)
                         try:
                             score_all_jobs(config, yes=True, profile=slug)
-                        except SystemExit:
+                        except RateLimitReached:
                             st.warning("Daily rate limit hit — scoring stopped early.")
                     st.session_state.rescore_confirm = False
                     st.success("Re-scoring complete.")
@@ -966,6 +1037,7 @@ def _render_profile_dashboard(slug: str) -> None:
     """Full dashboard for the active profile."""
     # Always sync module-level DB profile with session state
     set_active_profile(slug)
+    configure_logging(profile=slug, debug=False)
     init_db(profile=slug)
 
     config = _load_config(slug)
@@ -1058,7 +1130,7 @@ def _render_profile_dashboard(slug: str) -> None:
         _render_tab_jobs(all_results, slug, min_score_default)
 
     with tab2:
-        _render_tab_analytics(all_results)
+        _render_tab_analytics(all_results, slug)
 
     with tab3:
         _render_tab_profile(config, slug)
@@ -1127,6 +1199,10 @@ def main() -> None:
     for key, val in _defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+    # Configure logging for the active profile or default session
+    profile = st.session_state.active_profile
+    configure_logging(profile=profile or "default", debug=False)
 
     if st.session_state.show_onboarding:
         if st.button("✕  Cancel", key="cancel_onboarding"):
