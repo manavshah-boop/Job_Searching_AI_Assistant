@@ -82,7 +82,8 @@ def _safe_count_jobs(slug: str) -> dict[str, int]:
         return {"total": 0, "scored": 0}
 
 
-def list_profiles() -> list[dict[str, Any]]:
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_list_profiles() -> list[dict[str, Any]]:
     profiles: list[dict[str, Any]] = []
     if not PROFILES_DIR.exists():
         return profiles
@@ -117,6 +118,73 @@ def list_profiles() -> list[dict[str, Any]]:
         )
 
     return sorted(profiles, key=lambda item: item["updated_at"], reverse=True)
+
+
+def list_profiles() -> list[dict[str, Any]]:
+    return _cached_list_profiles()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
+    return _fetch_job_summaries(slug)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
+    return _fetch_job_detail(slug, job_id)
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_recent_runs(slug: str) -> list[dict[str, Any]]:
+    return get_recent_runs(limit=20, profile=slug)
+
+
+def invalidate_dashboard_caches() -> None:
+    _cached_list_profiles.clear()
+    _cached_fetch_job_summaries.clear()
+    _cached_fetch_job_detail.clear()
+    _cached_recent_runs.clear()
+
+
+def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        [
+            {
+                "id": record["id"],
+                "Title": record["title"],
+                "Company": record["company"],
+                "Location": record["location"] or "Location not listed",
+                "Source": record["source_label"],
+                "Job status": record["status_label"],
+                "Score state": record["score_state"],
+                "Fit": record["fit_score"],
+                "ATS": record["ats_score"],
+                "Summary": record["one_liner"],
+                "Posting": record["url"] or "",
+            }
+            for record in records
+        ]
+    )
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "Title",
+                "Company",
+                "Location",
+                "Source",
+                "Job status",
+                "Score state",
+                "Fit",
+                "ATS",
+                "Summary",
+                "Posting",
+            ]
+        )
+
+    for column in ("Fit", "ATS"):
+        frame[column] = pd.array(frame[column], dtype="Int64")
+    return frame
 
 
 def _apply_styles() -> None:
@@ -282,6 +350,31 @@ def _apply_styles() -> None:
             margin-bottom: 1rem;
             font-size: 0.92rem;
         }
+
+        .stApp a:focus-visible,
+        .stApp button:focus-visible,
+        .stApp [role="button"]:focus-visible,
+        .stApp input:focus-visible,
+        .stApp textarea:focus-visible,
+        .stApp [tabindex]:focus-visible {
+            outline: 3px solid rgba(15, 118, 110, 0.45);
+            outline-offset: 3px;
+        }
+
+        div[data-testid="stButton"],
+        div[data-testid="stLinkButton"] {
+            margin-top: 0.2rem;
+            margin-bottom: 0.35rem;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -358,65 +451,129 @@ def _score_state(record: sqlite3.Row) -> str:
     return "Pending"
 
 
-def _fetch_job_records(slug: str) -> list[dict[str, Any]]:
+def _deserialize_job_record(row: sqlite3.Row) -> dict[str, Any]:
+    record = dict(row)
+    record["score_state"] = _score_state(row)
+    record["source_label"] = _source_label(record["source"])
+    record["status_label"] = str(record["status"]).title()
+    record["reasons"] = json.loads(record.get("reasons") or "[]")
+    record["flags"] = json.loads(record.get("flags") or "[]")
+    record["skill_misses"] = json.loads(record.get("skill_misses") or "[]")
+    record["one_liner"] = record.get("one_liner") or ""
+    record["raw_text"] = record.get("raw_text") or ""
+    record["dimension_scores"] = {
+        "role_fit": record.get("role_fit"),
+        "stack_match": record.get("stack_match"),
+        "seniority": record.get("seniority"),
+        "location": record.get("score_location"),
+        "growth": record.get("growth"),
+        "compensation": record.get("compensation"),
+    }
+    return record
+
+
+def _fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
     init_db(profile=slug)
     conn = sqlite3.connect(get_db_path(slug))
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT
-            j.id,
-            j.title,
-            j.company,
-            j.location,
-            j.url,
-            j.raw_text,
-            j.source,
-            j.score_attempts,
-            j.score_error,
-            j.status,
-            j.created_at,
-            s.fit_score,
-            s.ats_score,
-            s.reasons,
-            s.flags,
-            s.skill_misses,
-            s.one_liner,
-            s.role_fit,
-            s.stack_match,
-            s.seniority,
-            s.location AS score_location,
-            s.growth,
-            s.compensation,
-            s.scored_at
-        FROM jobs j
-        LEFT JOIN scores s ON j.id = s.job_id
-        ORDER BY COALESCE(s.fit_score, -1) DESC, j.created_at DESC
-        """
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                j.id,
+                j.title,
+                j.company,
+                j.location,
+                j.url,
+                j.source,
+                j.score_attempts,
+                j.score_error,
+                j.status,
+                j.created_at,
+                s.fit_score,
+                s.ats_score,
+                s.reasons,
+                s.flags,
+                s.skill_misses,
+                s.one_liner,
+                s.role_fit,
+                s.stack_match,
+                s.seniority,
+                s.location AS score_location,
+                s.growth,
+                s.compensation,
+                s.scored_at
+            FROM jobs j
+            LEFT JOIN scores s ON j.id = s.job_id
+            ORDER BY COALESCE(s.fit_score, -1) DESC, j.created_at DESC
+            """
+        ).fetchall()
+        return [_deserialize_job_record(row) for row in rows]
+    finally:
+        conn.close()
 
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        record = dict(row)
-        record["score_state"] = _score_state(row)
-        record["source_label"] = _source_label(record["source"])
-        record["status_label"] = str(record["status"]).title()
-        record["reasons"] = json.loads(record.get("reasons") or "[]")
-        record["flags"] = json.loads(record.get("flags") or "[]")
-        record["skill_misses"] = json.loads(record.get("skill_misses") or "[]")
-        record["one_liner"] = record.get("one_liner") or ""
-        record["dimension_scores"] = {
-            "role_fit": record.get("role_fit"),
-            "stack_match": record.get("stack_match"),
-            "seniority": record.get("seniority"),
-            "location": record.get("score_location"),
-            "growth": record.get("growth"),
-            "compensation": record.get("compensation"),
-        }
-        records.append(record)
 
-    return records
+def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
+    init_db(profile=slug)
+    conn = sqlite3.connect(get_db_path(slug))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                j.id,
+                j.title,
+                j.company,
+                j.location,
+                j.url,
+                j.raw_text,
+                j.source,
+                j.score_attempts,
+                j.score_error,
+                j.status,
+                j.created_at,
+                s.fit_score,
+                s.ats_score,
+                s.reasons,
+                s.flags,
+                s.skill_misses,
+                s.one_liner,
+                s.role_fit,
+                s.stack_match,
+                s.seniority,
+                s.location AS score_location,
+                s.growth,
+                s.compensation,
+                s.scored_at
+            FROM jobs j
+            LEFT JOIN scores s ON j.id = s.job_id
+            WHERE j.id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _deserialize_job_record(row)
+    finally:
+        conn.close()
+
+
+def _search_job_ids_by_raw_text(slug: str, query: str) -> set[str]:
+    init_db(profile=slug)
+    conn = sqlite3.connect(get_db_path(slug))
+    like_query = f"%{query.lower()}%"
+    try:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM jobs
+            WHERE LOWER(COALESCE(raw_text, '')) LIKE ?
+            """,
+            (like_query,),
+        ).fetchall()
+        return {row[0] for row in rows}
+    finally:
+        conn.close()
 
 
 def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -724,15 +881,18 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
     if dims:
         st.bar_chart(pd.DataFrame([dims]).T.rename(columns={0: "Score"}))
 
-    actions = st.columns(4)
+    actions = st.columns(4, gap="medium")
     if actions[0].button("Mark new", key=f"mark_new_{record['id']}"):
         update_job_status(record["id"], "new", profile=slug)
+        invalidate_dashboard_caches()
         st.rerun()
     if actions[1].button("Mark applied", key=f"mark_applied_{record['id']}"):
         update_job_status(record["id"], "applied", profile=slug)
+        invalidate_dashboard_caches()
         st.rerun()
     if actions[2].button("Mark skipped", key=f"mark_skipped_{record['id']}"):
         update_job_status(record["id"], "skipped", profile=slug)
+        invalidate_dashboard_caches()
         st.rerun()
     if record["url"]:
         actions[3].link_button("Open posting", record["url"])
@@ -782,16 +942,30 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
         st.info("No jobs saved yet. Run the search to populate this profile.")
         return
 
-    filter_cols = st.columns(4)
     source_options = sorted({record["source_label"] for record in records})
     status_options = sorted({record["status_label"] for record in records})
     score_state_options = sorted({record["score_state"] for record in records})
 
-    selected_sources = filter_cols[0].multiselect("Source", source_options, default=source_options)
-    selected_statuses = filter_cols[1].multiselect("Job status", status_options, default=status_options)
-    selected_score_states = filter_cols[2].multiselect("Score state", score_state_options, default=score_state_options)
-    min_fit = filter_cols[3].slider("Minimum fit", min_value=0, max_value=100, value=0, step=5)
-    search = st.text_input("Search jobs", placeholder="Title, company, location, or keywords")
+    with st.expander("Filters", expanded=True):
+        filter_cols = st.columns(4, gap="medium")
+        selected_sources = filter_cols[0].multiselect("Source", source_options, default=source_options)
+        selected_statuses = filter_cols[1].multiselect("Job status", status_options, default=status_options)
+        selected_score_states = filter_cols[2].multiselect(
+            "Score state",
+            score_state_options,
+            default=score_state_options,
+        )
+        min_fit = filter_cols[3].slider("Minimum fit", min_value=0, max_value=100, value=0, step=5)
+
+        search_cols = st.columns([1.8, 1.0], gap="medium")
+        search = search_cols[0].text_input(
+            "Search jobs",
+            placeholder="Title, company, location, summary, or keywords",
+        )
+        include_full_text = search_cols[1].checkbox(
+            "Include full text in search (slower)",
+            value=False,
+        )
 
     filtered = records
     if selected_sources:
@@ -808,19 +982,22 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
         ]
     if search.strip():
         query = search.lower().strip()
+        raw_text_match_ids = _search_job_ids_by_raw_text(slug, query) if include_full_text else set()
         filtered = [
             record
             for record in filtered
-            if query in " ".join(
-                [
-                    record["title"],
-                    record["company"],
-                    record["location"] or "",
-                    record["source_label"],
-                    record["one_liner"],
-                    record["raw_text"] or "",
-                ]
-            ).lower()
+            if (
+                query in " ".join(
+                    [
+                        record["title"],
+                        record["company"],
+                        record["location"] or "",
+                        record["source_label"],
+                        record["one_liner"],
+                    ]
+                ).lower()
+                or record["id"] in raw_text_match_ids
+            )
         ]
 
     st.caption(f"Showing {len(filtered)} of {len(records)} jobs")
@@ -829,36 +1006,46 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
         st.warning("No jobs match the current filters.")
         return
 
-    frame = pd.DataFrame(
-        [
-            {
-                "Title": record["title"],
-                "Company": record["company"],
-                "Location": record["location"],
-                "Source": record["source_label"],
-                "Job status": record["status_label"],
-                "Score state": record["score_state"],
-                "Fit": record["fit_score"],
-                "ATS": record["ats_score"],
-                "Summary": record["one_liner"],
-                "Posting": record["url"],
-            }
-            for record in filtered
-        ]
-    )
-    st.dataframe(frame, use_container_width=True, hide_index=True)
+    table_col, detail_col = st.columns([1.35, 1.0], gap="large")
+    frame = build_jobs_table_frame(filtered)
 
-    options = {
-        record["id"]: f"{record['title']} - {record['company']} ({record['score_state']})"
-        for record in filtered
-    }
-    selected_id = st.selectbox(
-        "Inspect a job",
-        options=list(options.keys()),
-        format_func=lambda item_id: options[item_id],
-    )
-    selected = next(record for record in filtered if record["id"] == selected_id)
-    _render_job_detail(selected, slug)
+    with table_col:
+        st.caption(
+            "Use the table search and filters to narrow jobs. Sorting or changing filters can "
+            "clear the active selection in Streamlit."
+        )
+        # Selection indexes map to the currently rendered dataframe, so a sort/filter change can
+        # reset the detail pane until the user picks a row again.
+        selection = st.dataframe(
+            frame,
+            use_container_width=True,
+            hide_index=True,
+            key=f"jobs_table_{slug}",
+            on_select="rerun",
+            selection_mode="single-row",
+            height=520,
+            column_config={
+                "id": None,
+                "Fit": st.column_config.ProgressColumn("Fit", min_value=0, max_value=100),
+                "ATS": st.column_config.ProgressColumn("ATS", min_value=0, max_value=100),
+                "Posting": st.column_config.LinkColumn("Posting", display_text="Open"),
+            },
+        )
+
+    selected_detail: Optional[dict[str, Any]] = None
+    selected_rows = list(selection.selection.rows)
+    if selected_rows:
+        selected_row = selected_rows[0]
+        if 0 <= selected_row < len(frame):
+            selected_id = str(frame.iloc[selected_row]["id"])
+            selected_detail = _cached_fetch_job_detail(slug, selected_id)
+
+    with detail_col:
+        st.subheader("Job detail")
+        if selected_detail is None:
+            st.info("Select a row from the table to review match reasons, watchouts, and job text.")
+        else:
+            _render_job_detail(selected_detail, slug)
 
 
 def _render_activity_tab(slug: str, runs: list[dict[str, Any]], metrics: dict[str, Any]) -> None:
@@ -1054,8 +1241,13 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
         editable["sources"]["lever"]["companies"] = _lines_to_list(lv_companies)
         editable["sources"]["hn"]["enabled"] = hn_enabled
 
+        if not any((gh_enabled, lv_enabled, hn_enabled)):
+            st.error("Enable at least one source before saving settings.")
+            return
+
         _write_profile_config(slug, editable)
         _set_notice(slug, "success", "Settings saved.")
+        invalidate_dashboard_caches()
         st.rerun()
 
     st.divider()
@@ -1064,7 +1256,15 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
     action_cols = st.columns(2, gap="large")
     with action_cols[0]:
         st.write("Re-score everything currently in this profile.")
-        if st.button("Reset scores and rescore", key=f"rescore_all_{slug}"):
+        confirm_rescore = st.checkbox(
+            f"I understand this will delete existing scores and rescore {metrics['total']} jobs.",
+            key=f"confirm_rescore_{slug}",
+        )
+        if st.button(
+            "Reset scores and rescore",
+            key=f"rescore_all_{slug}",
+            disabled=not confirm_rescore,
+        ):
             missing = _check_api_key(config)
             if missing:
                 st.error(f"Scoring requires {missing} in your environment.")
@@ -1091,6 +1291,7 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                             profile=slug,
                         )
                     _set_notice(slug, "success", f"Re-scored {len(scored)} jobs.")
+                    invalidate_dashboard_caches()
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Re-score failed: {exc}")
@@ -1104,6 +1305,7 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
         if st.button("Clear profile database", key=f"clear_all_{slug}", disabled=not confirm_clear):
             _clear_profile_jobs(slug)
             _set_notice(slug, "success", "Profile database cleared.")
+            invalidate_dashboard_caches()
             st.rerun()
 
 
@@ -1124,15 +1326,15 @@ def _render_profile_dashboard(slug: str) -> None:
             st.rerun()
         return
 
-    records = _fetch_job_records(slug)
+    records = _cached_fetch_job_summaries(slug)
     metrics = _collect_metrics(slug, records)
-    runs = get_recent_runs(limit=20, profile=slug)
+    runs = _cached_recent_runs(slug)
     profile_name = config.get("profile", {}).get("name", slug.replace("_", " ").title())
 
     _render_notice(slug)
     _hero(profile_name, config, metrics, raw_config)
 
-    action_cols = st.columns([1.25, 1.0, 1.0, 1.0], gap="small")
+    action_cols = st.columns([1.25, 1.0, 1.0, 1.0], gap="medium")
     with action_cols[0]:
         st.write("")
     with action_cols[1]:
@@ -1152,11 +1354,13 @@ def _render_profile_dashboard(slug: str) -> None:
                             f"{result['scored_count']} scored, avg fit {result['avg_fit']}/100."
                         ),
                     )
+                    invalidate_dashboard_caches()
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Pipeline failed: {exc}")
     with action_cols[2]:
         if st.button("Refresh data", use_container_width=True):
+            invalidate_dashboard_caches()
             st.rerun()
     with action_cols[3]:
         if st.button("Switch profile", use_container_width=True):

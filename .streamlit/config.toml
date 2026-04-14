@@ -1,0 +1,15 @@
+[theme]
+base = "light"
+primaryColor = "#0f766e"
+backgroundColor = "#f8fbfb"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0f172a"
+linkColor = "#0f766e"
+linkUnderline = false
+baseRadius = "18px"
+buttonRadius = "14px"
+showWidgetBorder = true
+
+[client]
+# Avoid leaking stack traces in a deployed dashboard UI by default.
+showErrorDetails = "none"

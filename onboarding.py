@@ -10,6 +10,7 @@ import yaml
 from pathlib import Path
 from typing import Any, Dict
 
+import pandas as pd
 import streamlit as st
 
 from db import init_db
@@ -562,17 +563,19 @@ def _step_llm_provider() -> None:
 
     data = st.session_state.onboarding_data
 
-    # Comparison table
-    st.markdown("""
-| Provider | Model | Free RPM | Free RPD | Accuracy |
-|---|---|---|---|---|
-| Groq | Llama 4 Scout | 30 | 1,000 | ⭐⭐⭐⭐ |
-| Groq | Llama 3.3 70B | 30 | 1,000 | ⭐⭐⭐⭐ |
-| Groq | Llama 3.1 8B | 30 | 14,400 | ⭐⭐⭐ |
-| Gemini | 2.5 Flash | 10 | 250 | ⭐⭐⭐⭐⭐ |
-| Gemini | 2.5 Flash-Lite | 15 | 1,000 | ⭐⭐⭐⭐ |
-| Anthropic | Claude Sonnet | 50 | Unlimited | ⭐⭐⭐⭐⭐ (paid) |
-""")
+    comparison_frame = pd.DataFrame(
+        [
+            {
+                "Provider": provider["provider"].title(),
+                "Model": provider["model_id"],
+                "Free RPM": provider["rpm"],
+                "Free RPD": provider["rpd"] or "Unlimited",
+                "Accuracy": f"{provider['stars']}{' (paid)' if provider['paid'] else ''}",
+            }
+            for provider in _PROVIDERS
+        ]
+    )
+    st.dataframe(comparison_frame, use_container_width=True, hide_index=True)
 
     # Provider selection
     current_label = data.get("provider_label", _PROVIDER_LABELS[0])
@@ -700,6 +703,7 @@ def _step_review_create() -> None:
             st.session_state.onboarding_data  = {}
             st.session_state.show_onboarding  = False
             st.session_state.active_profile   = profile_slug
+            st.cache_data.clear()
             st.success(
                 f"Profile '{profile_slug}' created! "
                 "Your profile is ready. Go to the dashboard to start your first job search."
@@ -724,6 +728,11 @@ def render_onboarding() -> None:
 
     st.progress(step / 5)
     st.caption(f"Step {step} of 5 — New profile setup")
+    st.info(
+        "You will need your name, a resume, and one provider API key. Creating a profile writes "
+        "`profiles/<slug>/config.yaml`, initializes a dedicated jobs database, and opens that "
+        "profile in the dashboard."
+    )
 
     steps = [
         _step_job_type,
