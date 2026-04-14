@@ -54,7 +54,14 @@ def test_run_pipeline_passes_profile_to_all_profile_scoped_calls(monkeypatch):
 
     result = dashboard._run_pipeline(config, slug="default")
 
-    assert result == {"total_new": 9, "scored_count": 1, "avg_fit": 80.0}
+    assert result == {
+        "total_new": 9,
+        "jobs_scraped": 0,
+        "jobs_filtered": 0,
+        "jobs_saved": 9,
+        "scored_count": 1,
+        "avg_fit": 80.0,
+    }
     assert calls == [
         ("slugs", "default"),
         ("greenhouse", ("gh-co",), "default"),
@@ -83,6 +90,7 @@ def test_score_all_jobs_uses_profile_for_attempt_and_error_writes(monkeypatch):
     monkeypatch.setattr(scorer, "get_unscored", lambda profile=None: [job])
     monkeypatch.setattr(scorer, "build_structured_profile", lambda config, llm_call: {"name": "Test"})
     monkeypatch.setattr(scorer, "print_profile_summary", lambda profile: None)
+    monkeypatch.setattr(scorer.RateLimiter, "wait_if_needed", lambda self: None)
     monkeypatch.setattr(
         scorer,
         "increment_score_attempts",
@@ -91,7 +99,9 @@ def test_score_all_jobs_uses_profile_for_attempt_and_error_writes(monkeypatch):
     monkeypatch.setattr(
         scorer,
         "score_job",
-        lambda job, config, llm_call, structured_profile=None: (_ for _ in ()).throw(RuntimeError("boom")),
+        lambda job, config, llm_call, structured_profile=None, instructor_client=None: (
+            _ for _ in ()
+        ).throw(RuntimeError("boom")),
     )
     monkeypatch.setattr(
         scorer,
@@ -132,3 +142,48 @@ def test_score_all_jobs_uses_profile_for_attempt_and_error_writes(monkeypatch):
         ("attempt", "job-1", "default"),
         ("error", "job-1", "default", "boom"),
     ]
+
+
+def test_list_profiles_reads_names_and_sorts_by_updated_time(monkeypatch):
+    from pathlib import Path
+    import shutil
+
+    root = Path(".tmp_streamlit_test") / "dashboard_profiles"
+    if root.exists():
+        shutil.rmtree(root)
+
+    profiles_dir = root / "profiles"
+    alpha = profiles_dir / "alpha"
+    beta = profiles_dir / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir(parents=True)
+
+    (alpha / "config.yaml").write_text(
+        "profile:\n  name: Alpha Profile\n  job_type: fulltime\nllm:\n  provider: groq\n",
+        encoding="utf-8",
+    )
+    (beta / "config.yaml").write_text(
+        "profile:\n  name: Beta Profile\n  job_type: internship\nllm:\n  provider: gemini\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(dashboard, "PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr(
+        dashboard,
+        "_safe_count_jobs",
+        lambda slug: {"alpha": {"total": 3, "scored": 1}, "beta": {"total": 8, "scored": 5}}[slug],
+    )
+
+    alpha_time = (alpha / "config.yaml").stat().st_mtime
+    beta_time = alpha_time + 10
+    import os
+
+    os.utime(beta / "config.yaml", (beta_time, beta_time))
+
+    profiles = dashboard.list_profiles()
+
+    assert [profile["slug"] for profile in profiles] == ["beta", "alpha"]
+    assert profiles[0]["name"] == "Beta Profile"
+    assert profiles[0]["counts"] == {"total": 8, "scored": 5}
+
+    shutil.rmtree(root)

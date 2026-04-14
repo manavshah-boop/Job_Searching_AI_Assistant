@@ -38,7 +38,7 @@ llm:
       max_tpm: 9000000
 profile:
   name: Manav Shah
-  resume_file: /home/ubuntu/job-agent/profiles/manav_shah1/resume.pdf
+  resume_file: ../../resume.pdf
   bio: Software Engineer specializing in cloud-native, AI-integrated backend systems
     and data pipelines, with experience across medical devices, machine learning,
     and simulation platforms. Proven ability to design scalable systems, improve reliability,

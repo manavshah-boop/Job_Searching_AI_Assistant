@@ -9,12 +9,54 @@ Profile support:
 """
 
 import re
-import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
 import PyPDF2
+import yaml
 
 _BASE_DIR = Path(__file__).parent
+
+
+def _resolve_resume_path(
+    resume_value: str,
+    profile_dir: Path,
+) -> Path:
+    """
+    Resolve a resume path in a portable way.
+
+    Supports:
+    - relative paths inside the profile directory
+    - legacy absolute paths from another machine by falling back to a matching
+      filename in the profile directory or project root
+    """
+    raw_path = Path(resume_value)
+    candidates: list[Path] = []
+
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+        candidates.append(profile_dir / raw_path.name)
+        candidates.append(_BASE_DIR / raw_path.name)
+    else:
+        candidates.append(profile_dir / raw_path)
+        candidates.append(_BASE_DIR / raw_path)
+        candidates.append(profile_dir / raw_path.name)
+        candidates.append(_BASE_DIR / raw_path.name)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        normalized = candidate.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists():
+            return candidate
+
+    searched = "\n".join(f"  - {path}" for path in candidates)
+    raise FileNotFoundError(
+        "Resume PDF not found. Tried:\n"
+        f"{searched}"
+    )
 
 
 def extract_text_from_pdf(pdf_path: str) -> str:
@@ -54,12 +96,7 @@ def load_config(profile: Optional[str] = None) -> Dict[str, Any]:
 
     # Handle resume: either inline text or PDF file
     if config['profile'].get('resume_file'):
-        pdf_path = Path(config['profile']['resume_file'])
-        # Resolve relative paths against the profile dir (or project root)
-        if not pdf_path.is_absolute():
-            pdf_path = profile_dir / pdf_path
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"Resume PDF not found: {pdf_path}")
+        pdf_path = _resolve_resume_path(config['profile']['resume_file'], profile_dir)
         config['profile']['resume'] = extract_text_from_pdf(str(pdf_path))
     elif not config['profile'].get('resume'):
         raise ValueError("Either 'resume' text or 'resume_file' path must be provided in config.yaml")

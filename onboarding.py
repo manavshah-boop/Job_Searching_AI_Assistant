@@ -154,7 +154,7 @@ def generate_config(data: Dict[str, Any]) -> dict:
         "resume_file": None,
     }
     if data.get("resume_type") == "pdf":
-        profile_section["resume_file"] = str(_PROFILES_DIR / slug / "resume.pdf")
+        profile_section["resume_file"] = "resume.pdf"
     else:
         profile_section["resume"] = data.get("resume_text", "")
 

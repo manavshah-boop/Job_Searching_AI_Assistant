@@ -1,1220 +1,1253 @@
-"""
-dashboard.py — Streamlit web UI for the Job Agent.
+from __future__ import annotations
 
-Run with: streamlit run dashboard.py
-
-Routing:
-  - No active profile in session state  → profile selector
-  - Active profile set                  → full dashboard (4 tabs + sidebar)
-  - show_onboarding flag set            → onboarding flow
-"""
-
+import copy
+import html
 import json
 import os
 import sqlite3
-import time
-import yaml
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+import yaml
 from dotenv import load_dotenv
-
-load_dotenv()
 
 from config import load_config
 from db import (
-    count_jobs, get_db_path, get_recent_runs, get_top_jobs, init_db,
-    load_discovered_slugs, rescore_reset, set_active_profile, start_run,
-    finish_run, update_job_status,
-)
-from onboarding import render_onboarding
-from scraper import scrape_greenhouse, scrape_lever, scrape_hn
-from scorer import score_all_jobs, RateLimitReached
-from theirstack import get_or_discover_slugs
-from progress_tracker import ProgressTracker, Stage, StageStatus, ActivityType
-from dashboard_ui import (
-    render_progress_header,
-    render_pipeline_stages,
-    render_source_progress,
-    render_activity_feed,
-    render_summary,
-    render_debug_logs,
+    count_jobs,
+    finish_run,
+    get_db_path,
+    get_recent_runs,
+    init_db,
+    load_discovered_slugs,
+    rescore_reset,
+    set_active_profile,
+    start_run,
+    update_job_status,
 )
 from logging_config import configure_logging
+from onboarding import render_onboarding
+from scraper import scrape_greenhouse, scrape_hn, scrape_lever
+from scorer import RateLimitReached, score_all_jobs
+from theirstack import get_or_discover_slugs
 
-_BASE_DIR     = Path(__file__).parent
-_PROFILES_DIR = _BASE_DIR / "profiles"
-
-_PROVIDER_ENV_VARS = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "gemini":    "GEMINI_API_KEY",
-    "groq":      "GROQ_API_KEY",
-    "openai":    "OPENAI_API_KEY",
-}
+load_dotenv()
 
 st.set_page_config(
-    page_title="Job Agent",
-    page_icon="🔍",
+    page_title="Job Search Dashboard",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
+BASE_DIR = Path(__file__).parent
+PROFILES_DIR = BASE_DIR / "profiles"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+PROVIDER_ENV_VARS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
 
-def list_profiles() -> list:
-    """Return info dicts for every valid profile directory under profiles/."""
-    if not _PROFILES_DIR.exists():
-        return []
-    profiles = []
-    for folder in sorted(_PROFILES_DIR.iterdir()):
-        if not folder.is_dir():
-            continue
-        cfg_path = folder / "config.yaml"
-        if not cfg_path.exists():
-            continue
-        try:
-            with open(cfg_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-            name     = cfg.get("profile", {}).get("name", folder.name)
-            job_type = cfg.get("profile", {}).get("job_type", "fulltime")
-        except Exception:
-            name, job_type = folder.name, "fulltime"
-        profiles.append({"slug": folder.name, "name": name, "job_type": job_type})
-    return profiles
+SOURCE_LABELS = {
+    "greenhouse": "Greenhouse",
+    "lever": "Lever",
+    "hackernews": "HN Who's Hiring",
+}
 
 
-def _job_counts(slug: str) -> dict:
-    db_path = get_db_path(slug)
-    if not db_path.exists():
-        return {"total": 0, "scored": 0}
+def _init_state() -> None:
+    defaults = {
+        "active_profile": None,
+        "show_onboarding": False,
+        "onboarding_step": 1,
+        "onboarding_data": {},
+        "dashboard_notice": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _profile_config_path(slug: str) -> Path:
+    return PROFILES_DIR / slug / "config.yaml"
+
+
+def _safe_count_jobs(slug: str) -> dict[str, int]:
     try:
+        init_db(profile=slug)
         return count_jobs(profile=slug)
     except Exception:
         return {"total": 0, "scored": 0}
 
 
-def _jobs_by_status(slug: str) -> dict:
-    """Return {status: count} dict for a profile's jobs table."""
-    db_path = get_db_path(slug)
-    if not db_path.exists():
-        return {}
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute(
-            "SELECT status, COUNT(*) FROM jobs GROUP BY status"
-        ).fetchall()
-        conn.close()
-        return {r[0]: r[1] for r in rows}
-    except Exception:
-        return {}
+def list_profiles() -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    if not PROFILES_DIR.exists():
+        return profiles
 
+    for path in PROFILES_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        config_path = path / "config.yaml"
+        if not config_path.exists():
+            continue
 
-def _last_scored_at(slug: str) -> Optional[str]:
-    """Return the most recent scored_at timestamp from the scores table, or None."""
-    db_path = get_db_path(slug)
-    if not db_path.exists():
-        return None
-    try:
-        conn = sqlite3.connect(db_path)
-        row  = conn.execute("SELECT MAX(scored_at) FROM scores").fetchone()
-        conn.close()
-        return row[0] if row and row[0] else None
-    except Exception:
-        return None
+        raw_config: dict[str, Any] = {}
+        try:
+            with open(config_path, "r", encoding="utf-8") as file:
+                raw_config = yaml.safe_load(file) or {}
+        except Exception:
+            raw_config = {}
 
+        profile_cfg = raw_config.get("profile", {})
+        llm_cfg = raw_config.get("llm", {})
+        counts = _safe_count_jobs(path.name)
 
-_LOCKFILE_NAME  = ".worker_running"
-_STATUS_NAME    = ".last_run"
-_STALE_SECONDS  = 3 * 3600
-
-
-def _worker_is_running(slug: str) -> bool:
-    """Return True if a fresh (< 3h) lockfile exists for this profile."""
-    lock = _PROFILES_DIR / slug / _LOCKFILE_NAME
-    if not lock.exists():
-        return False
-    age = time.time() - lock.stat().st_mtime
-    return age < _STALE_SECONDS
-
-
-def _read_last_run(slug: str) -> Optional[dict]:
-    """Return the parsed .last_run JSON for this profile, or None."""
-    path = _PROFILES_DIR / slug / _STATUS_NAME
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return None
-
-
-def _load_config(slug: str) -> Optional[dict]:
-    """Load config for a profile, showing an error and returning None on failure."""
-    try:
-        return load_config(profile=slug)
-    except Exception as exc:
-        st.error(f"Cannot load config for profile '{slug}': {exc}")
-        return None
-
-
-def _check_api_key(config: dict) -> Optional[str]:
-    """Return an error message string if the provider's API key is missing, else None."""
-    provider = config.get("llm", {}).get("provider", "groq")
-    env_var  = _PROVIDER_ENV_VARS.get(provider)
-    if env_var and not os.environ.get(env_var):
-        return (
-            f"**{env_var}** is not set in your `.env` file.  \n"
-            f"Add it: `{env_var}=your_key_here`"
+        profiles.append(
+            {
+                "slug": path.name,
+                "name": profile_cfg.get("name", path.name.replace("_", " ").title()),
+                "job_type": profile_cfg.get("job_type", "fulltime"),
+                "provider": llm_cfg.get("provider", "unknown"),
+                "counts": counts,
+                "updated_at": config_path.stat().st_mtime,
+            }
         )
+
+    return sorted(profiles, key=lambda item: item["updated_at"], reverse=True)
+
+
+def _apply_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+        :root {
+            --bg-ink: #0f172a;
+            --bg-panel: rgba(255, 255, 255, 0.88);
+            --line: rgba(15, 23, 42, 0.10);
+            --text: #0f172a;
+            --muted: #52607a;
+            --accent: #0f766e;
+            --accent-soft: rgba(15, 118, 110, 0.12);
+            --danger: #b42318;
+            --warning: #b54708;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 28%),
+                radial-gradient(circle at top right, rgba(14, 116, 144, 0.12), transparent 24%),
+                linear-gradient(180deg, #f8fbfb 0%, #f2f6f9 100%);
+            color: var(--text);
+            font-family: 'IBM Plex Sans', 'Aptos', 'Segoe UI', sans-serif;
+        }
+
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+            max-width: 1280px;
+        }
+
+        h1, h2, h3 {
+            font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+            letter-spacing: -0.02em;
+        }
+
+        div[data-testid="stMetric"] {
+            background: var(--bg-panel);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            padding: 0.75rem 1rem;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.04);
+        }
+
+        .hero-shell {
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(15, 118, 110, 0.92));
+            border-radius: 28px;
+            padding: 1.5rem 1.75rem;
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            box-shadow: 0 24px 50px rgba(15, 23, 42, 0.16);
+            margin-bottom: 1rem;
+        }
+
+        .hero-kicker {
+            text-transform: uppercase;
+            font-size: 0.78rem;
+            letter-spacing: 0.12em;
+            opacity: 0.78;
+            margin-bottom: 0.35rem;
+        }
+
+        .hero-title {
+            font-size: 2rem;
+            line-height: 1.05;
+            margin: 0;
+        }
+
+        .hero-copy {
+            margin-top: 0.8rem;
+            color: rgba(255, 255, 255, 0.86);
+            max-width: 54rem;
+        }
+
+        .chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .chip {
+            background: rgba(255, 255, 255, 0.10);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 999px;
+            padding: 0.35rem 0.75rem;
+            font-size: 0.9rem;
+        }
+
+        .panel {
+            background: var(--bg-panel);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            padding: 1rem 1.1rem;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.04);
+        }
+
+        .match-card {
+            background: var(--bg-panel);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            padding: 1rem 1.1rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .match-title {
+            font-weight: 600;
+            font-size: 1.05rem;
+            margin-bottom: 0.2rem;
+            color: var(--text);
+        }
+
+        .match-meta {
+            color: var(--muted);
+            font-size: 0.92rem;
+            margin-bottom: 0.45rem;
+        }
+
+        .badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            margin-top: 0.55rem;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.22rem 0.55rem;
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent);
+            font-size: 0.84rem;
+            border: 1px solid rgba(15, 118, 110, 0.18);
+        }
+
+        .badge.warn {
+            color: var(--warning);
+            background: rgba(181, 71, 8, 0.08);
+            border-color: rgba(181, 71, 8, 0.16);
+        }
+
+        .badge.fail {
+            color: var(--danger);
+            background: rgba(180, 35, 24, 0.08);
+            border-color: rgba(180, 35, 24, 0.16);
+        }
+
+        .profile-card {
+            background: var(--bg-panel);
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            padding: 1.15rem;
+            min-height: 220px;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.04);
+        }
+
+        .profile-meta {
+            color: var(--muted);
+            margin-bottom: 1rem;
+            font-size: 0.92rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _read_profile_config(slug: str) -> dict[str, Any]:
+    with open(_profile_config_path(slug), "r", encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
+
+
+def _write_profile_config(slug: str, config: dict[str, Any]) -> None:
+    path = _profile_config_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        yaml.dump(config, file, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+def _enabled_sources(config: dict[str, Any]) -> dict[str, bool]:
+    sources = config.get("sources", {})
+    return {
+        "greenhouse": sources.get("greenhouse", {}).get("enabled", True),
+        "lever": sources.get("lever", {}).get("enabled", True),
+        "hackernews": sources.get("hn", {}).get("enabled", False),
+    }
+
+
+def _provider_model(config: dict[str, Any]) -> str:
+    llm_cfg = config.get("llm", {})
+    provider = llm_cfg.get("provider", "unknown")
+    models = llm_cfg.get("model", {})
+    return str(models.get(provider, "unknown"))
+
+
+def _check_api_key(config: dict[str, Any]) -> Optional[str]:
+    provider = config.get("llm", {}).get("provider")
+    env_var = PROVIDER_ENV_VARS.get(str(provider))
+    if env_var and not os.environ.get(env_var):
+        return env_var
     return None
 
 
-def _clear_all_jobs(slug: str) -> None:
-    """Permanently delete all jobs and scores from a profile's DB."""
-    db_path = get_db_path(slug)
-    if db_path.exists():
-        conn = sqlite3.connect(db_path)
-        conn.execute("DELETE FROM scores")
-        conn.execute("DELETE FROM jobs")
-        conn.commit()
-        conn.close()
+def _set_notice(slug: str, kind: str, message: str) -> None:
+    st.session_state.dashboard_notice = {
+        "profile": slug,
+        "kind": kind,
+        "message": message,
+    }
 
 
-def _score_badge(score: int) -> str:
-    if score >= 85:
-        return f"🟢 {score}"
-    if score >= 70:
-        return f"🟡 {score}"
-    if score >= 55:
-        return f"🟠 {score}"
-    return f"🔴 {score}"
+def _render_notice(slug: str) -> None:
+    notice = st.session_state.get("dashboard_notice")
+    if not notice or notice.get("profile") != slug:
+        return
+
+    kind = notice.get("kind", "info")
+    message = notice.get("message", "")
+    renderer = getattr(st, kind, st.info)
+    renderer(message)
+    st.session_state.dashboard_notice = None
 
 
-def _results_to_df(results: list) -> pd.DataFrame:
-    """Convert get_top_jobs() result list to a flat display DataFrame."""
-    if not results:
-        return pd.DataFrame(
-            columns=["id", "fit_score", "score", "ats", "title",
-                     "company", "location", "source", "status", "url"]
-        )
-    rows = []
-    for r in results:
-        job = r["job"]
-        rows.append({
-            "id":        job.id,
-            "fit_score": r["fit_score"],
-            "score":     _score_badge(r["fit_score"]),
-            "ats":       r["ats_score"],
-            "title":     job.title,
-            "company":   job.company,
-            "location":  job.location,
-            "source":    job.source,
-            "status":    job.status,
-            "url":       job.url,
-        })
-    return pd.DataFrame(rows)
+def _source_label(source: str) -> str:
+    return SOURCE_LABELS.get(source, source.replace("_", " ").title())
 
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
+def _score_state(record: sqlite3.Row) -> str:
+    if record["fit_score"] is not None:
+        return "Scored"
+    if (record["score_attempts"] or 0) >= 3:
+        return "Failed"
+    if record["score_error"]:
+        return "Needs retry"
+    return "Pending"
 
-def _run_pipeline(config: dict, slug: str) -> tuple[dict, ProgressTracker]:
-    """
-    Run the full scrape + score pipeline for a profile.
 
-    Uses a ProgressTracker to emit user-friendly events instead of raw logs.
-    Returns (summary_dict, tracker) where tracker contains all progress events.
-    """
-    tracker = ProgressTracker()
-    sources = config.get("sources", {})
+def _fetch_job_records(slug: str) -> list[dict[str, Any]]:
+    init_db(profile=slug)
+    conn = sqlite3.connect(get_db_path(slug))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT
+            j.id,
+            j.title,
+            j.company,
+            j.location,
+            j.url,
+            j.raw_text,
+            j.source,
+            j.score_attempts,
+            j.score_error,
+            j.status,
+            j.created_at,
+            s.fit_score,
+            s.ats_score,
+            s.reasons,
+            s.flags,
+            s.skill_misses,
+            s.one_liner,
+            s.role_fit,
+            s.stack_match,
+            s.seniority,
+            s.location AS score_location,
+            s.growth,
+            s.compensation,
+            s.scored_at
+        FROM jobs j
+        LEFT JOIN scores s ON j.id = s.job_id
+        ORDER BY COALESCE(s.fit_score, -1) DESC, j.created_at DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        record["score_state"] = _score_state(row)
+        record["source_label"] = _source_label(record["source"])
+        record["status_label"] = str(record["status"]).title()
+        record["reasons"] = json.loads(record.get("reasons") or "[]")
+        record["flags"] = json.loads(record.get("flags") or "[]")
+        record["skill_misses"] = json.loads(record.get("skill_misses") or "[]")
+        record["one_liner"] = record.get("one_liner") or ""
+        record["dimension_scores"] = {
+            "role_fit": record.get("role_fit"),
+            "stack_match": record.get("stack_match"),
+            "seniority": record.get("seniority"),
+            "location": record.get("score_location"),
+            "growth": record.get("growth"),
+            "compensation": record.get("compensation"),
+        }
+        records.append(record)
+
+    return records
+
+
+def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = count_jobs(profile=slug)
+    source_counts: dict[str, int] = {}
+    scored = 0
+    pending = 0
+    failed = 0
+    retries = 0
+    applied = 0
+    skipped = 0
+
+    for record in records:
+        source_counts[record["source_label"]] = source_counts.get(record["source_label"], 0) + 1
+        if record["status"] == "applied":
+            applied += 1
+        elif record["status"] == "skipped":
+            skipped += 1
+
+        if record["score_state"] == "Scored":
+            scored += 1
+        elif record["score_state"] == "Pending":
+            pending += 1
+        elif record["score_state"] == "Failed":
+            failed += 1
+        else:
+            retries += 1
+
+    fit_scores = [record["fit_score"] for record in records if record["fit_score"] is not None]
+    avg_fit = round(sum(fit_scores) / len(fit_scores), 1) if fit_scores else 0.0
+
+    return {
+        "total": counts["total"],
+        "scored": scored,
+        "pending": pending,
+        "failed": failed,
+        "needs_retry": retries,
+        "applied": applied,
+        "skipped": skipped,
+        "avg_fit": avg_fit,
+        "source_counts": source_counts,
+    }
+
+
+def _run_pipeline(
+    config: dict[str, Any],
+    slug: str,
+    status_box: Any | None = None,
+) -> dict[str, Any]:
+    enabled = _enabled_sources(config)
+    if not any(enabled.values()):
+        raise ValueError("No sources are enabled for this profile.")
+
+    run_id = start_run(profile=slug, source="dashboard")
+    slug_map = {"greenhouse": [], "lever": []}
     total_new = 0
     total_scraped = 0
     total_filtered = 0
     total_saved = 0
-    jobs_scored = 0
-    avg_fit = 0.0
-    errors: list[str] = []
-    status = "complete"
+    scored_results: list[dict[str, Any]] = []
 
-    gh_enabled = sources.get("greenhouse", {}).get("enabled", True)
-    lv_enabled = sources.get("lever", {}).get("enabled", True)
-    hn_enabled = sources.get("hn", {}).get("enabled", True)
-
-    run_id = start_run(profile=slug, source="dashboard")
+    def log(message: str) -> None:
+        if status_box is not None:
+            status_box.write(message)
+        else:
+            st.write(message)
 
     try:
-        # Stage 1: Discovery
-        tracker.start_stage(Stage.DISCOVERING)
-        if gh_enabled or lv_enabled:
-            tracker.add_activity_log("Discovering company slugs from TheirStack…")
+        if enabled["greenhouse"] or enabled["lever"]:
+            log("Resolving company lists and cached ATS slugs...")
             slug_map = get_or_discover_slugs(config, profile=slug)
-            tracker.stages[Stage.DISCOVERING].metrics = {
-                "companies": len(slug_map.get("greenhouse", [])) + len(slug_map.get("lever", []))
-            }
-            tracker.add_activity_log(
-                f"Found {len(slug_map.get('greenhouse', []))} Greenhouse + {len(slug_map.get('lever', []))} Lever companies"
-            )
-        else:
-            slug_map = {"greenhouse": [], "lever": []}
-        tracker.complete_stage(Stage.DISCOVERING)
 
-        # Stage 2: Fetching
-        tracker.start_stage(Stage.FETCHING)
-        tracker.stages[Stage.FETCHING].metrics = {
-            "sources_active": sum(
-                [gh_enabled, lv_enabled, hn_enabled]
-            )
-        }
-        tracker.complete_stage(Stage.FETCHING)
+        if enabled["greenhouse"]:
+            result = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=slug)
+            total_new += result.get("new_jobs_saved", 0)
+            total_scraped += result.get("jobs_scraped", 0)
+            total_filtered += result.get("jobs_filtered", 0)
+            total_saved += result.get("new_jobs_saved", 0)
+            log(f"Greenhouse saved {result.get('new_jobs_saved', 0)} new jobs.")
 
-        # Stage 3: Scraping
-        tracker.start_stage(Stage.SCRAPING)
-        
-        if gh_enabled:
-            tracker.start_source("Greenhouse")
-            tracker.register_source(
-                "Greenhouse",
-                len(slug_map.get("greenhouse", []))
-            )
-            r = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=slug)
-            jobs_found = r.get("new_jobs_saved", 0)
-            total_scraped += r.get("jobs_scraped", 0)
-            total_filtered += r.get("jobs_filtered", 0)
-            total_saved += jobs_found
-            tracker.complete_source("Greenhouse", jobs_found)
-            total_new += jobs_found
+        if enabled["lever"]:
+            result = scrape_lever(config, slugs=slug_map["lever"], profile=slug)
+            total_new += result.get("new_jobs_saved", 0)
+            total_scraped += result.get("jobs_scraped", 0)
+            total_filtered += result.get("jobs_filtered", 0)
+            total_saved += result.get("new_jobs_saved", 0)
+            log(f"Lever saved {result.get('new_jobs_saved', 0)} new jobs.")
 
-        if lv_enabled:
-            tracker.start_source("Lever")
-            tracker.register_source(
-                "Lever",
-                len(slug_map.get("lever", []))
-            )
-            r = scrape_lever(config, slugs=slug_map["lever"], profile=slug)
-            jobs_found = r.get("new_jobs_saved", 0)
-            total_scraped += r.get("jobs_scraped", 0)
-            total_filtered += r.get("jobs_filtered", 0)
-            total_saved += jobs_found
-            tracker.complete_source("Lever", jobs_found)
-            total_new += jobs_found
+        if enabled["hackernews"]:
+            result = scrape_hn(config, profile=slug)
+            total_new += result.get("new_jobs_saved", 0)
+            total_scraped += result.get("jobs_scraped", 0)
+            total_filtered += result.get("jobs_filtered", 0)
+            total_saved += result.get("new_jobs_saved", 0)
+            log(f"HN Who's Hiring saved {result.get('new_jobs_saved', 0)} new jobs.")
 
-        if hn_enabled:
-            tracker.start_source("HN Who's Hiring")
-            tracker.register_source("HN Who's Hiring", 1)
-            r = scrape_hn(config, profile=slug)
-            jobs_found = r.get("new_jobs_saved", 0)
-            total_scraped += r.get("jobs_scraped", 0)
-            total_filtered += r.get("jobs_filtered", 0)
-            total_saved += jobs_found
-            tracker.complete_source("HN Who's Hiring", jobs_found)
-            total_new += jobs_found
+        log("Scoring newly discovered jobs...")
+        scored_results = score_all_jobs(config, yes=True, profile=slug)
+        scored_ok = [result for result in scored_results if result.get("fit_score", 0) > 0]
+        avg_fit = round(
+            sum(result["fit_score"] for result in scored_ok) / len(scored_ok),
+            1,
+        ) if scored_ok else 0.0
 
-        tracker.stages[Stage.SCRAPING].metrics = {"jobs_found": total_new}
-        tracker.complete_stage(Stage.SCRAPING)
-
-        # Stage 4: Scoring
-        tracker.start_stage(Stage.SCORING)
-        tracker.add_activity_log("Beginning LLM scoring and filtering…")
-        
-        try:
-            scored = score_all_jobs(config, yes=True, profile=slug)
-            tracker.add_activity_log(f"Scored {len(scored)} jobs")
-        except RateLimitReached as exc:
-            scored = []
-            errors.append(str(exc))
-            status = "failed"
-            tracker.add_warning("Daily rate limit reached — scoring stopped early")
-            tracker.fail_stage(Stage.SCORING, "Daily rate limit hit")
-            return {
-                "total_new": total_new,
-                "jobs_scraped": total_scraped,
-                "jobs_filtered": total_filtered,
-                "jobs_saved": total_saved,
-                "scored_count": 0,
-                "avg_fit": 0.0,
-                "error": "Daily rate limit reached",
-            }, tracker
-
-        scored_ok = [r for r in scored if r.get("fit_score", 0) > 0]
-        jobs_scored = len(scored_ok)
-        avg_fit = (
-            round(sum(r["fit_score"] for r in scored_ok) / len(scored_ok), 1)
-            if scored_ok
-            else 0.0
+        finish_run(
+            run_id,
+            jobs_scraped=total_scraped,
+            jobs_filtered=total_filtered,
+            jobs_saved=total_saved,
+            jobs_scored=len(scored_ok),
+            avg_fit_score=avg_fit,
+            errors=[],
+            status="complete",
+            profile=slug,
         )
-        
-        tracker.stages[Stage.SCORING].metrics = {
-            "jobs_scored": jobs_scored,
-            "avg_fit": avg_fit,
-        }
-        tracker.add_activity_log(
-            f"Scoring complete: {jobs_scored} jobs with avg fit {avg_fit}/10"
-        )
-        tracker.complete_stage(Stage.SCORING)
 
-        # Stage 5: Finalizing
-        tracker.start_stage(Stage.FINALIZING)
-        tracker.add_activity_log("Finalizing results…")
-        tracker.complete_stage(Stage.FINALIZING)
-
-        return {
+        summary = {
             "total_new": total_new,
             "jobs_scraped": total_scraped,
             "jobs_filtered": total_filtered,
             "jobs_saved": total_saved,
-            "scored_count": jobs_scored,
+            "scored_count": len(scored_ok),
             "avg_fit": avg_fit,
-        }, tracker
-
-    except Exception as e:
-        errors.append(str(e))
-        status = "failed"
-        tracker.add_error(f"Pipeline failed: {str(e)}")
-        return {
-            "error": str(e),
-            "total_new": total_new,
-            "jobs_scraped": total_scraped,
-            "jobs_filtered": total_filtered,
-            "jobs_saved": total_saved,
-            "scored_count": 0,
-            "avg_fit": 0.0,
-        }, tracker
-
-    finally:
-        if run_id:
-            finish_run(
-                run_id,
-                jobs_scraped=total_scraped,
-                jobs_filtered=total_filtered,
-                jobs_saved=total_saved,
-                jobs_scored=jobs_scored,
-                avg_fit_score=avg_fit,
-                errors=errors,
-                status=status,
-                profile=slug,
+        }
+        if status_box is not None:
+            status_box.update(
+                label=(
+                    f"Pipeline complete: {summary['total_new']} new jobs, "
+                    f"{summary['scored_count']} scored"
+                ),
+                state="complete",
+                expanded=False,
             )
+        return summary
 
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-
-def _render_sidebar(config: dict, slug: str) -> None:
-    with st.sidebar:
-        name    = config.get("profile", {}).get("name", slug)
-        initial = name[0].upper() if name else "?"
-
-        # Avatar + name
-        st.markdown(
-            f"""<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-              <div style="width:40px;height:40px;border-radius:50%;background:#1f77b4;
-                          display:flex;align-items:center;justify-content:center;
-                          color:white;font-size:18px;font-weight:bold">{initial}</div>
-              <div><strong>{name}</strong><br><small><code>{slug}</code></small></div>
-            </div>""",
-            unsafe_allow_html=True,
+    except RateLimitReached as exc:
+        finish_run(
+            run_id,
+            jobs_scraped=total_scraped,
+            jobs_filtered=total_filtered,
+            jobs_saved=total_saved,
+            jobs_scored=0,
+            avg_fit_score=None,
+            errors=[str(exc)],
+            status="failed",
+            profile=slug,
         )
+        if status_box is not None:
+            status_box.update(label="Pipeline stopped by rate limits", state="error", expanded=True)
+        raise
 
-        if st.button("⇄  Switch profile", use_container_width=True):
-            st.session_state.active_profile  = None
-            st.session_state.selected_job_id = None
-            st.session_state.pipeline_running = False
-            st.session_state.pipeline_result  = None
-            set_active_profile(None)
-            st.rerun()
-
-        st.divider()
-
-        # DB stats
-        counts    = _job_counts(slug)
-        by_status = _jobs_by_status(slug)
-        last_run  = _last_scored_at(slug)
-
-        st.markdown("**Database**")
-        c1, c2 = st.columns(2)
-        c1.metric("Total", counts["total"])
-        c2.metric("Scored", counts["scored"])
-        if by_status:
-            st.caption(
-                f"New: {by_status.get('new', 0)}  "
-                f"· Applied: {by_status.get('applied', 0)}  "
-                f"· Skipped: {by_status.get('skipped', 0)}"
-            )
-        if last_run:
-            st.caption(f"Last scored: {last_run[:16]}")
-
-        # ── Worker status (maintenance mode) ─────────────────────────────────
-        recent_runs = get_recent_runs(profile=slug)
-        last_run_data = recent_runs[0] if recent_runs else _read_last_run(slug)
-        if _worker_is_running(slug):
-            st.warning("⚙️ Daily update in progress — data may be stale")
-        elif last_run_data:
-            finished = last_run_data.get("finished_at", "")[:16]
-            scored   = last_run_data.get("jobs_scored", 0)
-            if last_run_data.get("status") == "failed":
-                err = last_run_data.get("error_message", "unknown error")
-                st.error(f"⚠️ Last run failed: {err[:80]}")
-            else:
-                st.caption(f"Last updated: {finished} · {scored} jobs scored")
-
-        st.divider()
-
-        # Companies being searched
-        sources = config.get("sources", {})
-        gh_companies = sources.get("greenhouse", {}).get("companies", [])
-        lv_companies = sources.get("lever", {}).get("companies", [])
-        
-        # Load discovered companies from DB
-        try:
-            gh_discovered = load_discovered_slugs(ats="greenhouse", profile=slug)
-            lv_discovered = load_discovered_slugs(ats="lever", profile=slug)
-        except Exception:
-            gh_discovered = []
-            lv_discovered = []
-        
-        st.markdown("**Companies Searched**")
-        
-        # Check TheirStack status
-        has_theirstack_key = bool(os.environ.get("THEIRSTACK_API_KEY"))
-        if has_theirstack_key:
-            st.caption("🔍 TheirStack API: Active (may discover additional companies)")
-        else:
-            st.caption("🔍 TheirStack API: No key set (only configured companies)")
-        
-        if gh_companies or gh_discovered:
-            with st.expander(f"Greenhouse ({len(gh_companies)} configured, {len(gh_discovered)} discovered)"):
-                if gh_companies:
-                    st.markdown("**Configured:**")
-                    for company in gh_companies:
-                        st.write(f"• {company}")
-                if gh_discovered:
-                    st.markdown("**Discovered:**")
-                    for company in gh_discovered:
-                        st.write(f"• {company}")
-                else:
-                    st.caption("*No additional companies discovered yet*")
-        
-        if lv_companies or lv_discovered:
-            with st.expander(f"Lever ({len(lv_companies)} configured, {len(lv_discovered)} discovered)"):
-                if lv_companies:
-                    st.markdown("**Configured:**")
-                    for company in lv_companies:
-                        st.write(f"• {company}")
-                if lv_discovered:
-                    st.markdown("**Discovered:**")
-                    for company in lv_discovered:
-                        st.write(f"• {company}")
-                else:
-                    st.caption("*No additional companies discovered yet*")
-
-        st.divider()
-
-        # Run job search
-        key_err = _check_api_key(config)
-        running = st.session_state.get("pipeline_running", False)
-
-        if key_err:
-            st.warning(key_err)
-        else:
-            if st.button(
-                "▶  Run job search",
-                type="primary",
-                use_container_width=True,
-                disabled=running,
-                key="run_btn",
-            ):
-                st.session_state.pipeline_running = True
-                st.session_state.pipeline_result  = None
-                st.rerun()
-
-        if running:
-            st.caption("Running… see main panel for progress.")
-
-        result = st.session_state.get("pipeline_result")
-        if result and not running:
-            if "error" in result:
-                st.error(result["error"])
-            else:
-                st.success(
-                    f"Done.  \n"
-                    f"New jobs: **{result['total_new']}**  \n"
-                    f"Scored: **{result['scored_count']}**  \n"
-                    f"Avg fit: **{result['avg_fit']}**"
-                )
+    except Exception as exc:
+        finish_run(
+            run_id,
+            jobs_scraped=total_scraped,
+            jobs_filtered=total_filtered,
+            jobs_saved=total_saved,
+            jobs_scored=0,
+            avg_fit_score=None,
+            errors=[str(exc)],
+            status="failed",
+            profile=slug,
+        )
+        if status_box is not None:
+            status_box.update(label="Pipeline failed", state="error", expanded=True)
+        raise
 
 
-# ── Tab 1: Jobs ───────────────────────────────────────────────────────────────
-
-def _render_job_detail(result: dict) -> None:
-    """Detail card rendered below the table when a row is selected."""
-    job  = result["job"]
-    dims = result.get("dimension_scores", {})
-
-    st.markdown(f"#### {job.title} — {job.company}")
-    st.caption(f"{job.location}  ·  {job.source}")
-
-    if result.get("one_liner"):
-        st.info(result["one_liner"])
-
-    # Dimension scores — horizontal progress bars
-    dim_order = ["role_fit", "stack_match", "seniority", "location", "growth", "compensation"]
-    st.markdown("**Dimension scores**")
-    for dim in dim_order:
-        score = int(dims.get(dim) or 0)
-        label = dim.replace("_", " ").title()
-        col1, col2 = st.columns([2, 5])
-        with col1:
-            st.write(label)
-        with col2:
-            st.progress(score / 10, text=f"{score}/10")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if result.get("reasons"):
-            st.markdown("**Reasons**")
-            for item in result["reasons"]:
-                st.write(f"✅ {item}")
-    with col2:
-        if result.get("flags"):
-            st.markdown("**Flags**")
-            for item in result["flags"]:
-                st.write(f"⚠️ {item}")
-    with col3:
-        if result.get("skill_misses"):
-            st.markdown("**Missing from resume**")
-            for item in result["skill_misses"]:
-                st.write(f"❌ {item}")
-
-    st.markdown(f"[Open job posting ↗]({job.url})")
+def _clear_profile_jobs(slug: str) -> None:
+    init_db(profile=slug)
+    conn = sqlite3.connect(get_db_path(slug))
+    conn.execute("DELETE FROM scores")
+    conn.execute("DELETE FROM jobs")
+    conn.execute("DELETE FROM scrape_runs")
+    conn.commit()
+    conn.close()
 
 
-def _render_tab_jobs(results: list, slug: str, min_score_default: int = 60) -> None:
-    if not results:
-        st.info("No scored jobs yet. Hit **▶ Run job search** in the sidebar to get started.")
+def _hero(profile_name: str, config: dict[str, Any], metrics: dict[str, Any], raw_config: dict[str, Any]) -> None:
+    enabled = _enabled_sources(raw_config)
+    enabled_labels = [
+        label
+        for source, label in SOURCE_LABELS.items()
+        if enabled.get(source, False)
+    ]
+    profile_cfg = config.get("profile", {})
+    provider = config.get("llm", {}).get("provider", "unknown")
+    model = _provider_model(config)
+    bio = html.escape((profile_cfg.get("bio") or "").strip() or "No profile bio saved yet.")
+    chip_values = [
+        profile_cfg.get("job_type", "fulltime").replace("_", " ").title(),
+        f"{provider.title()} / {model}",
+        f"{metrics['total']} jobs tracked",
+        f"{metrics['scored']} scored",
+        ", ".join(enabled_labels) if enabled_labels else "No sources enabled",
+    ]
+    chips = "".join(
+        f"<span class='chip'>{html.escape(str(value))}</span>"
+        for value in chip_values
+        if value
+    )
+    st.markdown(
+        f"""
+        <section class="hero-shell">
+            <div class="hero-kicker">Profile Dashboard</div>
+            <h1 class="hero-title">{html.escape(profile_name)}</h1>
+            <p class="hero-copy">{bio}</p>
+            <div class="chip-row">{chips}</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_top_matches(records: list[dict[str, Any]]) -> None:
+    scored = [record for record in records if record["fit_score"] is not None]
+    if not scored:
+        st.info("No scored jobs yet. Run the pipeline to populate your top matches.")
         return
 
-    df = _results_to_df(results)
-
-    # ── Filters ───────────────────────────────────────────────────────────────
-    fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 3])
-    with fc1:
-        score_range = st.slider(
-            "Score", 0, 100, (min_score_default, 100), key="filter_score",
+    for record in scored[:6]:
+        badges: list[str] = []
+        badges.append(f"<span class='badge'>Fit {record['fit_score']}/100</span>")
+        if record["ats_score"] is not None:
+            badges.append(f"<span class='badge'>ATS {record['ats_score']}/100</span>")
+        if record["flags"]:
+            badges.append(f"<span class='badge warn'>{html.escape(record['flags'][0])}</span>")
+        summary = html.escape(record["one_liner"] or "Scored and ready for review.")
+        st.markdown(
+            f"""
+            <div class="match-card">
+                <div class="match-title">{html.escape(record['title'])}</div>
+                <div class="match-meta">
+                    {html.escape(record['company'])} · {html.escape(record['location'] or 'Location not listed')}
+                    · {html.escape(record['source_label'])}
+                </div>
+                <div>{summary}</div>
+                <div class="badge-row">{''.join(badges)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-    with fc2:
-        source_opts = sorted(df["source"].unique().tolist())
-        sources_sel = st.multiselect(
-            "Source", source_opts, default=source_opts, key="filter_sources",
-        )
-    with fc3:
-        statuses_sel = st.multiselect(
-            "Status", ["new", "applied", "skipped"],
-            default=["new"], key="filter_statuses",
-        )
-    with fc4:
-        search = st.text_input("Search title / company", key="filter_search")
+        if record["url"]:
+            st.link_button("Open posting", record["url"], key=f"open_posting_{record['id']}")
 
-    # Apply filters
-    sources_active  = sources_sel  if sources_sel  else source_opts
-    statuses_active = statuses_sel if statuses_sel else ["new", "applied", "skipped"]
 
-    mask = (
-        df["fit_score"].between(score_range[0], score_range[1]) &
-        df["source"].isin(sources_active) &
-        df["status"].isin(statuses_active)
+def _render_run_history(runs: list[dict[str, Any]]) -> None:
+    if not runs:
+        st.info("No run history yet. The first pipeline run will appear here.")
+        return
+
+    frame = pd.DataFrame(
+        [
+            {
+                "Started": run.get("started_at", ""),
+                "Finished": run.get("finished_at", ""),
+                "Status": str(run.get("status", "")).title(),
+                "Saved": run.get("jobs_saved", 0),
+                "Scored": run.get("jobs_scored", 0),
+                "Avg Fit": run.get("avg_fit_score", 0) or 0,
+                "Source": run.get("source", ""),
+                "Errors": "; ".join(run.get("errors", [])),
+            }
+            for run in runs
+        ]
     )
-    if search:
-        sl = search.lower()
-        mask &= (
-            df["title"].str.lower().str.contains(sl, na=False) |
-            df["company"].str.lower().str.contains(sl, na=False)
-        )
-    filtered = df[mask].reset_index(drop=True)
+    st.dataframe(frame, use_container_width=True, hide_index=True)
 
-    st.caption(f"Showing {len(filtered)} of {len(df)} scored jobs")
 
-    if filtered.empty:
+def _render_job_detail(record: dict[str, Any], slug: str) -> None:
+    st.subheader(record["title"])
+    st.caption(
+        f"{record['company']} · {record['location'] or 'Location not listed'} · "
+        f"{record['source_label']} · {record['status_label']}"
+    )
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Fit", record["fit_score"] if record["fit_score"] is not None else "N/A")
+    metric_cols[1].metric("ATS", record["ats_score"] if record["ats_score"] is not None else "N/A")
+    metric_cols[2].metric("Score state", record["score_state"])
+    metric_cols[3].metric("Attempts", record["score_attempts"] or 0)
+
+    if record["one_liner"]:
+        st.write(record["one_liner"])
+
+    if record["reasons"]:
+        st.write("Why it matched")
+        for reason in record["reasons"]:
+            st.write(f"- {reason}")
+
+    if record["flags"]:
+        st.write("Watchouts")
+        for flag in record["flags"]:
+            st.write(f"- {flag}")
+
+    if record["skill_misses"]:
+        st.write("Missing from resume")
+        for skill in record["skill_misses"]:
+            st.write(f"- {skill}")
+
+    if record["score_error"]:
+        st.error(record["score_error"])
+
+    dims = {key: value for key, value in record["dimension_scores"].items() if value is not None}
+    if dims:
+        st.bar_chart(pd.DataFrame([dims]).T.rename(columns={0: "Score"}))
+
+    actions = st.columns(4)
+    if actions[0].button("Mark new", key=f"mark_new_{record['id']}"):
+        update_job_status(record["id"], "new", profile=slug)
+        st.rerun()
+    if actions[1].button("Mark applied", key=f"mark_applied_{record['id']}"):
+        update_job_status(record["id"], "applied", profile=slug)
+        st.rerun()
+    if actions[2].button("Mark skipped", key=f"mark_skipped_{record['id']}"):
+        update_job_status(record["id"], "skipped", profile=slug)
+        st.rerun()
+    if record["url"]:
+        actions[3].link_button("Open posting", record["url"])
+
+    with st.expander("Job text", expanded=False):
+        st.text(record["raw_text"] or "")
+
+
+def _render_overview_tab(
+    slug: str,
+    config: dict[str, Any],
+    raw_config: dict[str, Any],
+    records: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    metrics: dict[str, Any],
+) -> None:
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Total jobs", metrics["total"])
+    metric_cols[1].metric("Scored", metrics["scored"])
+    metric_cols[2].metric("Pending", metrics["pending"])
+    metric_cols[3].metric("Failed", metrics["failed"])
+    metric_cols[4].metric("Applied", metrics["applied"])
+
+    left, right = st.columns([1.25, 1.0], gap="large")
+    with left:
+        st.subheader("Top matches")
+        _render_top_matches(records)
+
+    with right:
+        st.subheader("Pipeline health")
+        with st.container(border=True):
+            enabled = _enabled_sources(raw_config)
+            st.write(
+                f"Enabled sources: "
+                f"{', '.join(label for source, label in SOURCE_LABELS.items() if enabled.get(source)) or 'None'}"
+            )
+            st.write(f"Average fit across scored jobs: {metrics['avg_fit']}/100")
+            st.write(f"Jobs needing retry: {metrics['needs_retry']}")
+            st.write(f"Skipped jobs: {metrics['skipped']}")
+
+        st.subheader("Recent runs")
+        _render_run_history(runs[:5])
+
+
+def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
+    if not records:
+        st.info("No jobs saved yet. Run the search to populate this profile.")
+        return
+
+    filter_cols = st.columns(4)
+    source_options = sorted({record["source_label"] for record in records})
+    status_options = sorted({record["status_label"] for record in records})
+    score_state_options = sorted({record["score_state"] for record in records})
+
+    selected_sources = filter_cols[0].multiselect("Source", source_options, default=source_options)
+    selected_statuses = filter_cols[1].multiselect("Job status", status_options, default=status_options)
+    selected_score_states = filter_cols[2].multiselect("Score state", score_state_options, default=score_state_options)
+    min_fit = filter_cols[3].slider("Minimum fit", min_value=0, max_value=100, value=0, step=5)
+    search = st.text_input("Search jobs", placeholder="Title, company, location, or keywords")
+
+    filtered = records
+    if selected_sources:
+        filtered = [record for record in filtered if record["source_label"] in selected_sources]
+    if selected_statuses:
+        filtered = [record for record in filtered if record["status_label"] in selected_statuses]
+    if selected_score_states:
+        filtered = [record for record in filtered if record["score_state"] in selected_score_states]
+    if min_fit > 0:
+        filtered = [
+            record
+            for record in filtered
+            if record["fit_score"] is not None and record["fit_score"] >= min_fit
+        ]
+    if search.strip():
+        query = search.lower().strip()
+        filtered = [
+            record
+            for record in filtered
+            if query in " ".join(
+                [
+                    record["title"],
+                    record["company"],
+                    record["location"] or "",
+                    record["source_label"],
+                    record["one_liner"],
+                    record["raw_text"] or "",
+                ]
+            ).lower()
+        ]
+
+    st.caption(f"Showing {len(filtered)} of {len(records)} jobs")
+
+    if not filtered:
         st.warning("No jobs match the current filters.")
         return
 
-    # ── Table ─────────────────────────────────────────────────────────────────
-    selected_id = st.session_state.get("selected_job_id")
-
-    # Add a "👁" checkbox column so the user can select a row for the detail panel
-    table_df = filtered[["id", "score", "ats", "title", "company",
-                          "location", "source", "status", "url"]].copy()
-    table_df.insert(0, "👁", table_df["id"] == selected_id)
-
-    edited = st.data_editor(
-        table_df,
-        column_config={
-            "👁":       st.column_config.CheckboxColumn("👁", width="small"),
-            "id":       None,  # hidden
-            "score":    st.column_config.TextColumn("Score", width="small"),
-            "ats":      st.column_config.NumberColumn("ATS", width="small"),
-            "title":    st.column_config.TextColumn("Title"),
-            "company":  st.column_config.TextColumn("Company"),
-            "location": st.column_config.TextColumn("Location"),
-            "source":   st.column_config.TextColumn("Source", width="small"),
-            "status":   st.column_config.SelectboxColumn(
-                "Status",
-                options=["new", "applied", "skipped"],
-                width="small",
-            ),
-            "url": st.column_config.LinkColumn("Link", width="small"),
-        },
-        disabled=["score", "ats", "title", "company", "location", "source", "url"],
-        use_container_width=True,
-        hide_index=True,
-        key="jobs_table",
+    frame = pd.DataFrame(
+        [
+            {
+                "Title": record["title"],
+                "Company": record["company"],
+                "Location": record["location"],
+                "Source": record["source_label"],
+                "Job status": record["status_label"],
+                "Score state": record["score_state"],
+                "Fit": record["fit_score"],
+                "ATS": record["ats_score"],
+                "Summary": record["one_liner"],
+                "Posting": record["url"],
+            }
+            for record in filtered
+        ]
     )
+    st.dataframe(frame, use_container_width=True, hide_index=True)
 
-    # ── Detect changes and persist ─────────────────────────────────────────────
-    needs_rerun  = False
-    new_selected = selected_id  # default: keep current selection
+    options = {
+        record["id"]: f"{record['title']} - {record['company']} ({record['score_state']})"
+        for record in filtered
+    }
+    selected_id = st.selectbox(
+        "Inspect a job",
+        options=list(options.keys()),
+        format_func=lambda item_id: options[item_id],
+    )
+    selected = next(record for record in filtered if record["id"] == selected_id)
+    _render_job_detail(selected, slug)
 
-    for i in range(len(filtered)):
-        job_id = filtered.iloc[i]["id"]
 
-        # Status change → persist immediately
-        orig_status = filtered.iloc[i]["status"]
-        new_status  = edited.iloc[i]["status"]
-        if orig_status != new_status and new_status in ("new", "applied", "skipped"):
-            update_job_status(job_id, new_status, profile=slug)
-            needs_rerun = True
+def _render_activity_tab(slug: str, runs: list[dict[str, Any]], metrics: dict[str, Any]) -> None:
+    left, right = st.columns([1.1, 0.9], gap="large")
+    with left:
+        st.subheader("Run log")
+        _render_run_history(runs)
 
-        # View toggle → update selected_job_id
-        was_selected = (job_id == selected_id)
-        is_selected  = bool(edited.iloc[i]["👁"])
-        if is_selected and not was_selected:
-            new_selected = job_id
-            needs_rerun  = True
-        elif not is_selected and was_selected:
-            new_selected = None
-            needs_rerun  = True
+    with right:
+        st.subheader("Source mix")
+        source_counts = metrics["source_counts"]
+        if source_counts:
+            chart_df = pd.DataFrame(
+                {"Source": list(source_counts.keys()), "Jobs": list(source_counts.values())}
+            ).set_index("Source")
+            st.bar_chart(chart_df)
+        else:
+            st.info("No source data yet.")
 
-    if new_selected != selected_id:
-        st.session_state.selected_job_id = new_selected
+        st.subheader("Cached ATS slugs")
+        gh_slugs = load_discovered_slugs(ats="greenhouse", profile=slug)
+        lv_slugs = load_discovered_slugs(ats="lever", profile=slug)
+        st.write(f"Greenhouse cache: {len(gh_slugs)}")
+        st.write(f"Lever cache: {len(lv_slugs)}")
 
-    if needs_rerun:
+
+def _render_profile_tab(config: dict[str, Any], raw_config: dict[str, Any]) -> None:
+    profile_cfg = config.get("profile", {})
+    prefs = config.get("preferences", {})
+    loc = prefs.get("location", {})
+    compensation = prefs.get("compensation", {})
+
+    top = st.columns(2, gap="large")
+    with top[0]:
+        st.subheader("Candidate summary")
+        with st.container(border=True):
+            st.write(profile_cfg.get("bio") or "No bio saved.")
+            st.write(f"Name: {profile_cfg.get('name', 'Unknown')}")
+            st.write(f"Job type: {profile_cfg.get('job_type', 'fulltime')}")
+            if profile_cfg.get("resume_file"):
+                st.write(f"Resume file: {profile_cfg['resume_file']}")
+            else:
+                resume_text = profile_cfg.get("resume") or ""
+                st.write(f"Resume text stored inline: {len(resume_text)} characters")
+
+    with top[1]:
+        st.subheader("Search preferences")
+        with st.container(border=True):
+            st.write(f"Remote OK: {loc.get('remote_ok', True)}")
+            st.write(
+                "Preferred locations: "
+                + (", ".join(loc.get("preferred_locations", [])) or "None")
+            )
+            if "min_salary" in compensation:
+                st.write(f"Minimum salary: ${int(compensation['min_salary']):,}")
+            if "monthly_stipend" in compensation:
+                st.write(f"Monthly stipend target: ${int(compensation['monthly_stipend']):,}")
+
+    st.subheader("Target titles")
+    st.write(", ".join(prefs.get("titles", [])) or "None saved")
+
+    st.subheader("Desired skills")
+    st.write(", ".join(prefs.get("desired_skills", [])) or "None saved")
+
+    st.subheader("Source configuration")
+    source_lines: list[str] = []
+    for source_name, source_cfg in raw_config.get("sources", {}).items():
+        if source_name in {"greenhouse", "lever"}:
+            companies = source_cfg.get("companies", [])
+            source_lines.append(f"{source_name}: enabled={source_cfg.get('enabled', True)} ({len(companies)} companies)")
+        else:
+            source_lines.append(f"{source_name}: enabled={source_cfg.get('enabled', False)}")
+    if source_lines:
+        for line in source_lines:
+            st.write(f"- {line}")
+    else:
+        st.write("No source configuration found.")
+
+
+def _lines_to_list(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any], metrics: dict[str, Any]) -> None:
+    editable = copy.deepcopy(raw_config)
+    editable.setdefault("scoring", {})
+    editable.setdefault("preferences", {})
+    editable["preferences"].setdefault("location", {})
+    editable["preferences"].setdefault("compensation", {})
+    editable.setdefault("sources", {})
+    editable["sources"].setdefault("greenhouse", {"enabled": True, "companies": []})
+    editable["sources"].setdefault("lever", {"enabled": True, "companies": []})
+    editable["sources"].setdefault("hn", {"enabled": False})
+
+    with st.form(f"settings_form_{slug}"):
+        st.subheader("Search and scoring")
+        min_display = st.slider(
+            "Minimum display score",
+            min_value=0,
+            max_value=100,
+            value=int(editable["scoring"].get("min_display_score", 60)),
+            step=5,
+        )
+        titles_text = st.text_area(
+            "Target titles",
+            value="\n".join(editable["preferences"].get("titles", [])),
+            height=120,
+        )
+        skills_text = st.text_area(
+            "Desired skills",
+            value="\n".join(editable["preferences"].get("desired_skills", [])),
+            height=120,
+        )
+        hard_no_text = st.text_area(
+            "Hard-no keywords",
+            value="\n".join(editable["preferences"].get("hard_no_keywords", [])),
+            height=100,
+        )
+
+        st.subheader("Location and compensation")
+        remote_ok = st.checkbox(
+            "Remote OK",
+            value=bool(editable["preferences"]["location"].get("remote_ok", True)),
+        )
+        preferred_locations_text = st.text_area(
+            "Preferred locations",
+            value="\n".join(editable["preferences"]["location"].get("preferred_locations", [])),
+            height=90,
+        )
+
+        compensation = editable["preferences"]["compensation"]
+        salary_value = int(compensation.get("min_salary", 0))
+        stipend_value = int(compensation.get("monthly_stipend", 0))
+        if "min_salary" in compensation or "monthly_stipend" not in compensation:
+            minimum_salary = st.number_input(
+                "Minimum salary",
+                min_value=0,
+                step=5000,
+                value=salary_value,
+            )
+            monthly_stipend = None
+        else:
+            monthly_stipend = st.number_input(
+                "Monthly stipend target",
+                min_value=0,
+                step=500,
+                value=stipend_value,
+            )
+            minimum_salary = None
+
+        st.subheader("Sources")
+        source_cols = st.columns(3)
+        gh_enabled = source_cols[0].checkbox(
+            "Greenhouse",
+            value=bool(editable["sources"]["greenhouse"].get("enabled", True)),
+        )
+        lv_enabled = source_cols[1].checkbox(
+            "Lever",
+            value=bool(editable["sources"]["lever"].get("enabled", True)),
+        )
+        hn_enabled = source_cols[2].checkbox(
+            "HN Who's Hiring",
+            value=bool(editable["sources"]["hn"].get("enabled", False)),
+        )
+
+        gh_companies = st.text_area(
+            "Greenhouse companies",
+            value="\n".join(editable["sources"]["greenhouse"].get("companies", [])),
+            height=160,
+        )
+        lv_companies = st.text_area(
+            "Lever companies",
+            value="\n".join(editable["sources"]["lever"].get("companies", [])),
+            height=160,
+        )
+
+        submitted = st.form_submit_button("Save settings", type="primary")
+
+    if submitted:
+        editable["scoring"]["min_display_score"] = int(min_display)
+        editable["preferences"]["titles"] = _lines_to_list(titles_text)
+        editable["preferences"]["desired_skills"] = _lines_to_list(skills_text)
+        editable["preferences"]["hard_no_keywords"] = _lines_to_list(hard_no_text)
+        editable["preferences"]["location"]["remote_ok"] = remote_ok
+        editable["preferences"]["location"]["preferred_locations"] = _lines_to_list(preferred_locations_text)
+        if minimum_salary is not None:
+            editable["preferences"]["compensation"]["min_salary"] = int(minimum_salary)
+        if monthly_stipend is not None:
+            editable["preferences"]["compensation"]["monthly_stipend"] = int(monthly_stipend)
+        editable["sources"]["greenhouse"]["enabled"] = gh_enabled
+        editable["sources"]["greenhouse"]["companies"] = _lines_to_list(gh_companies)
+        editable["sources"]["lever"]["enabled"] = lv_enabled
+        editable["sources"]["lever"]["companies"] = _lines_to_list(lv_companies)
+        editable["sources"]["hn"]["enabled"] = hn_enabled
+
+        _write_profile_config(slug, editable)
+        _set_notice(slug, "success", "Settings saved.")
         st.rerun()
 
-    # ── Detail panel ───────────────────────────────────────────────────────────
-    if selected_id:
-        selected_result = next(
-            (r for r in results if r["job"].id == selected_id), None
-        )
-        if selected_result:
-            st.divider()
-            _render_job_detail(selected_result)
-
-
-# ── Tab 2: Analytics ──────────────────────────────────────────────────────────
-
-def _render_tab_analytics(results: list, slug: str) -> None:
-    if not results:
-        st.info("No scored jobs yet. Run a job search to see analytics.")
-        return
-
-    df     = _results_to_df(results)
-    scores = df["fit_score"]
-
-    st.markdown("### Pipeline run history")
-    recent_runs = get_recent_runs(profile=slug)
-    if recent_runs:
-        history_rows = []
-        for run in recent_runs:
-            history_rows.append({
-                "Started": run["started_at"][:19],
-                "Finished": run["finished_at"][:19] if run.get("finished_at") else "running",
-                "Status": "✅ Complete" if run["status"] == "complete" else "⚠️ " + run["status"],
-                "Saved": run["jobs_saved"],
-                "Scraped": run["jobs_scraped"],
-                "Filtered": run["jobs_filtered"],
-                "Scored": run["jobs_scored"],
-                "Avg fit": round(run.get("avg_fit_score") or 0, 1),
-                "Errors": len(run.get("errors", [])),
-            })
-        st.dataframe(
-            pd.DataFrame(history_rows),
-            use_container_width=True,
-        )
-    else:
-        st.info("No pipeline runs recorded yet. Run the job search to populate history.")
-
-    st.markdown("---")
-    row1c1, row1c2 = st.columns(2)
-
-    with row1c1:
-        st.markdown("**Score distribution**")
-        bands  = [f"{b}–{b+9}" for b in range(0, 100, 10)]
-        counts = [int(((scores >= b) & (scores < b + 10)).sum()) for b in range(0, 100, 10)]
-        st.bar_chart(pd.DataFrame({"Jobs": counts}, index=bands))
-
-    with row1c2:
-        st.markdown("**Jobs by source**")
-        st.bar_chart(df["source"].value_counts().rename("Jobs"))
-
-    row2c1, row2c2 = st.columns(2)
-
-    with row2c1:
-        st.markdown("**Jobs by status**")
-        st.bar_chart(df["status"].value_counts().rename("Jobs"))
-
-    with row2c2:
-        st.markdown("**Top 10 companies by avg fit score**")
-        top = (
-            df.groupby("company")["fit_score"]
-            .mean()
-            .nlargest(10)
-            .round(1)
-            .rename("Avg Score")
-        )
-        st.bar_chart(top)
-
-    st.markdown("**ATS score vs fit score**")
-    st.scatter_chart(
-        df[["fit_score", "ats"]].rename(columns={"fit_score": "Fit Score", "ats": "ATS Score"}),
-        x="Fit Score",
-        y="ATS Score",
-    )
-
-
-# ── Tab 3: Profile ────────────────────────────────────────────────────────────
-
-def _render_tab_profile(config: dict, slug: str) -> None:
-    prof  = config.get("profile", {})
-    prefs = config.get("preferences", {})
-    llm   = config.get("llm", {})
-    job_type = prof.get("job_type", "fulltime")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"**Name:** {prof.get('name', '—')}")
-        st.markdown(f"**Job type:** {'Internship' if job_type == 'internship' else 'Full-time'}")
-        if job_type == "internship":
-            season = prof.get("target_season", "")
-            school = prof.get("school", "")
-            major  = prof.get("major", "")
-            st.markdown(f"**Target:** {season}  ·  {school}  ·  {major}")
-        st.markdown(f"**Bio:** {prof.get('bio', '—')}")
-
-        st.markdown("**Target titles**")
-        for t in prefs.get("titles", []):
-            st.write(f"· {t}")
-
-        st.markdown("**Desired skills**")
-        st.write(", ".join(prefs.get("desired_skills", [])) or "—")
-
-    with col2:
-        loc = prefs.get("location", {})
-        st.markdown(f"**Remote OK:** {'Yes' if loc.get('remote_ok') else 'No'}")
-        preferred = ", ".join(loc.get("preferred_locations", []))
-        if preferred:
-            st.markdown(f"**Preferred locations:** {preferred}")
-
-        comp = prefs.get("compensation", {})
-        if job_type == "fulltime":
-            sal = comp.get("min_salary", 0)
-            st.markdown(f"**Min salary:** ${sal:,}")
-        else:
-            stip = comp.get("monthly_stipend", 0)
-            st.markdown(f"**Expected stipend:** {'${:,}/mo'.format(stip) if stip else '—'}")
-
-        provider = llm.get("provider", "—")
-        model    = llm.get("model", {}).get(provider, "—")
-        st.markdown(f"**LLM:** {provider} — `{model}`")
-
     st.divider()
+    st.subheader("Maintenance")
 
-    resume_text = prof.get("resume", "")
-    if resume_text:
-        with st.expander("Resume (click to expand)"):
-            st.text(resume_text[:3000] + ("…" if len(resume_text) > 3000 else ""))
-    elif prof.get("resume_file"):
-        st.caption(f"Resume PDF: `{prof.get('resume_file')}`")
-
-    st.divider()
-    st.info(
-        f"To edit your profile, update `profiles/{slug}/config.yaml` directly "
-        "and restart the dashboard."
-    )
-
-
-# ── Tab 4: Settings ───────────────────────────────────────────────────────────
-
-def _render_tab_settings(config: dict, slug: str) -> None:
-    scoring  = config.get("scoring", {})
-    weights  = scoring.get("weights", {})
-    cfg_path = _PROFILES_DIR / slug / "config.yaml"
-
-    # ── Display ───────────────────────────────────────────────────────────────
-    st.subheader("Display")
-    min_score = st.slider(
-        "Min display score",
-        0, 100, int(scoring.get("min_display_score", 60)),
-        key="settings_min_score",
-    )
-
-    # ── Scoring weights ───────────────────────────────────────────────────────
-    st.subheader("Scoring weights")
-    st.caption("Must sum to 1.0")
-    dim_order = ["role_fit", "stack_match", "seniority", "location", "growth", "compensation"]
-    new_weights = {}
-    for dim in dim_order:
-        new_weights[dim] = st.slider(
-            dim.replace("_", " ").title(),
-            0.0, 1.0, float(weights.get(dim, 0.0)), 0.05,
-            key=f"wt_{dim}",
-        )
-    total = round(sum(new_weights.values()), 4)
-    if abs(total - 1.0) > 0.01:
-        st.warning(f"Weights sum to **{total}** — they must sum to 1.0 before saving.")
-    else:
-        st.success(f"Weights sum to {total} ✓")
-
-    if st.button("💾 Save settings", type="primary"):
-        if abs(total - 1.0) > 0.01:
-            st.error("Fix the weights before saving.")
-        else:
-            try:
-                with open(cfg_path, encoding="utf-8") as f:
-                    raw = yaml.safe_load(f)
-                raw.setdefault("scoring", {})["min_display_score"] = min_score
-                raw["scoring"]["weights"] = new_weights
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    yaml.dump(raw, f, default_flow_style=False,
-                              sort_keys=False, allow_unicode=True)
-                st.success("Settings saved. Restart the dashboard to apply weight changes.")
-            except Exception as exc:
-                st.error(f"Failed to save: {exc}")
-
-    st.divider()
-
-    # ── Re-score all jobs ─────────────────────────────────────────────────────
-    st.subheader("Re-score all jobs")
-    n_jobs   = _job_counts(slug).get("total", 0)
-    provider = config.get("llm", {}).get("provider", "groq")
-    rpm      = config.get("llm", {}).get("rate_limits", {}).get(provider, {}).get("max_rpm", 10)
-    est_min  = max(1, round(n_jobs / max(rpm, 1)))
-    st.caption(f"Estimated ~{est_min} min for {n_jobs} jobs at {rpm} RPM ({provider})")
-
-    if not st.session_state.get("rescore_confirm"):
-        if st.button("🔄 Re-score all jobs"):
-            st.session_state.rescore_confirm = True
-            st.rerun()
-    else:
-        st.warning("This will delete all existing scores and re-score from scratch.")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✓ Confirm re-score", type="primary", key="confirm_rescore"):
-                key_err = _check_api_key(config)
-                if key_err:
-                    st.error(key_err)
-                else:
-                    with st.spinner("Re-scoring all jobs…"):
+    action_cols = st.columns(2, gap="large")
+    with action_cols[0]:
+        st.write("Re-score everything currently in this profile.")
+        if st.button("Reset scores and rescore", key=f"rescore_all_{slug}"):
+            missing = _check_api_key(config)
+            if missing:
+                st.error(f"Scoring requires {missing} in your environment.")
+            else:
+                try:
+                    with st.spinner("Resetting scores and rescoring jobs..."):
+                        run_id = start_run(profile=slug, source="dashboard_rescore")
                         rescore_reset(profile=slug)
-                        try:
-                            score_all_jobs(config, yes=True, profile=slug)
-                        except RateLimitReached:
-                            st.warning("Daily rate limit hit — scoring stopped early.")
-                    st.session_state.rescore_confirm = False
-                    st.success("Re-scoring complete.")
+                        results = score_all_jobs(config, yes=True, profile=slug)
+                        scored = [item for item in results if item.get("fit_score", 0) > 0]
+                        avg_fit = round(
+                            sum(item["fit_score"] for item in scored) / len(scored),
+                            1,
+                        ) if scored else 0.0
+                        finish_run(
+                            run_id,
+                            jobs_scraped=0,
+                            jobs_filtered=0,
+                            jobs_saved=0,
+                            jobs_scored=len(scored),
+                            avg_fit_score=avg_fit,
+                            errors=[],
+                            status="complete",
+                            profile=slug,
+                        )
+                    _set_notice(slug, "success", f"Re-scored {len(scored)} jobs.")
                     st.rerun()
-        with c2:
-            if st.button("Cancel", key="cancel_rescore"):
-                st.session_state.rescore_confirm = False
-                st.rerun()
+                except Exception as exc:
+                    st.error(f"Re-score failed: {exc}")
 
-    st.divider()
-
-    # ── Manage companies ──────────────────────────────────────────────────────
-    st.subheader("Manage Companies")
-    st.caption("Add or remove companies to search for jobs. Changes take effect on next job search.")
-    
-    sources = config.get("sources", {})
-    gh_companies = sources.get("greenhouse", {}).get("companies", [])
-    lv_companies = sources.get("lever", {}).get("companies", [])
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("**Greenhouse Companies**")
-        new_gh = st.text_input("Add Greenhouse company slug", key="add_gh")
-        if st.button("➕ Add Greenhouse", key="add_gh_btn") and new_gh.strip():
-            if new_gh.strip() not in gh_companies:
-                gh_companies.append(new_gh.strip())
-                sources.setdefault("greenhouse", {})["companies"] = gh_companies
-                config["sources"] = sources
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-                st.success(f"Added {new_gh}")
-                st.rerun()
-            else:
-                st.warning("Company already in list")
-        
-        # Remove companies
-        to_remove_gh = st.multiselect("Remove Greenhouse companies", gh_companies, key="remove_gh")
-        if st.button("➖ Remove Selected", key="remove_gh_btn") and to_remove_gh:
-            gh_companies = [c for c in gh_companies if c not in to_remove_gh]
-            sources.setdefault("greenhouse", {})["companies"] = gh_companies
-            config["sources"] = sources
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-            st.success(f"Removed {len(to_remove_gh)} companies")
-            st.rerun()
-    
-    with col2:
-        st.markdown("**Lever Companies**")
-        new_lv = st.text_input("Add Lever company slug", key="add_lv")
-        if st.button("➕ Add Lever", key="add_lv_btn") and new_lv.strip():
-            if new_lv.strip() not in lv_companies:
-                lv_companies.append(new_lv.strip())
-                sources.setdefault("lever", {})["companies"] = lv_companies
-                config["sources"] = sources
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-                st.success(f"Added {new_lv}")
-                st.rerun()
-            else:
-                st.warning("Company already in list")
-        
-        # Remove companies
-        to_remove_lv = st.multiselect("Remove Lever companies", lv_companies, key="remove_lv")
-        if st.button("➖ Remove Selected", key="remove_lv_btn") and to_remove_lv:
-            lv_companies = [c for c in lv_companies if c not in to_remove_lv]
-            sources.setdefault("lever", {})["companies"] = lv_companies
-            config["sources"] = sources
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-            st.success(f"Removed {len(to_remove_lv)} companies")
-            st.rerun()
-
-    st.divider()
-
-    # ── Clear all jobs ─────────────────────────────────────────────────────────
-    st.subheader("Danger zone")
-    if not st.session_state.get("clear_confirm_1"):
-        if st.button("☢️ Clear all jobs"):
-            st.session_state.clear_confirm_1 = True
-            st.rerun()
-    elif not st.session_state.get("clear_confirm_2"):
-        st.error(
-            f"This will permanently delete all **{n_jobs} jobs** and their scores. "
-            "This cannot be undone."
+    with action_cols[1]:
+        st.write("Clear jobs, scores, and run history for a clean slate.")
+        confirm_clear = st.checkbox(
+            f"I understand this will erase the current profile database ({metrics['total']} jobs).",
+            key=f"confirm_clear_{slug}",
         )
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("I understand — delete everything", type="primary",
-                         key="clear_confirm_2_btn"):
-                st.session_state.clear_confirm_2 = True
-                st.rerun()
-        with c2:
-            if st.button("Cancel", key="cancel_clear_1"):
-                st.session_state.clear_confirm_1 = False
-                st.rerun()
-    else:
-        st.error("Last chance — this is permanent.")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("☢️ Yes, delete everything", type="primary",
-                         key="clear_final_btn"):
-                _clear_all_jobs(slug)
-                st.session_state.clear_confirm_1 = False
-                st.session_state.clear_confirm_2 = False
-                st.session_state.selected_job_id = None
-                st.success("All jobs cleared.")
-                st.rerun()
-        with c2:
-            if st.button("Cancel", key="cancel_clear_2"):
-                st.session_state.clear_confirm_1 = False
-                st.session_state.clear_confirm_2 = False
-                st.rerun()
+        if st.button("Clear profile database", key=f"clear_all_{slug}", disabled=not confirm_clear):
+            _clear_profile_jobs(slug)
+            _set_notice(slug, "success", "Profile database cleared.")
+            st.rerun()
 
-
-# ── Main dashboard ────────────────────────────────────────────────────────────
 
 def _render_profile_dashboard(slug: str) -> None:
-    """Full dashboard for the active profile."""
-    # Always sync module-level DB profile with session state
     set_active_profile(slug)
     configure_logging(profile=slug, debug=False)
     init_db(profile=slug)
 
-    config = _load_config(slug)
-    if config is None:
-        return  # error already shown by _load_config
-
-    # ── Pipeline execution (triggered by sidebar button) ──────────────────────
-    if st.session_state.get("pipeline_running"):
-        # Render sidebar first (button shows as disabled)
-        _render_sidebar(config, slug)
-
-        key_err = _check_api_key(config)
-        if key_err:
-            st.error(key_err)
-            st.session_state.pipeline_running = False
-            st.session_state.pipeline_result  = {"error": key_err}
+    try:
+        config = load_config(profile=slug)
+        raw_config = _read_profile_config(slug)
+    except Exception as exc:
+        st.error(f"Profile '{slug}' could not be loaded.")
+        st.exception(exc)
+        if st.button("Back to profile list", key=f"broken_profile_back_{slug}"):
+            st.session_state.active_profile = None
+            set_active_profile(None)
             st.rerun()
-            return
-
-        # NEW: Modern progress dashboard
-        st.title("🚀 Job Search in Progress")
-        progress_placeholder = st.empty()
-        stages_placeholder = st.empty()
-        sources_placeholder = st.empty()
-        activities_placeholder = st.empty()
-
-        # Run pipeline with progress tracking
-        with st.spinner("Running…"):
-            result, tracker = _run_pipeline(config, slug)
-
-        # Display final result
-        progress_placeholder.empty()
-        stages_placeholder.empty()
-        sources_placeholder.empty()
-        activities_placeholder.empty()
-
-        # Show final state
-        with progress_placeholder.container():
-            render_progress_header(tracker)
-
-        with stages_placeholder.container():
-            render_pipeline_stages(tracker)
-
-        if tracker.sources:
-            with sources_placeholder.container():
-                render_source_progress(tracker)
-
-        with activities_placeholder.container():
-            render_activity_feed(tracker)
-
-        # Summary
-        render_summary(tracker)
-
-        # Debug logs
-        render_debug_logs(tracker)
-
-        # Results
-        st.divider()
-        st.subheader("Results")
-        if "error" in result:
-            st.error(f"Error: {result['error']}")
-        else:
-            st.success(
-                f"✅ Pipeline complete: Found **{result['total_new']}** new jobs, "
-                f"scored **{result['scored_count']}** with avg fit **{result['avg_fit']}/10**"
-            )
-
-        st.session_state.pipeline_running = False
-        st.session_state.pipeline_result = result
-
-        # Button to return to main dashboard
-        if st.button("← Return to Dashboard"):
-            st.rerun()
-        
         return
 
-    # ── Normal render ─────────────────────────────────────────────────────────
-    _render_sidebar(config, slug)
+    records = _fetch_job_records(slug)
+    metrics = _collect_metrics(slug, records)
+    runs = get_recent_runs(limit=20, profile=slug)
+    profile_name = config.get("profile", {}).get("name", slug.replace("_", " ").title())
 
-    # Fetch all scored jobs (used by Jobs and Analytics tabs)
-    all_results = get_top_jobs(0, profile=slug)
+    _render_notice(slug)
+    _hero(profile_name, config, metrics, raw_config)
 
-    min_score_default = int(config.get("scoring", {}).get("min_display_score", 60))
+    action_cols = st.columns([1.25, 1.0, 1.0, 1.0], gap="small")
+    with action_cols[0]:
+        st.write("")
+    with action_cols[1]:
+        if st.button("Run search now", type="primary", use_container_width=True):
+            missing = _check_api_key(config)
+            if missing:
+                st.error(f"Scoring requires {missing} in your environment.")
+            else:
+                status_box = st.status("Running pipeline...", expanded=True)
+                try:
+                    result = _run_pipeline(config, slug, status_box=status_box)
+                    _set_notice(
+                        slug,
+                        "success",
+                        (
+                            f"Pipeline complete: {result['total_new']} new jobs, "
+                            f"{result['scored_count']} scored, avg fit {result['avg_fit']}/100."
+                        ),
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Pipeline failed: {exc}")
+    with action_cols[2]:
+        if st.button("Refresh data", use_container_width=True):
+            st.rerun()
+    with action_cols[3]:
+        if st.button("Switch profile", use_container_width=True):
+            st.session_state.active_profile = None
+            set_active_profile(None)
+            st.rerun()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📋 Jobs", "📊 Analytics", "👤 Profile", "⚙️ Settings"]
-    )
+    tabs = st.tabs(["Overview", "Jobs", "Activity", "Profile", "Settings"])
+    with tabs[0]:
+        _render_overview_tab(slug, config, raw_config, records, runs, metrics)
+    with tabs[1]:
+        _render_jobs_tab(records, slug)
+    with tabs[2]:
+        _render_activity_tab(slug, runs, metrics)
+    with tabs[3]:
+        _render_profile_tab(config, raw_config)
+    with tabs[4]:
+        _render_settings_tab(slug, config, raw_config, metrics)
 
-    with tab1:
-        _render_tab_jobs(all_results, slug, min_score_default)
-
-    with tab2:
-        _render_tab_analytics(all_results, slug)
-
-    with tab3:
-        _render_tab_profile(config, slug)
-
-    with tab4:
-        _render_tab_settings(config, slug)
-
-
-# ── Profile selection ─────────────────────────────────────────────────────────
 
 def _render_profile_selection() -> None:
-    st.title("🔍 Job Agent")
-    st.markdown("Select your profile to continue, or create a new one.")
-
+    set_active_profile(None)
     profiles = list_profiles()
 
-    if profiles:
-        st.subheader("Your profiles")
-        for p in profiles:
-            counts    = _job_counts(p["slug"])
-            is_intern = p["job_type"] == "internship"
-            badge     = "🎓 Internship" if is_intern else "💼 Full-time"
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(
-                    f"**{p['name']}** &nbsp; `{p['slug']}` &nbsp; {badge}  \n"
-                    f"<small>{counts['total']} jobs · {counts['scored']} scored</small>",
-                    unsafe_allow_html=True,
-                )
-            with col2:
-                if st.button("Continue →", key=f"sel_{p['slug']}"):
-                    st.session_state.active_profile  = p["slug"]
-                    st.session_state.show_onboarding = False
-                    set_active_profile(p["slug"])
-                    st.rerun()
-        st.divider()
-    else:
-        st.info("No profiles yet. Create your first profile to get started.")
+    st.markdown(
+        """
+        <section class="hero-shell">
+            <div class="hero-kicker">Job Search Dashboard</div>
+            <h1 class="hero-title">Choose a profile and get a real picture of the search.</h1>
+            <p class="hero-copy">
+                Each profile keeps its own config, database, and run history. Open one to browse
+                top matches, pending jobs, failed scores, and source activity in one place.
+            </p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if st.button(
-        "➕  Add new profile",
-        type="primary" if not profiles else "secondary",
-    ):
+    top = st.columns(3)
+    with top[0]:
+        st.metric("Profiles", len(profiles))
+    with top[1]:
+        st.metric("Tracked jobs", sum(profile["counts"]["total"] for profile in profiles))
+    with top[2]:
+        st.metric("Scored jobs", sum(profile["counts"]["scored"] for profile in profiles))
+
+    if not profiles:
+        st.info("No profiles found yet. Create one to get started.")
+    else:
+        columns = st.columns(3, gap="large")
+        for index, profile in enumerate(profiles):
+            counts = profile["counts"]
+            with columns[index % 3]:
+                with st.container(border=True):
+                    st.markdown(f"### {profile['name']}")
+                    st.caption(f"{profile['slug']} · {profile['provider']} · {profile['job_type']}")
+                    st.write(f"{counts['total']} jobs tracked")
+                    st.write(f"{counts['scored']} jobs scored")
+                    if st.button("Open profile", key=f"open_profile_{profile['slug']}"):
+                        st.session_state.active_profile = profile["slug"]
+                        st.session_state.show_onboarding = False
+                        set_active_profile(profile["slug"])
+                        st.rerun()
+
+    st.divider()
+    if st.button("Create new profile", type="primary", key="create_profile"):
         st.session_state.show_onboarding = True
         st.session_state.onboarding_step = 1
         st.session_state.onboarding_data = {}
         st.rerun()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 def main() -> None:
-    # Initialise all session state keys used across the app
-    _defaults = {
-        "active_profile":   None,
-        "show_onboarding":  False,
-        "selected_job_id":  None,
-        "pipeline_running": False,
-        "pipeline_result":  None,
-        "clear_confirm_1":  False,
-        "clear_confirm_2":  False,
-        "rescore_confirm":  False,
-        "onboarding_step":  1,
-        "onboarding_data":  {},
-    }
-    for key, val in _defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-    # Configure logging for the active profile or default session
-    profile = st.session_state.active_profile
-    configure_logging(profile=profile or "default", debug=False)
+    _init_state()
+    _apply_styles()
 
     if st.session_state.show_onboarding:
-        if st.button("✕  Cancel", key="cancel_onboarding"):
-            st.session_state.show_onboarding = False
-            st.session_state.onboarding_step = 1
-            st.session_state.onboarding_data = {}
-            st.rerun()
+        top_cols = st.columns([1.0, 4.0])
+        with top_cols[0]:
+            if st.button("Back", key="cancel_onboarding"):
+                st.session_state.show_onboarding = False
+                st.session_state.onboarding_step = 1
+                st.session_state.onboarding_data = {}
+                st.rerun()
+        with top_cols[1]:
+            st.write("")
         render_onboarding()
+        return
 
-    elif st.session_state.active_profile:
+    if st.session_state.active_profile:
         _render_profile_dashboard(st.session_state.active_profile)
-
     else:
         _render_profile_selection()
 
