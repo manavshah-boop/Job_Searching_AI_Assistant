@@ -575,7 +575,7 @@ def _step_llm_provider() -> None:
             for provider in _PROVIDERS
         ]
     )
-    st.dataframe(comparison_frame, use_container_width=True, hide_index=True)
+    st.dataframe(comparison_frame, width="stretch", hide_index=True, placeholder="")
 
     # Provider selection
     current_label = data.get("provider_label", _PROVIDER_LABELS[0])
@@ -678,6 +678,11 @@ def _step_review_create() -> None:
             st.session_state.onboarding_step = 4
             st.rerun()
     with col2:
+        celebrate = st.checkbox(
+            "Celebrate when the profile is created",
+            value=bool(data.get("celebrate", st.session_state.get("celebrate_profile_create", False))),
+            key="celebrate_profile_create",
+        )
         if st.button("Create profile", type="primary", key="step5_create"):
             if not profile_slug:
                 st.error("Profile name cannot be empty.")
@@ -692,6 +697,7 @@ def _step_review_create() -> None:
                 return
 
             data["profile_slug"] = profile_slug
+            data["celebrate"] = celebrate
             try:
                 create_profile(data)
             except Exception as e:
@@ -708,7 +714,8 @@ def _step_review_create() -> None:
                 f"Profile '{profile_slug}' created! "
                 "Your profile is ready. Go to the dashboard to start your first job search."
             )
-            st.balloons()
+            if celebrate:
+                st.balloons()
             st.rerun()
 
 

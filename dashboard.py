@@ -31,6 +31,7 @@ from onboarding import render_onboarding
 from scraper import scrape_greenhouse, scrape_hn, scrape_lever
 from scorer import RateLimitReached, score_all_jobs
 from theirstack import get_or_discover_slugs
+from ui_shell import callout, chip_row, panel, stat_row
 
 load_dotenv()
 
@@ -64,6 +65,7 @@ def _init_state() -> None:
         "onboarding_step": 1,
         "onboarding_data": {},
         "dashboard_notice": None,
+        "celebrate_profile_create": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -187,6 +189,52 @@ def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
     return frame
 
 
+def summarize_run_errors(errors: list[str], preview_chars: int = 72) -> str:
+    if not errors:
+        return "None"
+
+    preview = errors[0].strip()
+    if len(preview) > preview_chars:
+        preview = preview[: preview_chars - 1].rstrip() + "…"
+    if len(errors) == 1:
+        return preview
+    return f"{preview} (+{len(errors) - 1} more)"
+
+
+def _summarize_filter_selection(selected: list[str], all_options: list[str]) -> str:
+    if not selected:
+        return "None"
+    if len(selected) == len(all_options):
+        return "All"
+    if len(selected) <= 2:
+        return ", ".join(selected)
+    return f"{selected[0]}, {selected[1]} +{len(selected) - 2}"
+
+
+def build_jobs_filter_chips(
+    selected_sources: list[str],
+    source_options: list[str],
+    selected_statuses: list[str],
+    status_options: list[str],
+    selected_score_states: list[str],
+    score_state_options: list[str],
+    min_fit: int,
+    search: str,
+    include_full_text: bool,
+) -> list[str]:
+    chips = [
+        f"Sources: {_summarize_filter_selection(selected_sources, source_options)}",
+        f"Status: {_summarize_filter_selection(selected_statuses, status_options)}",
+        f"Scoring: {_summarize_filter_selection(selected_score_states, score_state_options)}",
+        f"Min fit: {min_fit}+" if min_fit > 0 else "Min fit: Any",
+    ]
+    if search.strip():
+        chips.append(f"Search: {search.strip()}")
+    if include_full_text:
+        chips.append("Full text search: On")
+    return chips
+
+
 def _apply_styles() -> None:
     st.markdown(
         """
@@ -218,6 +266,11 @@ def _apply_styles() -> None:
             padding-top: 2rem;
             padding-bottom: 3rem;
             max-width: 1280px;
+        }
+
+        div[data-testid="stSidebar"] > div:first-child {
+            background: linear-gradient(180deg, #f6fbfb 0%, #ffffff 100%);
+            border-right: 1px solid rgba(15, 23, 42, 0.08);
         }
 
         h1, h2, h3 {
@@ -351,6 +404,45 @@ def _apply_styles() -> None:
             font-size: 0.92rem;
         }
 
+        .shell-panel-head {
+            margin-bottom: 0.9rem;
+        }
+
+        .shell-panel-title {
+            font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+            font-size: 1.05rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: var(--text);
+        }
+
+        .shell-panel-subtitle {
+            margin-top: 0.2rem;
+            color: var(--muted);
+            font-size: 0.92rem;
+            line-height: 1.45;
+        }
+
+        .shell-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            margin: 0.2rem 0 0.75rem;
+        }
+
+        .shell-chip {
+            display: inline-flex;
+            align-items: center;
+            min-height: 2rem;
+            padding: 0.32rem 0.72rem;
+            border-radius: 999px;
+            background: #eef7f6;
+            border: 1px solid rgba(15, 118, 110, 0.16);
+            color: var(--accent);
+            font-size: 0.84rem;
+            line-height: 1.2;
+        }
+
         .stApp a:focus-visible,
         .stApp button:focus-visible,
         .stApp [role="button"]:focus-visible,
@@ -365,6 +457,11 @@ def _apply_styles() -> None:
         div[data-testid="stLinkButton"] {
             margin-top: 0.2rem;
             margin-bottom: 0.35rem;
+        }
+
+        div[data-testid="stButton"] > button,
+        div[data-testid="stLinkButton"] > a {
+            min-height: 2.75rem;
         }
 
         @media (prefers-reduced-motion: reduce) {
@@ -791,7 +888,7 @@ def _hero(profile_name: str, config: dict[str, Any], metrics: dict[str, Any], ra
 def _render_top_matches(records: list[dict[str, Any]]) -> None:
     scored = [record for record in records if record["fit_score"] is not None]
     if not scored:
-        st.info("No scored jobs yet. Run the pipeline to populate your top matches.")
+        callout("info", "No scored jobs yet", "Run the pipeline to populate your top matches.")
         return
 
     for record in scored[:6]:
@@ -822,83 +919,119 @@ def _render_top_matches(records: list[dict[str, Any]]) -> None:
 
 def _render_run_history(runs: list[dict[str, Any]]) -> None:
     if not runs:
-        st.info("No run history yet. The first pipeline run will appear here.")
+        callout("info", "No run history yet", "The first pipeline run will appear here.")
         return
 
     frame = pd.DataFrame(
         [
             {
                 "Started": run.get("started_at", ""),
-                "Finished": run.get("finished_at", ""),
                 "Status": str(run.get("status", "")).title(),
                 "Saved": run.get("jobs_saved", 0),
                 "Scored": run.get("jobs_scored", 0),
                 "Avg Fit": run.get("avg_fit_score", 0) or 0,
                 "Source": run.get("source", ""),
-                "Errors": "; ".join(run.get("errors", [])),
+                "Issues": summarize_run_errors(run.get("errors", [])),
             }
             for run in runs
         ]
     )
-    st.dataframe(frame, use_container_width=True, hide_index=True)
+    st.dataframe(frame, width="stretch", hide_index=True, placeholder="")
+
+    if any(run.get("errors") for run in runs):
+        with st.expander("View full run errors", expanded=False):
+            for run in runs:
+                errors = run.get("errors", [])
+                if not errors:
+                    continue
+                st.write(
+                    f"{run.get('started_at', '')} · {str(run.get('status', '')).title()} · "
+                    f"{run.get('source', '')}"
+                )
+                for error in errors:
+                    st.code(error)
+
+
+def _set_job_status_and_refresh(slug: str, job_id: str, status: str) -> None:
+    update_job_status(job_id, status, profile=slug)
+    invalidate_dashboard_caches()
+    st.rerun()
 
 
 def _render_job_detail(record: dict[str, Any], slug: str) -> None:
-    st.subheader(record["title"])
-    st.caption(
-        f"{record['company']} · {record['location'] or 'Location not listed'} · "
-        f"{record['source_label']} · {record['status_label']}"
-    )
-
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Fit", record["fit_score"] if record["fit_score"] is not None else "N/A")
-    metric_cols[1].metric("ATS", record["ats_score"] if record["ats_score"] is not None else "N/A")
-    metric_cols[2].metric("Score state", record["score_state"])
-    metric_cols[3].metric("Attempts", record["score_attempts"] or 0)
-
-    if record["one_liner"]:
-        st.write(record["one_liner"])
-
-    if record["reasons"]:
-        st.write("Why it matched")
-        for reason in record["reasons"]:
-            st.write(f"- {reason}")
-
-    if record["flags"]:
-        st.write("Watchouts")
-        for flag in record["flags"]:
-            st.write(f"- {flag}")
-
-    if record["skill_misses"]:
-        st.write("Missing from resume")
-        for skill in record["skill_misses"]:
-            st.write(f"- {skill}")
-
-    if record["score_error"]:
-        st.error(record["score_error"])
+    with panel(
+        "Summary",
+        subtitle=(
+            f"{record['company']} · {record['location'] or 'Location not listed'} · "
+            f"{record['source_label']}"
+        ),
+    ):
+        st.markdown(f"### {record['title']}")
+        chip_row(
+            [
+                f"State: {record['score_state']}",
+                f"Job status: {record['status_label']}",
+                f"Posting source: {record['source_label']}",
+            ]
+        )
+        stat_row(
+            [
+                ("Fit", record["fit_score"] if record["fit_score"] is not None else "N/A"),
+                ("ATS", record["ats_score"] if record["ats_score"] is not None else "N/A"),
+                ("Attempts", record["score_attempts"] or 0),
+            ]
+        )
+        if record["one_liner"]:
+            st.write(record["one_liner"])
+        else:
+            st.caption("No summary was generated for this job yet.")
+        if record["score_error"]:
+            callout("warning", "Last scoring issue", record["score_error"])
 
     dims = {key: value for key, value in record["dimension_scores"].items() if value is not None}
     if dims:
-        st.bar_chart(pd.DataFrame([dims]).T.rename(columns={0: "Score"}))
+        with panel("Scoring breakdown", subtitle="Dimension scores that contributed to the fit score"):
+            st.bar_chart(pd.DataFrame([dims]).T.rename(columns={0: "Score"}))
 
-    actions = st.columns(4, gap="medium")
-    if actions[0].button("Mark new", key=f"mark_new_{record['id']}"):
-        update_job_status(record["id"], "new", profile=slug)
-        invalidate_dashboard_caches()
-        st.rerun()
-    if actions[1].button("Mark applied", key=f"mark_applied_{record['id']}"):
-        update_job_status(record["id"], "applied", profile=slug)
-        invalidate_dashboard_caches()
-        st.rerun()
-    if actions[2].button("Mark skipped", key=f"mark_skipped_{record['id']}"):
-        update_job_status(record["id"], "skipped", profile=slug)
-        invalidate_dashboard_caches()
-        st.rerun()
-    if record["url"]:
-        actions[3].link_button("Open posting", record["url"])
+    with panel("Why it matched", subtitle="Top positive signals from the scoring pass"):
+        if record["reasons"]:
+            for reason in record["reasons"]:
+                st.write(f"- {reason}")
+        else:
+            callout("info", "No match reasons saved", "This score did not include reason bullets.")
 
-    with st.expander("Job text", expanded=False):
-        st.text(record["raw_text"] or "")
+    with panel("Watchouts", subtitle="Flags and concerns worth checking before you apply"):
+        if record["flags"]:
+            for flag in record["flags"]:
+                st.write(f"- {flag}")
+        else:
+            callout("success", "No watchouts", "This job does not currently have any saved warning flags.")
+
+    with panel("Missing skills", subtitle="Resume gaps the scorer highlighted for this role"):
+        if record["skill_misses"]:
+            for skill in record["skill_misses"]:
+                st.write(f"- {skill}")
+        else:
+            callout("success", "No missing skills noted", "The scorer did not flag resume skill gaps here.")
+
+    with panel("Actions", subtitle="Update workflow status without leaving the detail view"):
+        primary_actions = st.columns(2, gap="medium")
+        if primary_actions[0].button("Mark applied", key=f"mark_applied_{record['id']}", use_container_width=True):
+            _set_job_status_and_refresh(slug, record["id"], "applied")
+        if record["url"]:
+            primary_actions[1].link_button("Open posting", record["url"], use_container_width=True)
+        else:
+            primary_actions[1].button("Posting unavailable", disabled=True, use_container_width=True)
+
+        secondary_actions = st.columns(2, gap="medium")
+        if secondary_actions[0].button("Mark new", key=f"mark_new_{record['id']}", use_container_width=True):
+            _set_job_status_and_refresh(slug, record["id"], "new")
+        if secondary_actions[1].button("Mark skipped", key=f"mark_skipped_{record['id']}", use_container_width=True):
+            _set_job_status_and_refresh(slug, record["id"], "skipped")
+
+    with panel("Job text", subtitle="Expanded posting text is hidden by default for readability"):
+        with st.expander("Show job text", expanded=False):
+            st.text(record["raw_text"] or "")
 
 
 def _render_overview_tab(
@@ -909,37 +1042,42 @@ def _render_overview_tab(
     runs: list[dict[str, Any]],
     metrics: dict[str, Any],
 ) -> None:
-    metric_cols = st.columns(5)
-    metric_cols[0].metric("Total jobs", metrics["total"])
-    metric_cols[1].metric("Scored", metrics["scored"])
-    metric_cols[2].metric("Pending", metrics["pending"])
-    metric_cols[3].metric("Failed", metrics["failed"])
-    metric_cols[4].metric("Applied", metrics["applied"])
+    stat_row(
+        [
+            ("Total jobs", metrics["total"]),
+            ("Scored", metrics["scored"]),
+            ("Pending", metrics["pending"]),
+            ("Failed", metrics["failed"]),
+            ("Applied", metrics["applied"]),
+        ]
+    )
 
     left, right = st.columns([1.25, 1.0], gap="large")
     with left:
-        st.subheader("Top matches")
-        _render_top_matches(records)
+        with panel("Top matches", subtitle="Highest-scoring roles in the current profile"):
+            _render_top_matches(records)
 
     with right:
-        st.subheader("Pipeline health")
-        with st.container(border=True):
+        with panel("Pipeline health", subtitle="Quick scan of coverage, retries, and source readiness"):
             enabled = _enabled_sources(raw_config)
+            enabled_labels = [
+                label for source, label in SOURCE_LABELS.items() if enabled.get(source)
+            ]
+            chip_row(enabled_labels or ["No sources enabled"])
             st.write(
-                f"Enabled sources: "
-                f"{', '.join(label for source, label in SOURCE_LABELS.items() if enabled.get(source)) or 'None'}"
+                f"**Average fit**: {metrics['avg_fit']}/100"
             )
-            st.write(f"Average fit across scored jobs: {metrics['avg_fit']}/100")
-            st.write(f"Jobs needing retry: {metrics['needs_retry']}")
-            st.write(f"Skipped jobs: {metrics['skipped']}")
+            st.write(f"**Jobs needing retry**: {metrics['needs_retry']}")
+            st.write(f"**Skipped jobs**: {metrics['skipped']}")
+            st.write(f"**LLM provider**: {config.get('llm', {}).get('provider', 'unknown').title()}")
 
-        st.subheader("Recent runs")
-        _render_run_history(runs[:5])
+        with panel("Recent runs", subtitle="Recent pipeline activity with compact issue summaries"):
+            _render_run_history(runs[:5])
 
 
 def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
     if not records:
-        st.info("No jobs saved yet. Run the search to populate this profile.")
+        callout("info", "No jobs saved yet", "Run the search to populate this profile.")
         return
 
     source_options = sorted({record["source_label"] for record in records})
@@ -1000,37 +1138,48 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
             )
         ]
 
+    chip_row(
+        build_jobs_filter_chips(
+            selected_sources,
+            source_options,
+            selected_statuses,
+            status_options,
+            selected_score_states,
+            score_state_options,
+            min_fit,
+            search,
+            include_full_text,
+        )
+    )
     st.caption(f"Showing {len(filtered)} of {len(records)} jobs")
 
     if not filtered:
-        st.warning("No jobs match the current filters.")
+        callout("warning", "No jobs match the current filters", "Adjust the filters or broaden the search.")
         return
 
     table_col, detail_col = st.columns([1.35, 1.0], gap="large")
     frame = build_jobs_table_frame(filtered)
 
     with table_col:
-        st.caption(
-            "Use the table search and filters to narrow jobs. Sorting or changing filters can "
-            "clear the active selection in Streamlit."
-        )
-        # Selection indexes map to the currently rendered dataframe, so a sort/filter change can
-        # reset the detail pane until the user picks a row again.
-        selection = st.dataframe(
-            frame,
-            use_container_width=True,
-            hide_index=True,
-            key=f"jobs_table_{slug}",
-            on_select="rerun",
-            selection_mode="single-row",
-            height=520,
-            column_config={
-                "id": None,
-                "Fit": st.column_config.ProgressColumn("Fit", min_value=0, max_value=100),
-                "ATS": st.column_config.ProgressColumn("ATS", min_value=0, max_value=100),
-                "Posting": st.column_config.LinkColumn("Posting", display_text="Open"),
-            },
-        )
+        with panel("Job list", subtitle="Sorting or changing filters can clear the active row selection"):
+            # Selection indexes map to the currently rendered dataframe, so a sort/filter change can
+            # reset the detail pane until the user picks a row again.
+            selection = st.dataframe(
+                frame,
+                width="stretch",
+                hide_index=True,
+                key=f"jobs_table_{slug}",
+                on_select="rerun",
+                selection_mode="single-row",
+                height=520,
+                placeholder="",
+                column_config={
+                    "id": None,
+                    "Fit": st.column_config.ProgressColumn("Fit", min_value=0, max_value=100),
+                    "ATS": st.column_config.ProgressColumn("ATS", min_value=0, max_value=100),
+                    "Posting": st.column_config.LinkColumn("Posting", display_text="Open"),
+                },
+            )
 
     selected_detail: Optional[dict[str, Any]] = None
     selected_rows = list(selection.selection.rows)
@@ -1041,9 +1190,13 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
             selected_detail = _cached_fetch_job_detail(slug, selected_id)
 
     with detail_col:
-        st.subheader("Job detail")
         if selected_detail is None:
-            st.info("Select a row from the table to review match reasons, watchouts, and job text.")
+            with panel("Job detail", subtitle="Select a row from the table to inspect this role"):
+                callout(
+                    "info",
+                    "Select a job",
+                    "Pick a row from the table to review match reasons, watchouts, actions, and job text.",
+                )
         else:
             _render_job_detail(selected_detail, slug)
 
@@ -1399,27 +1552,40 @@ def _render_profile_selection() -> None:
         unsafe_allow_html=True,
     )
 
-    top = st.columns(3)
-    with top[0]:
-        st.metric("Profiles", len(profiles))
-    with top[1]:
-        st.metric("Tracked jobs", sum(profile["counts"]["total"] for profile in profiles))
-    with top[2]:
-        st.metric("Scored jobs", sum(profile["counts"]["scored"] for profile in profiles))
+    stat_row(
+        [
+            ("Profiles", len(profiles)),
+            ("Tracked jobs", sum(profile["counts"]["total"] for profile in profiles)),
+            ("Scored jobs", sum(profile["counts"]["scored"] for profile in profiles)),
+        ]
+    )
 
     if not profiles:
-        st.info("No profiles found yet. Create one to get started.")
+        callout("info", "No profiles found yet", "Create one to get started.")
     else:
         columns = st.columns(3, gap="large")
         for index, profile in enumerate(profiles):
             counts = profile["counts"]
             with columns[index % 3]:
-                with st.container(border=True):
-                    st.markdown(f"### {profile['name']}")
-                    st.caption(f"{profile['slug']} · {profile['provider']} · {profile['job_type']}")
-                    st.write(f"{counts['total']} jobs tracked")
-                    st.write(f"{counts['scored']} jobs scored")
-                    if st.button("Open profile", key=f"open_profile_{profile['slug']}"):
+                with panel(profile["name"], subtitle=profile["slug"]):
+                    chip_row(
+                        [
+                            profile["provider"].title(),
+                            profile["job_type"].replace("_", " ").title(),
+                        ]
+                    )
+                    stat_row(
+                        [
+                            ("Tracked", counts["total"]),
+                            ("Scored", counts["scored"]),
+                        ]
+                    )
+                    if st.button(
+                        "Open profile",
+                        key=f"open_profile_{profile['slug']}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
                         st.session_state.active_profile = profile["slug"]
                         st.session_state.show_onboarding = False
                         set_active_profile(profile["slug"])

@@ -4,12 +4,15 @@ primaryColor = "#0f766e"
 backgroundColor = "#f8fbfb"
 secondaryBackgroundColor = "#ffffff"
 textColor = "#0f172a"
+borderColor = "#d7e4e4"
 linkColor = "#0f766e"
 linkUnderline = false
 baseRadius = "18px"
 buttonRadius = "14px"
 showWidgetBorder = true
+dataframeHeaderBackgroundColor = "#eef6f6"
 
 [client]
 # Avoid leaking stack traces in a deployed dashboard UI by default.
 showErrorDetails = "none"
+toolbarMode = "minimal"
