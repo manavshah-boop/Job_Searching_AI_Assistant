@@ -489,8 +489,14 @@ def _provider_model(config: dict[str, Any]) -> str:
 def _check_api_key(config: dict[str, Any]) -> Optional[str]:
     provider = config.get("llm", {}).get("provider")
     env_var = PROVIDER_ENV_VARS.get(str(provider))
-    if env_var and not os.environ.get(env_var):
-        return env_var
+    if not env_var:
+        return None
+    profile = config.get("_active_profile")
+    key = os.environ.get(f"{env_var}_{profile.upper()}") if profile else None
+    if not key:
+        key = os.environ.get(env_var)
+    if not key:
+        return f"{env_var}_{profile.upper()} or {env_var}" if profile else env_var
     return None
 
 
@@ -804,6 +810,7 @@ def _run_pipeline(
     if not any(enabled.values()):
         raise ValueError("No sources are enabled for this profile.")
 
+    config["_active_profile"] = slug
     tracker = ProgressTracker()
     run_id = start_run(profile=slug, source="dashboard")
     slug_map = {"greenhouse": [], "lever": []}
@@ -2818,6 +2825,7 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
             with profile_action_cols[1]:
                 confirm_rescore = bool(st.session_state.get(f"confirm_rescore_{slug}", False))
                 if st.button("Re-score profile", key=f"rescore_all_{slug}", disabled=not confirm_rescore):
+                    config["_active_profile"] = slug
                     missing = _check_api_key(config)
                     if missing:
                         callout("error", "API key missing", f"Set {missing} before running a rescore.")

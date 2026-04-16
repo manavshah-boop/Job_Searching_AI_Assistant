@@ -344,6 +344,14 @@ pandas  # used by dashboard.py
 
 ## Environment variables
 
+Per-profile keys are preferred — suffix with the uppercase profile slug (written by onboarding):
+```
+GROQ_API_KEY_MANAV=       # profile: manav, provider: groq
+GROQ_API_KEY_SISTER=      # profile: sister, provider: groq
+ANTHROPIC_API_KEY_MANAV=  # profile: manav, provider: anthropic
+```
+
+Unsuffixed keys are a fallback for single-user / CLI use (no `--profile` flag):
 ```
 GROQ_API_KEY=         # active default provider
 ANTHROPIC_API_KEY=    # if provider: anthropic
@@ -351,6 +359,9 @@ GEMINI_API_KEY=       # if provider: gemini
 OPENAI_API_KEY=       # if provider: openai
 THEIRSTACK_API_KEY=   # optional — enables dynamic company discovery
 ```
+
+Resolution order: `{KEY}_{PROFILE_UPPER}` → `{KEY}` (unsuffixed fallback).
+Onboarding writes the suffixed form. The unsuffixed key is used only when `--profile` is omitted.
 
 ---
 

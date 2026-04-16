@@ -44,6 +44,15 @@ class RateLimitReached(Exception):
     """Raised when the provider's daily RPD limit is exhausted."""
 
 
+def _resolve_api_key(env_var: str, profile: Optional[str]) -> Optional[str]:
+    """Try the profile-suffixed key first, then fall back to the unsuffixed name."""
+    if profile:
+        suffixed = os.environ.get(f"{env_var}_{profile.upper()}")
+        if suffixed:
+            return suffixed
+    return os.environ.get(env_var)
+
+
 # LlmCall type: (prompt, max_tokens) -> (response_text, tokens_used)
 LlmCall = Callable[[str, int], Tuple[str, int]]
 
@@ -131,12 +140,14 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
     provider    = config["llm"]["provider"]
     models      = config["llm"]["model"]
     temperature = config["llm"].get("temperature", 0)
+    profile     = config.get("_active_profile")
 
     if provider == "anthropic":
         import anthropic
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = _resolve_api_key("ANTHROPIC_API_KEY", profile)
         if not api_key:
-            logger.error("ANTHROPIC_API_KEY not set in environment or .env")
+            names = f"ANTHROPIC_API_KEY_{profile.upper()} or ANTHROPIC_API_KEY" if profile else "ANTHROPIC_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = anthropic.Anthropic(api_key=api_key)
 
@@ -160,9 +171,10 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
     elif provider == "gemini":
         from google import genai
         from google.genai import types as genai_types
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = _resolve_api_key("GEMINI_API_KEY", profile)
         if not api_key:
-            logger.error("GEMINI_API_KEY not set in environment or .env")
+            names = f"GEMINI_API_KEY_{profile.upper()} or GEMINI_API_KEY" if profile else "GEMINI_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = genai.Client(api_key=api_key)
         gemini_model = models["gemini"]
@@ -183,9 +195,10 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
 
     elif provider == "groq":
         from groq import Groq
-        api_key = os.environ.get("GROQ_API_KEY")
+        api_key = _resolve_api_key("GROQ_API_KEY", profile)
         if not api_key:
-            logger.error("GROQ_API_KEY not set in environment or .env")
+            names = f"GROQ_API_KEY_{profile.upper()} or GROQ_API_KEY" if profile else "GROQ_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = Groq(api_key=api_key)
 
@@ -202,9 +215,10 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
 
     elif provider == "openai":
         from openai import OpenAI
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = _resolve_api_key("OPENAI_API_KEY", profile)
         if not api_key:
-            logger.error("OPENAI_API_KEY not set in environment or .env")
+            names = f"OPENAI_API_KEY_{profile.upper()} or OPENAI_API_KEY" if profile else "OPENAI_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = OpenAI(api_key=api_key)
 
@@ -239,13 +253,15 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
     provider    = config["llm"]["provider"]
     models      = config["llm"]["model"]
     temperature = config["llm"].get("temperature", 0)
+    profile     = config.get("_active_profile")
 
     if provider == "anthropic":
         import anthropic
         import instructor
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = _resolve_api_key("ANTHROPIC_API_KEY", profile)
         if not api_key:
-            logger.error("ANTHROPIC_API_KEY not set in environment or .env")
+            names = f"ANTHROPIC_API_KEY_{profile.upper()} or ANTHROPIC_API_KEY" if profile else "ANTHROPIC_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = anthropic.Anthropic(api_key=api_key)
         client = instructor.from_anthropic(client)
@@ -254,9 +270,10 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
     elif provider == "gemini":
         from google import genai
         import instructor
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = _resolve_api_key("GEMINI_API_KEY", profile)
         if not api_key:
-            logger.error("GEMINI_API_KEY not set in environment or .env")
+            names = f"GEMINI_API_KEY_{profile.upper()} or GEMINI_API_KEY" if profile else "GEMINI_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = genai.Client(api_key=api_key)
         # Gemini doesn't have direct instructor support yet, so we use raw client
@@ -266,9 +283,10 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
     elif provider == "groq":
         from groq import Groq
         import instructor
-        api_key = os.environ.get("GROQ_API_KEY")
+        api_key = _resolve_api_key("GROQ_API_KEY", profile)
         if not api_key:
-            logger.error("GROQ_API_KEY not set in environment or .env")
+            names = f"GROQ_API_KEY_{profile.upper()} or GROQ_API_KEY" if profile else "GROQ_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = Groq(api_key=api_key)
         client = instructor.from_groq(client)
@@ -277,9 +295,10 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
     elif provider == "openai":
         from openai import OpenAI
         import instructor
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = _resolve_api_key("OPENAI_API_KEY", profile)
         if not api_key:
-            logger.error("OPENAI_API_KEY not set in environment or .env")
+            names = f"OPENAI_API_KEY_{profile.upper()} or OPENAI_API_KEY" if profile else "OPENAI_API_KEY"
+            logger.error("%s not set in environment or .env", names)
             sys.exit(1)
         client = OpenAI(api_key=api_key)
         client = instructor.from_openai(client)

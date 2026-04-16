@@ -68,11 +68,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _check_api_key(provider: str) -> None:
+def _check_api_key(provider: str, profile: str | None = None) -> None:
     """Exit with a clear message if the required API key is missing."""
     env_var = _PROVIDER_ENV_VARS.get(provider)
-    if env_var and not os.environ.get(env_var):
-        logger.error(f"Scoring requires {env_var} but it is not set.")
+    if not env_var:
+        return
+    key = os.environ.get(f"{env_var}_{profile.upper()}") if profile else None
+    if not key:
+        key = os.environ.get(env_var)
+    if not key:
+        if profile:
+            logger.error(f"Scoring requires {env_var}_{profile.upper()} or {env_var} but neither is set.")
+        else:
+            logger.error(f"Scoring requires {env_var} but it is not set.")
         logger.error(f"Add it to your .env file:  {env_var}=your_key_here")
         logger.error(f"Or export it:              export {env_var}=your_key_here")
         sys.exit(1)
@@ -167,6 +175,7 @@ def main() -> None:
         set_active_profile(args.profile)
 
     config = load_config(profile=args.profile)
+    config["_active_profile"] = args.profile
     init_db(profile=args.profile)
 
     # Configure logging after profile is set
@@ -192,7 +201,7 @@ def main() -> None:
     # Validate API key before starting any work if scoring will run
     will_score = not args.scrape_only
     if will_score:
-        _check_api_key(provider)
+        _check_api_key(provider, args.profile)
 
     _print_banner(config)
 

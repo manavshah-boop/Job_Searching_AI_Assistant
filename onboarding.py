@@ -329,7 +329,7 @@ def create_profile(data: Dict[str, Any]) -> None:
         env_var = data.get("env_var", "")
         if env_var:
             env_path = _BASE_DIR / ".env"
-            _upsert_env_key(env_path, env_var, api_key)
+            _upsert_env_key(env_path, f"{env_var}_{slug.upper()}", api_key)
 
     # Initialize the profile's DB
     init_db(profile=slug)
