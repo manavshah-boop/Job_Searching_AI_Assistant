@@ -1175,23 +1175,15 @@ def _open_resume_preview_dialog(file_name: str, pdf_bytes: bytes) -> None:
     st.session_state.show_resume_preview_dialog = True
 
 
-def _launch_create_profile_flow(profile_name: str, employment_type: str, company: str) -> None:
+def _launch_create_profile_flow(profile_name: str, employment_type: str) -> None:
     clean_name = profile_name.strip()
-    clean_company = company.strip()
     job_type = "internship" if employment_type.lower().startswith("intern") else "fulltime"
-    seeded_bio = ""
-    if clean_company:
-        seeded_bio = (
-            f"Interested in {employment_type.lower()} opportunities at {clean_company} "
-            "and similar teams."
-        )
 
     onboarding_data = {
         "name": clean_name,
         "profile_slug": sanitize_slug(clean_name),
         "job_type": job_type,
-        "bio": seeded_bio,
-        "company_focus": clean_company,
+        "bio": "",
     }
     if job_type == "internship":
         onboarding_data.update(
@@ -1210,7 +1202,7 @@ def _launch_create_profile_flow(profile_name: str, employment_type: str, company
 
 
 def _create_profile_modal_body() -> None:
-    st.caption("Start with a few details, then finish the rest in guided setup.")
+    st.caption("Start with a name and search mode, then finish the rest in guided setup.")
     with st.form("create_profile_modal_form"):
         profile_name = st.text_input(
             "Profile name",
@@ -1221,12 +1213,6 @@ def _create_profile_modal_body() -> None:
             "Employment type",
             ["Full-time", "Internship"],
             index=0 if st.session_state.get("quick_create_employment_type", "Full-time") == "Full-time" else 1,
-        )
-        company = st.text_input(
-            "Company",
-            value=st.session_state.get("quick_create_company", ""),
-            placeholder="Optional company focus",
-            help="Used to seed the initial profile summary. You can edit it during setup.",
         )
         action_cols = st.columns(2, gap="small")
         with action_cols[0]:
@@ -1253,8 +1239,7 @@ def _create_profile_modal_body() -> None:
             return
         st.session_state.quick_create_profile_name = clean_name
         st.session_state.quick_create_employment_type = employment_type
-        st.session_state.quick_create_company = company.strip()
-        _launch_create_profile_flow(clean_name, employment_type, company)
+        _launch_create_profile_flow(clean_name, employment_type)
 
 
 if callable(getattr(st, "dialog", None)):
@@ -2681,114 +2666,118 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
     editable["sources"].setdefault("lever", {"enabled": True, "companies": []})
     editable["sources"].setdefault("hn", {"enabled": False})
     with section_shell("Settings", SECTION_COPY["Settings"]):
-        with st.form(f"settings_form_{slug}"):
-            location_defaults = editable["preferences"]["location"].get("preferred_locations", [])
-            location_options = sorted({*LOCATION_PICKER_OPTIONS, *location_defaults})
-            compensation = editable["preferences"]["compensation"]
-            salary_value = int(compensation.get("min_salary", 0))
-            stipend_value = int(compensation.get("monthly_stipend", 0))
+        location_defaults = editable["preferences"]["location"].get("preferred_locations", [])
+        location_options = sorted({*LOCATION_PICKER_OPTIONS, *location_defaults})
+        compensation = editable["preferences"]["compensation"]
+        salary_value = int(compensation.get("min_salary", 0))
+        stipend_value = int(compensation.get("monthly_stipend", 0))
 
-            with st.expander("Search preferences", expanded=True):
-                st.caption("Keep the shortlist aligned with where and how you want to work.")
-                st.markdown("##### Scoring")
-                min_display = st.slider(
-                    "Minimum display score",
-                    min_value=0,
-                    max_value=100,
-                    value=int(editable["scoring"].get("min_display_score", 60)),
-                    step=5,
-                    help="Jobs below this score stay saved, but they will not appear in the main shortlist views.",
+        with st.expander("Search preferences", expanded=True):
+            st.caption("Keep the shortlist aligned with where and how you want to work.")
+            st.markdown("##### Scoring")
+            min_display = st.slider(
+                "Minimum display score",
+                min_value=0,
+                max_value=100,
+                value=int(editable["scoring"].get("min_display_score", 60)),
+                step=5,
+                help="Jobs below this score stay saved, but they will not appear in the main shortlist views.",
+            )
+            with st.expander("About display score", expanded=False):
+                st.write("Lower the display score only if you want to inspect weaker-fit roles more often.")
+
+            pref_cols = st.columns([1.0, 1.1], gap="large")
+            with pref_cols[0]:
+                st.markdown("##### Location")
+                remote_ok = st.checkbox(
+                    "Remote OK",
+                    value=bool(editable["preferences"]["location"].get("remote_ok", True)),
                 )
-                with st.expander("About display score", expanded=False):
-                    st.write("Lower the display score only if you want to inspect weaker-fit roles more often.")
-
-                pref_cols = st.columns([1.0, 1.1], gap="large")
-                with pref_cols[0]:
-                    st.markdown("##### Location")
-                    remote_ok = st.checkbox(
-                        "Remote OK",
-                        value=bool(editable["preferences"]["location"].get("remote_ok", True)),
-                    )
-                    preferred_locations = st.multiselect(
-                        "Preferred locations",
-                        options=location_options,
-                        default=[loc for loc in location_defaults if loc in location_options],
-                        help="Choose the locations you want discovery to prioritize.",
-                    )
-                with pref_cols[1]:
-                    st.markdown("##### Sources")
-                    gh_enabled = st.checkbox(
-                        "Greenhouse",
-                        value=bool(editable["sources"]["greenhouse"].get("enabled", True)),
-                    )
-                    lv_enabled = st.checkbox(
-                        "Lever",
-                        value=bool(editable["sources"]["lever"].get("enabled", True)),
-                    )
-                    hn_enabled = st.checkbox(
-                        "HN Who's Hiring",
-                        value=bool(editable["sources"]["hn"].get("enabled", False)),
-                    )
-
-            with st.expander("Matching rules", expanded=False):
-                st.caption("Fine-tune titles, skills, exclusions, and source company lists when you need more control.")
-                titles_default = editable["preferences"].get("titles", [])
-                skills_default = editable["preferences"].get("desired_skills", [])
-                hard_no_default = editable["preferences"].get("hard_no_keywords", [])
-                gh_companies_default = editable["sources"]["greenhouse"].get("companies", [])
-                lv_companies_default = editable["sources"]["lever"].get("companies", [])
-                titles_text = "\n".join(titles_default)
-                skills_text = "\n".join(skills_default)
-                hard_no_text = "\n".join(hard_no_default)
-                gh_companies = "\n".join(gh_companies_default)
-                lv_companies = "\n".join(lv_companies_default)
-                edit_matching_rules = st.toggle(
-                    "Edit matching rules",
-                    key=f"edit_matching_rules_{slug}",
-                    help="Switch between a compact summary and the full editor for titles, skills, exclusions, and source company lists.",
+                preferred_locations = st.multiselect(
+                    "Preferred locations",
+                    options=location_options,
+                    default=[loc for loc in location_defaults if loc in location_options],
+                    help="Choose the locations you want discovery to prioritize.",
                 )
+            with pref_cols[1]:
+                st.markdown("##### Sources")
+                gh_enabled = st.checkbox(
+                    "Greenhouse",
+                    value=bool(editable["sources"]["greenhouse"].get("enabled", True)),
+                )
+                lv_enabled = st.checkbox(
+                    "Lever",
+                    value=bool(editable["sources"]["lever"].get("enabled", True)),
+                )
+                hn_enabled = st.checkbox(
+                    "HN Who's Hiring",
+                    value=bool(editable["sources"]["hn"].get("enabled", False)),
+                )
+
+        with st.expander("Matching rules", expanded=False):
+            st.caption("Fine-tune titles, skills, exclusions, and source company lists when you need more control.")
+            titles_default = editable["preferences"].get("titles", [])
+            skills_default = editable["preferences"].get("desired_skills", [])
+            hard_no_default = editable["preferences"].get("hard_no_keywords", [])
+            gh_companies_default = editable["sources"]["greenhouse"].get("companies", [])
+            lv_companies_default = editable["sources"]["lever"].get("companies", [])
+            titles_text = "\n".join(titles_default)
+            skills_text = "\n".join(skills_default)
+            hard_no_text = "\n".join(hard_no_default)
+            gh_companies = "\n".join(gh_companies_default)
+            lv_companies = "\n".join(lv_companies_default)
+            edit_matching_rules = st.toggle(
+                "Edit matching rules",
+                key=f"edit_matching_rules_{slug}",
+                help="Switch between a compact summary and the full editor for titles, skills, exclusions, and source company lists.",
+            )
+            if "min_salary" in compensation or "monthly_stipend" not in compensation:
+                minimum_salary = salary_value
+                monthly_stipend = None
+                compensation_summary = f"${salary_value:,}" if salary_value else "Not set"
+                compensation_label = "Minimum salary"
+            else:
+                monthly_stipend = stipend_value
+                minimum_salary = None
+                compensation_summary = f"${stipend_value:,}/mo" if stipend_value else "Not set"
+                compensation_label = "Monthly stipend target"
+
+            if not edit_matching_rules:
+                _render_summary_list(
+                    [
+                        ("Target titles", len(titles_default)),
+                        ("Desired skills", len(skills_default)),
+                        ("Hard-no keywords", len(hard_no_default)),
+                        (compensation_label, compensation_summary),
+                        ("Greenhouse companies", len(gh_companies_default)),
+                        ("Lever companies", len(lv_companies_default)),
+                    ]
+                )
+                st.caption("Target titles")
+                chip_row(titles_default[:8] or ["None saved"])
+                st.caption("Desired skills")
+                chip_row(skills_default[:8] or ["None saved"])
+                st.caption("Hard-no keywords")
+                chip_row(hard_no_default[:6] or ["None saved"])
+            else:
+                titles_text = st.text_area("Target titles", value=titles_text, height=120, help="One title per line.")
+                skills_text = st.text_area("Desired skills", value=skills_text, height=120, help="One skill per line.")
+                hard_no_text = st.text_area("Hard-no keywords", value=hard_no_text, height=100, help="Any posting containing these phrases will be skipped early.")
                 if "min_salary" in compensation or "monthly_stipend" not in compensation:
-                    minimum_salary = salary_value
+                    minimum_salary = st.number_input("Minimum salary", min_value=0, step=5000, value=salary_value, help="Used as a soft scoring preference, not a hard filter.")
                     monthly_stipend = None
-                    compensation_summary = f"${salary_value:,}" if salary_value else "Not set"
-                    compensation_label = "Minimum salary"
                 else:
-                    monthly_stipend = stipend_value
+                    monthly_stipend = st.number_input("Monthly stipend target", min_value=0, step=500, value=stipend_value, help="Used as a soft scoring preference for internship profiles.")
                     minimum_salary = None
-                    compensation_summary = f"${stipend_value:,}/mo" if stipend_value else "Not set"
-                    compensation_label = "Monthly stipend target"
+                gh_companies = st.text_area("Greenhouse companies", value=gh_companies, height=140, help="One company slug or name per line.")
+                lv_companies = st.text_area("Lever companies", value=lv_companies, height=140, help="One company slug or name per line.")
 
-                if not edit_matching_rules:
-                    _render_summary_list(
-                        [
-                            ("Target titles", len(titles_default)),
-                            ("Desired skills", len(skills_default)),
-                            ("Hard-no keywords", len(hard_no_default)),
-                            (compensation_label, compensation_summary),
-                            ("Greenhouse companies", len(gh_companies_default)),
-                            ("Lever companies", len(lv_companies_default)),
-                        ]
-                    )
-                    st.caption("Target titles")
-                    chip_row(titles_default[:8] or ["None saved"])
-                    st.caption("Desired skills")
-                    chip_row(skills_default[:8] or ["None saved"])
-                    st.caption("Hard-no keywords")
-                    chip_row(hard_no_default[:6] or ["None saved"])
-                else:
-                    titles_text = st.text_area("Target titles", value=titles_text, height=120, help="One title per line.")
-                    skills_text = st.text_area("Desired skills", value=skills_text, height=120, help="One skill per line.")
-                    hard_no_text = st.text_area("Hard-no keywords", value=hard_no_text, height=100, help="Any posting containing these phrases will be skipped early.")
-                    if "min_salary" in compensation or "monthly_stipend" not in compensation:
-                        minimum_salary = st.number_input("Minimum salary", min_value=0, step=5000, value=salary_value, help="Used as a soft scoring preference, not a hard filter.")
-                        monthly_stipend = None
-                    else:
-                        monthly_stipend = st.number_input("Monthly stipend target", min_value=0, step=500, value=stipend_value, help="Used as a soft scoring preference for internship profiles.")
-                        minimum_salary = None
-                    gh_companies = st.text_area("Greenhouse companies", value=gh_companies, height=140, help="One company slug or name per line.")
-                    lv_companies = st.text_area("Lever companies", value=lv_companies, height=140, help="One company slug or name per line.")
-
-            submitted = st.form_submit_button("Save settings", type="primary", help="Writes the updated config to this profile only.")
+        submitted = st.button(
+            "Save settings",
+            key=f"save_settings_{slug}",
+            type="primary",
+            help="Writes the updated config to this profile only.",
+        )
 
         if submitted:
             editable["scoring"]["min_display_score"] = int(min_display)
@@ -2982,19 +2971,23 @@ def _render_profile_selection() -> None:
         set_active_profile(only_profile["slug"])
         st.rerun()
 
-    page_header(
-        "Choose a profile",
-        "Open an existing workspace or create a new one to start finding matches.",
+    _render_html_block(
+        (
+            "<section class='shell-selection-header'>"
+            "<h1 class='shell-selection-title'>Select a workspace</h1>"
+            "<p class='shell-selection-copy'>Open an existing workspace or create a new one to continue.</p>"
+            "</section>"
+        )
     )
 
     if not profiles:
         clicked = empty_state(
-            "Create your first profile to get started",
-            "No profiles found yet. Create your first profile to start finding matching job opportunities.",
+            "Create your first workspace to get started",
+            "No workspaces found yet. Create your first workspace to start finding matching job opportunities.",
             actions=[
                 {
                     "id": "create_profile_zero_state",
-                    "label": "Create profile",
+                    "label": "Create your first workspace",
                     "type": "primary",
                     "key": "create_profile_zero_state",
                 }
@@ -3005,43 +2998,38 @@ def _render_profile_selection() -> None:
             _open_create_profile_dialog()
         return
 
-    _render_html_block("<div class='shell-inline-section-label'>Saved workspaces</div>")
+    _render_html_block("<div class='shell-selection-label'>Available workspaces</div>")
     grid_count = min(2, max(1, len(profiles)))
     columns = st.columns(grid_count, gap="large")
     for index, profile in enumerate(profiles):
-        counts = profile["counts"]
         with columns[index % grid_count]:
-            with panel(profile["name"], subtitle=f"Profile ID: {profile['slug']}"):
-                chip_row(
-                    [
-                        profile["job_type"].replace("_", " ").title(),
-                        profile["provider"].title(),
-                    ]
+            role_line = (
+                f"{profile['job_type'].replace('_', ' ').title()} search with {profile['provider'].title()}"
+            )
+            with st.container(border=True):
+                _render_html_block(
+                    (
+                        "<div class='shell-workspace-card'>"
+                        f"<div class='shell-workspace-card-title'>{html.escape(profile['name'])}</div>"
+                        f"<div class='shell-workspace-card-copy'>{html.escape(role_line)}</div>"
+                        "</div>"
+                    )
                 )
-                _render_summary_list(
-                    [
-                        ("Tracked jobs", counts["total"]),
-                        ("Ready to review", counts["scored"]),
-                    ]
-                )
-                clicked = toolbar(
-                    primary_actions=[
-                        {
-                            "id": "open_profile",
-                            "label": "Open workspace",
-                            "key": f"open_profile_{profile['slug']}",
-                            "use_container_width": False,
-                        }
-                    ],
-                    secondary_actions=[],
-                )
-                if clicked == "open_profile":
+                _render_html_block("<div class='shell-workspace-card-action'>")
+                if st.button(
+                    "Open workspace",
+                    key=f"open_profile_{profile['slug']}",
+                    type="primary",
+                    use_container_width=True,
+                ):
                     st.session_state.active_profile = profile["slug"]
                     st.session_state.show_onboarding = False
                     set_active_profile(profile["slug"])
                     st.rerun()
+                _render_html_block("</div>")
 
-    if st.button("Create new profile", key="create_profile_selection_footer", type="secondary", help="Open a quick profile-creation dialog."):
+    _render_html_block("<div class='shell-selection-footer'></div>")
+    if st.button("Create new workspace", key="create_profile_selection_footer", type="secondary", help="Open a quick workspace-creation dialog."):
         _open_create_profile_dialog()
 
 

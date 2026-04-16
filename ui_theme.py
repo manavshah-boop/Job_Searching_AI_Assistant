@@ -440,6 +440,79 @@ def _global_css() -> str:
         max-width: 78ch;
     }}
 
+    .shell-selection-header {{
+        display: grid;
+        gap: 0.375rem;
+        margin-bottom: 1rem;
+    }}
+
+    .shell-selection-title {{
+        margin: 0;
+        font-family: var(--shell-font-display);
+        font-size: clamp(1.5rem, 2.1vw, 2.05rem);
+        font-weight: 700;
+        line-height: 1.04;
+        letter-spacing: -0.03em;
+    }}
+
+    .shell-selection-copy {{
+        margin: 0;
+        max-width: 56ch;
+        color: #64748b;
+        font-size: 0.94rem;
+        line-height: 1.5;
+    }}
+
+    .shell-selection-label {{
+        margin: 0 0 0.375rem 0;
+        color: var(--shell-muted);
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+    }}
+
+    .shell-workspace-card {{
+        display: grid;
+        gap: 0.375rem;
+        margin-bottom: 0.625rem;
+    }}
+
+    .shell-workspace-card-title {{
+        margin: 0;
+        font-family: var(--shell-font-display);
+        font-size: 1.18rem;
+        font-weight: 600;
+        line-height: 1.08;
+        color: var(--shell-text);
+        overflow-wrap: anywhere;
+    }}
+
+    .shell-workspace-card-copy {{
+        margin: 0;
+        color: #64748b;
+        font-size: 0.9rem;
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+    }}
+
+    .shell-workspace-card-action {{
+        margin-top: 0.25rem;
+    }}
+
+    .shell-selection-footer {{
+        height: 1.25rem;
+    }}
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.shell-workspace-card) {{
+        padding: 1.25rem;
+        margin-bottom: 1rem;
+    }}
+
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.shell-workspace-card) div[data-testid="stButton"] {{
+        margin-top: 0;
+        margin-bottom: 0;
+    }}
+
     .shell-panel,
     div[data-testid="stVerticalBlockBorderWrapper"] {{
         display: block;
@@ -656,12 +729,12 @@ def _global_css() -> str:
     }}
 
     .shell-toolbar--sidebar-primary {{
-        margin-top: 0.18rem;
+        margin-top: 0.08rem;
         margin-bottom: 0;
     }}
 
     .shell-toolbar--sidebar-primary div[data-testid="stButton"] > button[kind="primary"] {{
-        min-height: 2.55rem;
+        min-height: 2.45rem;
         border-radius: 10px;
         box-shadow: 0 8px 18px rgba(17, 34, 39, 0.06);
     }}
@@ -672,7 +745,7 @@ def _global_css() -> str:
     }}
 
     .shell-toolbar--sidebar-subtle div[data-testid="stButton"] > button[kind="secondary"] {{
-        min-height: 2rem;
+        min-height: 1.92rem;
         justify-content: flex-start;
         border-radius: 8px;
         border: 0;
@@ -1303,7 +1376,7 @@ def _global_css() -> str:
     }}
 
     .shell-inline-section-label--sidebar {{
-        margin: 0 0 0.08rem 0;
+        margin: 0 0 0.04rem 0;
     }}
 
     .shell-sidebar-spacer {{
@@ -1313,18 +1386,26 @@ def _global_css() -> str:
 
     .shell-sidebar-actions {{
         display: grid;
-        gap: 0.04rem;
+        gap: 0;
         padding-top: 0;
         border-top: 0;
     }}
 
     .shell-sidebar-actions .shell-toolbar--sidebar-primary {{
         margin-top: 0;
-        margin-bottom: 0.22rem;
+        margin-bottom: 0.1rem;
     }}
 
     .shell-sidebar-actions .shell-toolbar--sidebar-subtle {{
         margin-top: 0;
+        margin-bottom: 0;
+    }}
+
+    .shell-sidebar-actions div[data-testid="stVerticalBlock"] {{
+        gap: 0.08rem;
+    }}
+
+    .shell-sidebar-actions div[data-testid="stButton"] {{
         margin-bottom: 0;
     }}
 

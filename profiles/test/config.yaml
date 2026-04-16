@@ -1,0 +1,122 @@
+llm:
+  provider: groq
+  temperature: 0
+  model:
+    anthropic: claude-sonnet-4-20250514
+    gemini: gemini-2.5-flash
+    gemini_lite: gemini-2.5-flash-lite-preview-06-17
+    groq: meta-llama/llama-4-scout-17b-16e-instruct
+    groq_balanced: llama-3.3-70b-versatile
+    groq_testing: llama-3.1-8b-instant
+    openai: gpt-4o-mini
+  rate_limits:
+    groq:
+      max_rpm: 28
+      max_tpm: 28000
+      max_rpd: 1000
+    groq_balanced:
+      max_rpm: 28
+      max_tpm: 11000
+      max_rpd: 1000
+    groq_testing:
+      max_rpm: 28
+      max_tpm: 5500
+      max_rpd: 14400
+    gemini:
+      max_rpm: 9
+      max_tpm: 240000
+      max_rpd: 250
+    gemini_lite:
+      max_rpm: 14
+      max_tpm: 240000
+      max_rpd: 1000
+    anthropic:
+      max_rpm: 50
+      max_tpm: 9000000
+    openai:
+      max_rpm: 50
+      max_tpm: 9000000
+profile:
+  name: Test
+  bio: Test
+  job_type: fulltime
+  resume: Test
+  resume_file: null
+preferences:
+  titles:
+  - Software Engineer
+  - Software Developer
+  - Software Development Engineer
+  - SDE
+  - SWE
+  - Backend Engineer
+  - AI Engineer
+  desired_skills:
+  - Python
+  - ML Infrastructure
+  - LLM
+  - backend
+  - AWS
+  hard_no_keywords:
+  - security clearance required
+  - 5+ years of experience
+  - internship
+  - intern
+  location:
+    remote_ok: true
+    preferred_locations:
+    - Remote
+    - San Francisco, CA
+    - New York, NY
+  filters:
+    countries_allowed:
+    - United States
+    - US
+    - USA
+    - Remote
+    min_yoe: 0
+    max_yoe: 5
+    require_degree_filter: true
+    title_blocklist:
+    - Staff
+    - Principal
+    - VP
+    - Director
+    - Head of
+    - Manager
+    - Lead
+    - Executive
+    - Intern
+  yoe: 0
+  compensation:
+    min_salary: 130000
+sources:
+  greenhouse:
+    enabled: true
+    companies:
+    - anthropic
+    - stripe
+    - figma
+    - databricks
+  lever:
+    enabled: true
+    companies:
+    - stripe
+    - linear
+    - vercel
+    - notion
+    - retool
+    - figma
+    - rippling
+    - brex
+    - ramp
+    - scale
+scoring:
+  min_display_score: 60
+  weights:
+    role_fit: 0.3
+    stack_match: 0.25
+    seniority: 0.2
+    location: 0.1
+    growth: 0.1
+    compensation: 0.05
