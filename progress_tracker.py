@@ -181,6 +181,10 @@ class ProgressTracker:
             {"stage": stage.name},
         )
 
+    def set_stage_metrics(self, stage: Stage, **metrics: Any):
+        """Attach lightweight stage metrics for UI display."""
+        self.stages[stage].metrics.update(metrics)
+
     def fail_stage(self, stage: Stage, error: str):
         """Mark a stage as failed."""
         prog = self.stages[stage]
@@ -223,6 +227,7 @@ class ProgressTracker:
         if companies_processed is not None:
             source.companies_processed = companies_processed
         if jobs_found is not None:
+            source.jobs_found = jobs_found
             source.jobs_new = jobs_found
 
     def complete_source(self, name: str, jobs_found: int = 0):

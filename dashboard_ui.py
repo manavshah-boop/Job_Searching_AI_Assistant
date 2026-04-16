@@ -5,39 +5,33 @@ Streamlit-based UI for displaying job search progress with real-time updates.
 """
 
 import streamlit as st
-from typing import Optional, List, Dict, Any
+from ui_shell import badge, callout, empty_state, panel, stat_row
 from progress_tracker import ProgressTracker, Stage, StageStatus, ActivityType
 
 
 def render_progress_header(tracker: ProgressTracker) -> None:
     """Render the main progress bar and overall metrics."""
-    st.markdown("---")
+    progress_pct = tracker.overall_progress_pct
+    elapsed = tracker.elapsed_time
+    mins, secs = divmod(int(elapsed.total_seconds()), 60)
+    eta = tracker.eta
+    eta_label = "—"
+    if eta:
+        eta_mins, eta_secs = divmod(int(eta.total_seconds()), 60)
+        eta_label = f"~{eta_mins}m {eta_secs}s"
 
-    # Main progress bar
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        progress_pct = tracker.overall_progress_pct
-        st.metric("Progress", f"{int(progress_pct)}%")
-        st.progress(progress_pct / 100, text=f"{int(progress_pct)}%")
-    with col2:
-        elapsed = tracker.elapsed_time
-        mins, secs = divmod(int(elapsed.total_seconds()), 60)
-        st.metric("Elapsed", f"{mins}m {secs}s")
-    with col3:
-        eta = tracker.eta
-        if eta:
-            mins, secs = divmod(int(eta.total_seconds()), 60)
-            st.metric("ETA", f"~{mins}m {secs}s")
-        else:
-            st.metric("ETA", "—")
-
-    st.markdown("---")
+    stat_row(
+        [
+            ("Progress", f"{int(progress_pct)}%"),
+            ("Elapsed", f"{mins}m {secs}s"),
+            ("ETA", eta_label),
+        ]
+    )
+    st.progress(progress_pct / 100, text=f"{int(progress_pct)}% complete")
 
 
 def render_pipeline_stages(tracker: ProgressTracker) -> None:
     """Render pipeline stages with status indicators."""
-    st.subheader("📋 Pipeline Stages")
-
     stages_info = [
         (Stage.DISCOVERING, "Company Discovery"),
         (Stage.FETCHING, "Job Board Fetch"),
@@ -46,29 +40,33 @@ def render_pipeline_stages(tracker: ProgressTracker) -> None:
         (Stage.FINALIZING, "Results Finalization"),
     ]
 
-    for stage, label in stages_info:
-        prog = tracker.stages[stage]
-        col1, col2, col3 = st.columns([1, 3, 1])
+    with panel("Pipeline stages", subtitle="Clear stage boundaries help explain where time is being spent"):
+        for stage, label in stages_info:
+            prog = tracker.stages[stage]
+            col1, col2, col3 = st.columns([1, 3, 1])
 
-        with col1:
-            status_emoji = tracker.get_stage_status_emoji(stage)
-            st.write(status_emoji)
+            with col1:
+                st.markdown(
+                    badge(
+                        tracker.get_stage_status_emoji(stage),
+                        "success" if prog.status == StageStatus.COMPLETE else "info" if prog.status == StageStatus.RUNNING else "danger" if prog.status == StageStatus.FAILED else "neutral",
+                    ),
+                    unsafe_allow_html=True,
+                )
 
-        with col2:
-            # Stage name
-            st.markdown(f"**{label}**")
-            if prog.status == StageStatus.RUNNING:
-                st.caption(f"Duration: {int(prog.duration or 0)}s")
-            elif prog.status == StageStatus.COMPLETE:
-                st.caption(f"✓ Completed in {int(prog.duration or 0)}s")
+            with col2:
+                st.markdown(f"**{label}**")
+                if prog.status == StageStatus.RUNNING:
+                    st.caption(f"Running for {int(prog.duration or 0)}s")
+                elif prog.status == StageStatus.COMPLETE:
+                    st.caption(f"Completed in {int(prog.duration or 0)}s")
+                elif prog.status == StageStatus.FAILED:
+                    st.caption("Failed before completion")
 
-        with col3:
-            if prog.metrics:
-                # Show brief metrics
-                metric_strs = [f"{v}" for k, v in prog.metrics.items()]
-                st.caption(" · ".join(metric_strs))
-
-    st.markdown("---")
+            with col3:
+                if prog.metrics:
+                    metric_strs = [f"{k}: {v}" for k, v in prog.metrics.items()]
+                    st.caption(" · ".join(metric_strs))
 
 
 def render_source_progress(tracker: ProgressTracker) -> None:
@@ -76,87 +74,56 @@ def render_source_progress(tracker: ProgressTracker) -> None:
     if not tracker.sources:
         return
 
-    st.subheader("🏢 Job Board Progress")
-
-    for source_name, source in tracker.sources.items():
-        with st.container():
-            col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-
+    with panel("Source progress", subtitle="Per-source progress builds trust while the pipeline is running"):
+        for source_name, source in tracker.sources.items():
+            col1, col2, col3 = st.columns([2.1, 1, 1], gap="medium")
             with col1:
-                status_icon = {
-                    StageStatus.PENDING: "⏹️",
-                    StageStatus.RUNNING: "⏳",
-                    StageStatus.COMPLETE: "✅",
-                    StageStatus.FAILED: "❌",
-                }.get(source.status, "•")
-
-                progress_pct = source.progress_pct
-                st.markdown(f"{status_icon} **{source_name}**")
-                st.progress(progress_pct / 100, text=f"{int(progress_pct)}%")
-
+                st.write(f"**{source_name}**")
+                st.progress(source.progress_pct / 100 if source.companies_total else 0.0, text=f"{int(source.progress_pct)}%")
             with col2:
-                st.metric(
-                    "Companies",
-                    f"{source.companies_processed}/{source.companies_total}",
-                )
-
+                st.caption("Coverage")
+                st.write(f"{source.companies_processed}/{source.companies_total or 0}")
             with col3:
-                st.metric("Jobs Found", source.jobs_new)
-
-            with col4:
-                if source.eta:
-                    mins, secs = divmod(int(source.eta.total_seconds()), 60)
-                    st.metric("ETA", f"~{mins}m {secs}s")
-                else:
-                    st.metric("ETA", "—")
-
-        st.markdown("---")
+                st.caption("New jobs")
+                st.write(str(source.jobs_new))
 
 
 def render_activity_feed(tracker: ProgressTracker, limit: int = 15) -> None:
     """Render the live activity feed."""
-    st.subheader("📝 Activity Feed")
-
     activities = tracker.get_recent_activities(limit)
 
-    if not activities:
-        st.info("Waiting for activity…")
-        return
+    with panel("Activity feed", subtitle="Human-readable updates make the run easier to follow"):
+        if not activities:
+            empty_state("Waiting for activity", "Progress messages will appear here as the run advances.")
+            return
 
-    for activity in reversed(activities):
-        # Color code by type
-        if activity.type == ActivityType.ERROR:
-            st.error(f"**{activity.time_str()}** — {activity.message}")
-        elif activity.type == ActivityType.WARNING:
-            st.warning(f"**{activity.time_str()}** — {activity.message}")
-        elif activity.type == ActivityType.STAGE_UPDATE:
-            st.info(f"**{activity.time_str()}** — {activity.message}")
-        elif activity.type == ActivityType.METRIC_UPDATE:
-            st.success(f"**{activity.time_str()}** — {activity.message}")
-        else:
-            st.write(f"**{activity.time_str()}** — {activity.message}")
+        for activity in reversed(activities):
+            if activity.type == ActivityType.ERROR:
+                callout("error", activity.time_str(), activity.message)
+            elif activity.type == ActivityType.WARNING:
+                callout("warning", activity.time_str(), activity.message)
+            elif activity.type == ActivityType.METRIC_UPDATE:
+                callout("success", activity.time_str(), activity.message)
+            else:
+                st.write(f"**{activity.time_str()}** — {activity.message}")
 
 
 def render_summary(tracker: ProgressTracker) -> None:
     """Render final summary when complete."""
-    st.markdown("---")
-    st.subheader("✅ Search Complete")
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Jobs Found", tracker.total_jobs_new)
-    with col2:
-        st.metric("Total Time", f"{int(tracker.elapsed_time.total_seconds())}s")
-    with col3:
+    with panel("Run summary", subtitle="Compact wrap-up after the pipeline finishes"):
         jobs_per_min = (
-            (tracker.total_jobs_new / tracker.elapsed_time.total_seconds())
-            * 60
+            (tracker.total_jobs_new / tracker.elapsed_time.total_seconds()) * 60
             if tracker.elapsed_time.total_seconds() > 0
             else 0
         )
-        st.metric("Rate", f"{jobs_per_min:.1f} jobs/min")
-    with col4:
-        st.metric("Sources", len(tracker.sources))
+        stat_row(
+            [
+                ("Total jobs found", tracker.total_jobs_new),
+                ("Total time", f"{int(tracker.elapsed_time.total_seconds())}s"),
+                ("Rate", f"{jobs_per_min:.1f} jobs/min"),
+                ("Sources", len(tracker.sources)),
+            ]
+        )
 
 
 def render_debug_logs(tracker: ProgressTracker) -> None:

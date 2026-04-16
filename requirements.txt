@@ -19,7 +19,8 @@ groq>=0.9.0                   # provider: "groq"     — pip install groq
 # openai>=1.50.0                # provider: "openai"   — pip install openai
 
 # step 6 — GUI config editor
-streamlit>=1.28.0
+# dashboard.py uses st.dataframe row selection + placeholder/column_config APIs.
+streamlit>=1.52.0
 
 # step 8 — structured output + instructor
 pydantic>=2.7.0

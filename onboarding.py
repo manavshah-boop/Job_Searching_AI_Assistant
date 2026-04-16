@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from db import init_db
+from ui_shell import badge, callout, chip_row, page_header, panel, section_shell, stat_row, toolbar
 
 _BASE_DIR    = Path(__file__).parent
 _PROFILES_DIR = _BASE_DIR / "profiles"
@@ -116,6 +117,14 @@ _LOCATION_OPTIONS = [
     "Denver, CO", "Washington, DC",
 ]
 
+_ONBOARDING_STEPS = [
+    ("Path", "Choose the search mode"),
+    ("Profile", "Add candidate context"),
+    ("Preferences", "Set role and location filters"),
+    ("AI provider", "Connect a scoring model"),
+    ("Review", "Confirm and create"),
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -137,6 +146,33 @@ def _runtime_estimate(rpm: int, rpd: int | None, n_jobs: int = 1000) -> str:
 
 def _lines_to_list(text: str) -> list:
     return [t.strip() for t in text.strip().splitlines() if t.strip()]
+
+
+def _onboarding_intro(step: int) -> str | None:
+    title, subtitle = _ONBOARDING_STEPS[step - 1]
+    header_action = page_header(
+        f"Setup: {title}",
+        subtitle,
+        secondary_actions=[
+            {
+                "id": "cancel_onboarding",
+                "label": "Cancel setup",
+                "key": "cancel_onboarding_header",
+                "use_container_width": False,
+            }
+        ] if step == 1 else None,
+    )
+    progress_markup = "".join(
+        (
+            f"<span class='setup-step-pill {'setup-step-pill--active' if index + 1 == step else 'setup-step-pill--done' if index + 1 < step else ''}'>"
+            f"<span class='setup-step-pill-index'>{index + 1}</span>"
+            f"{label}"
+            "</span>"
+        )
+        for index, (label, copy) in enumerate(_ONBOARDING_STEPS)
+    )
+    st.markdown(f"<div class='setup-progress-rail'>{progress_markup}</div>", unsafe_allow_html=True)
+    return header_action
 
 
 # ── Config generator ──────────────────────────────────────────────────────────
@@ -322,7 +358,8 @@ def _upsert_env_key(env_path: Path, key: str, value: str) -> None:
 # ── Step renderers ────────────────────────────────────────────────────────────
 
 def _step_job_type() -> None:
-    st.header("What are you looking for?")
+    with panel("What are you looking for?", subtitle="Start by choosing the search mode so the rest of the setup can adapt"):
+        callout("info", "Tip", "Internship mode changes filters, salary handling, and prompt wording so the scorer evaluates student roles correctly.")
 
     data = st.session_state.onboarding_data
     current_idx = 1 if data.get("job_type") == "internship" else 0
@@ -335,37 +372,36 @@ def _step_job_type() -> None:
     )
 
     if job_type_choice == "Internship":
-        st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            season_opts = ["Summer", "Fall", "Spring"]
-            season = st.selectbox(
-                "Target season",
-                season_opts,
-                index=season_opts.index(data.get("target_season", "Summer")),
-            )
-        with col2:
-            year_opts = ["2025", "2026", "2027"]
-            year = st.selectbox(
-                "Year",
-                year_opts,
-                index=year_opts.index(data.get("target_year", "2026")),
-            )
-        school = st.text_input("School name", value=data.get("school", ""))
-        col1, col2 = st.columns(2)
-        with col1:
-            major = st.text_input("Major", value=data.get("major", ""))
-        with col2:
-            grad_year_opts = ["2025", "2026", "2027", "2028", "2029"]
-            grad_default = data.get("graduation_year", "2027")
-            grad_year = st.selectbox(
-                "Graduation year",
-                grad_year_opts,
-                index=grad_year_opts.index(grad_default) if grad_default in grad_year_opts else 2,
-            )
-        gpa = st.text_input("GPA (optional)", value=data.get("gpa", ""))
+        with panel("Internship details", subtitle="This adds school and season context to the scoring prompts"):
+            col1, col2 = st.columns(2)
+            with col1:
+                season_opts = ["Summer", "Fall", "Spring"]
+                season = st.selectbox(
+                    "Target season",
+                    season_opts,
+                    index=season_opts.index(data.get("target_season", "Summer")),
+                )
+            with col2:
+                year_opts = ["2025", "2026", "2027"]
+                year = st.selectbox(
+                    "Year",
+                    year_opts,
+                    index=year_opts.index(data.get("target_year", "2026")),
+                )
+            school = st.text_input("School name", value=data.get("school", ""))
+            col1, col2 = st.columns(2)
+            with col1:
+                major = st.text_input("Major", value=data.get("major", ""))
+            with col2:
+                grad_year_opts = ["2025", "2026", "2027", "2028", "2029"]
+                grad_default = data.get("graduation_year", "2027")
+                grad_year = st.selectbox(
+                    "Graduation year",
+                    grad_year_opts,
+                    index=grad_year_opts.index(grad_default) if grad_default in grad_year_opts else 2,
+                )
+            gpa = st.text_input("GPA (optional)", value=data.get("gpa", ""))
 
-    st.divider()
     if st.button("Next →", type="primary", key="step1_next"):
         data["job_type"] = "internship" if job_type_choice == "Internship" else "fulltime"
         if job_type_choice == "Internship":
@@ -380,7 +416,8 @@ def _step_job_type() -> None:
 
 
 def _step_basic_info() -> None:
-    st.header("About you")
+    with panel("About you", subtitle="This step collects the candidate context that powers scoring quality"):
+        callout("info", "What you need here", "Add your name, a resume, and a short bio. The bio helps the scorer understand what kind of work you want next.")
 
     data = st.session_state.onboarding_data
     name = st.text_input("Your name", value=data.get("name", ""))
@@ -394,7 +431,7 @@ def _step_basic_info() -> None:
     if resume_choice == "Upload PDF":
         has_pdf = bool(data.get("resume_pdf_bytes"))
         if has_pdf:
-            st.success(f"Uploaded: {data.get('resume_pdf_name', 'resume.pdf')}")
+            callout("success", "Resume uploaded", data.get("resume_pdf_name", "resume.pdf"))
             if st.button("Replace PDF", key="replace_pdf"):
                 data.pop("resume_pdf_bytes", None)
                 data.pop("resume_pdf_name", None)
@@ -427,7 +464,6 @@ def _step_basic_info() -> None:
         placeholder=bio_placeholder,
     )
 
-    st.divider()
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← Back", key="step2_back"):
@@ -445,7 +481,7 @@ def _step_basic_info() -> None:
 
             if errors:
                 for e in errors:
-                    st.error(e)
+                    callout("error", "Missing required information", e)
             else:
                 data["name"] = name.strip()
                 data["bio"]  = bio.strip()
@@ -458,7 +494,8 @@ def _step_basic_info() -> None:
 
 def _step_preferences() -> None:
     is_intern = st.session_state.onboarding_data.get("job_type") == "internship"
-    st.header("Job preferences")
+    with panel("Job preferences", subtitle="These settings decide what gets fetched, filtered, and scored"):
+        callout("info", "Why this matters", "Target titles and desired skills influence which jobs are worth an LLM call. Hard-no keywords skip obvious mismatches early.")
 
     data = st.session_state.onboarding_data
 
@@ -531,7 +568,6 @@ def _step_preferences() -> None:
         placeholder="e.g. Austin, TX",
     )
 
-    st.divider()
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← Back", key="step3_back"):
@@ -559,7 +595,8 @@ def _step_preferences() -> None:
 
 
 def _step_llm_provider() -> None:
-    st.header("Choose your AI provider")
+    with panel("Choose your AI provider", subtitle="Pick the model that balances quality, speed, and daily capacity for your workflow"):
+        callout("info", "Plain language guide", "RPM means requests per minute. RPD means requests per day. Higher limits make long scoring runs smoother.")
 
     data = st.session_state.onboarding_data
 
@@ -570,6 +607,7 @@ def _step_llm_provider() -> None:
                 "Model": provider["model_id"],
                 "Free RPM": provider["rpm"],
                 "Free RPD": provider["rpd"] or "Unlimited",
+                "Recommended": "Yes" if "recommended" in provider["label"].lower() else "",
                 "Accuracy": f"{provider['stars']}{' (paid)' if provider['paid'] else ''}",
             }
             for provider in _PROVIDERS
@@ -588,6 +626,10 @@ def _step_llm_provider() -> None:
     )
 
     selected = next(p for p in _PROVIDERS if p["label"] == selected_label)
+    st.markdown(
+        badge("Recommended", "success") if "recommended" in selected["label"].lower() else badge("Alternate option", "neutral"),
+        unsafe_allow_html=True,
+    )
 
     # Runtime estimate
     rpd_val = selected["rpd"]
@@ -597,7 +639,7 @@ def _step_llm_provider() -> None:
     # API key input
     st.subheader("API key")
     if selected["paid"]:
-        st.info("Anthropic Claude Sonnet is a paid model. You will be billed per token.")
+        callout("warning", "Paid provider", "Anthropic Claude Sonnet is a paid model. You will be billed per token.")
     api_key = st.text_input(
         f"{selected['env_var']}",
         value=data.get("api_key", "") if data.get("provider") == selected["provider"] else "",
@@ -614,7 +656,7 @@ def _step_llm_provider() -> None:
     with col2:
         if st.button("Next →", type="primary", key="step4_next"):
             if not api_key.strip():
-                st.error(f"Please enter your {selected['env_var']} to continue.")
+                callout("error", "API key required", f"Please enter your {selected['env_var']} to continue.")
             else:
                 data["provider_label"] = selected_label
                 data["provider"]   = selected["provider"]
@@ -627,7 +669,8 @@ def _step_llm_provider() -> None:
 
 
 def _step_review_create() -> None:
-    st.header("Review and create profile")
+    with panel("Review and create profile", subtitle="Double-check the key decisions before the profile folder and database are created"):
+        callout("info", "Almost there", "Creating the profile writes a dedicated config file and initializes a separate jobs database for this person.")
 
     data = st.session_state.onboarding_data
     is_intern = data.get("job_type") == "internship"
@@ -643,33 +686,31 @@ def _step_review_create() -> None:
     if profile_slug:
         st.caption(f"Will be created at: profiles/{profile_slug}/")
 
-    st.divider()
-    st.subheader("Summary")
+    with panel("Summary", subtitle="These settings will be written to the new profile immediately after creation"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Name:** {data.get('name', '')}")
+            st.markdown(f"**Type:** {'Internship' if is_intern else 'Full-time'}")
+            if is_intern:
+                st.markdown(f"**Target:** {data.get('target_season', '')} {data.get('target_year', '')} — {data.get('school', '')}")
+            resume_label = f"PDF ({data.get('resume_pdf_name', 'resume.pdf')})" if data.get("resume_type") == "pdf" else "Text"
+            st.markdown(f"**Resume:** {resume_label}")
+            st.markdown(f"**Provider:** {data.get('provider_label', '')}")
+        with col2:
+            st.markdown(f"**Remote OK:** {'Yes' if data.get('remote_ok') else 'No'}")
+            locs = ", ".join(data.get("preferred_locations", []))
+            st.markdown(f"**Locations:** {locs or '—'}")
+            if not is_intern:
+                sal = data.get("min_salary", 0)
+                st.markdown(f"**Min salary:** ${sal:,}")
+            else:
+                stip = data.get("stipend_expectation", 0)
+                st.markdown(f"**Stipend:** ${stip:,}/mo" if stip else "**Stipend:** —")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(f"**Name:** {data.get('name', '')}")
-        st.markdown(f"**Type:** {'Internship' if is_intern else 'Full-time'}")
-        if is_intern:
-            st.markdown(f"**Target:** {data.get('target_season', '')} {data.get('target_year', '')} — {data.get('school', '')}")
-        resume_label = f"PDF ({data.get('resume_pdf_name', 'resume.pdf')})" if data.get("resume_type") == "pdf" else "Text"
-        st.markdown(f"**Resume:** {resume_label}")
-        st.markdown(f"**Provider:** {data.get('provider_label', '')}")
-    with col2:
-        st.markdown(f"**Remote OK:** {'Yes' if data.get('remote_ok') else 'No'}")
-        locs = ", ".join(data.get("preferred_locations", []))
-        st.markdown(f"**Locations:** {locs or '—'}")
-        if not is_intern:
-            sal = data.get("min_salary", 0)
-            st.markdown(f"**Min salary:** ${sal:,}")
-        else:
-            stip = data.get("stipend_expectation", 0)
-            st.markdown(f"**Stipend:** ${stip:,}/mo" if stip else "**Stipend:** —")
-
-    titles = data.get("titles", [])
-    if titles:
-        st.markdown("**Target titles:**")
-        st.code("\n".join(titles))
+        titles = data.get("titles", [])
+        if titles:
+            st.markdown("**Target titles:**")
+            chip_row(titles)
 
     st.divider()
     col1, col2 = st.columns(2)
@@ -685,14 +726,15 @@ def _step_review_create() -> None:
         )
         if st.button("Create profile", type="primary", key="step5_create"):
             if not profile_slug:
-                st.error("Profile name cannot be empty.")
+                callout("error", "Profile name required", "Profile name cannot be empty.")
                 return
 
             profile_dir = _PROFILES_DIR / profile_slug
             if profile_dir.exists():
-                st.warning(
-                    f"A profile named '{profile_slug}' already exists. "
-                    "Choose a different name or go back to the main page."
+                callout(
+                    "warning",
+                    "Profile already exists",
+                    f"A profile named '{profile_slug}' already exists. Choose a different name or go back to the main page.",
                 )
                 return
 
@@ -701,7 +743,7 @@ def _step_review_create() -> None:
             try:
                 create_profile(data)
             except Exception as e:
-                st.error(f"Failed to create profile: {e}")
+                callout("error", "Profile creation failed", str(e))
                 return
 
             # Success — clear onboarding state
@@ -710,13 +752,313 @@ def _step_review_create() -> None:
             st.session_state.show_onboarding  = False
             st.session_state.active_profile   = profile_slug
             st.cache_data.clear()
-            st.success(
-                f"Profile '{profile_slug}' created! "
-                "Your profile is ready. Go to the dashboard to start your first job search."
+            callout(
+                "success",
+                "Profile created",
+                f"Profile '{profile_slug}' created. Your profile is ready for its first job search.",
             )
             if celebrate:
                 st.balloons()
             st.rerun()
+
+
+def _setup_step_navigation(back_step: int | None, next_id: str, next_label: str, *, meta: str = "") -> str | None:
+    secondary = []
+    if back_step is not None:
+        secondary.append({"id": "back", "label": "Back", "key": f"{next_id}_back"})
+    return toolbar(
+        primary_actions=[{"id": "next", "label": next_label, "key": next_id}],
+        secondary_actions=secondary,
+        meta=meta,
+    )
+
+
+def _step_job_type() -> None:
+    data = st.session_state.onboarding_data
+    with section_shell("Choose the search path", "This choice changes defaults, compensation handling, and scoring language."):
+        with panel("Search mode", subtitle="Pick the setup that best matches the roles you want right now"):
+            st.caption("Internship mode keeps school context visible. Full-time mode keeps salary and experience signals visible.")
+            current_idx = 1 if data.get("job_type") == "internship" else 0
+            job_type_choice = st.radio(
+                "Job type",
+                ["Full-time", "Internship"],
+                index=current_idx,
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+
+        if job_type_choice == "Internship":
+            with panel("Internship details", subtitle="These details help the scorer understand school-year recruiting context"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    season_opts = ["Summer", "Fall", "Spring"]
+                    season = st.selectbox("Target season", season_opts, index=season_opts.index(data.get("target_season", "Summer")))
+                with col2:
+                    year_opts = ["2025", "2026", "2027"]
+                    year = st.selectbox("Target year", year_opts, index=year_opts.index(data.get("target_year", "2026")))
+                school = st.text_input("School", value=data.get("school", ""), placeholder="Georgia Tech")
+                col1, col2 = st.columns(2)
+                with col1:
+                    major = st.text_input("Major", value=data.get("major", ""), placeholder="Computer Science")
+                with col2:
+                    grad_year_opts = ["2025", "2026", "2027", "2028", "2029"]
+                    grad_default = data.get("graduation_year", "2027")
+                    grad_year = st.selectbox("Graduation year", grad_year_opts, index=grad_year_opts.index(grad_default) if grad_default in grad_year_opts else 2)
+                gpa = st.text_input("GPA", value=data.get("gpa", ""), placeholder="Optional")
+
+    clicked = _setup_step_navigation(None, "setup_step1_next", "Continue to profile", meta="You can update this later in Settings.")
+    if clicked == "next":
+        data["job_type"] = "internship" if job_type_choice == "Internship" else "fulltime"
+        if job_type_choice == "Internship":
+            data["target_season"] = season
+            data["target_year"] = year
+            data["school"] = school
+            data["major"] = major
+            data["graduation_year"] = grad_year
+            data["gpa"] = gpa
+        st.session_state.onboarding_step = 2
+        st.rerun()
+
+
+def _step_basic_info() -> None:
+    data = st.session_state.onboarding_data
+    with section_shell("Build the candidate profile", "These details power the scoring prompts and the profile summary across the app."):
+        with panel("Candidate basics", subtitle="Add the core context the system should carry into job review"):
+            st.caption("A short, specific bio helps the scorer understand the kind of role you want next.")
+            name = st.text_input("Name", value=data.get("name", ""), placeholder="Manav Shah")
+            bio_placeholder = (
+                "Junior CS student focused on backend and AI engineering internships for Summer 2026."
+                if data.get("job_type") == "internship"
+                else "Software engineer focused on Python backend systems and LLM integrations."
+            )
+            bio = st.text_area("Short bio", value=data.get("bio", ""), height=110, placeholder=bio_placeholder, help="Aim for 2-3 sentences.")
+
+        with panel("Resume source", subtitle="Choose one resume source. PDF is easiest. Pasted text gives you more direct control."):
+            resume_opts = ["Upload PDF", "Paste text"]
+            resume_type_idx = 0 if data.get("resume_type") == "pdf" else 1
+            resume_choice = st.radio("Resume source", resume_opts, index=resume_type_idx, horizontal=True, label_visibility="collapsed")
+
+            if resume_choice == "Upload PDF":
+                has_pdf = bool(data.get("resume_pdf_bytes"))
+                if has_pdf:
+                    callout("success", "Resume ready", data.get("resume_pdf_name", "resume.pdf"))
+                    if st.button("Replace uploaded PDF", key="replace_pdf"):
+                        data.pop("resume_pdf_bytes", None)
+                        data.pop("resume_pdf_name", None)
+                        st.rerun()
+                else:
+                    uploaded = st.file_uploader("Upload resume PDF", type=["pdf"], help="Used for ATS-style overlap scoring and saved with the profile.")
+                    if uploaded is not None:
+                        data["resume_pdf_bytes"] = uploaded.getvalue()
+                        data["resume_pdf_name"] = uploaded.name
+                        st.rerun()
+                resume_text = data.get("resume_text", "")
+            else:
+                resume_text = st.text_area("Resume text", value=data.get("resume_text", ""), height=220, help="Paste plain text so the scorer can inspect it directly.")
+
+    clicked = _setup_step_navigation(1, "setup_step2_next", "Continue to preferences", meta="Required fields are checked before you move on.")
+    if clicked == "back":
+        st.session_state.onboarding_step = 1
+        st.rerun()
+    if clicked == "next":
+        errors = []
+        if not name.strip():
+            errors.append("Add a profile name before continuing.")
+        if resume_choice == "Upload PDF" and not data.get("resume_pdf_bytes"):
+            errors.append("Upload a PDF resume or switch to pasted text.")
+        if resume_choice == "Paste text" and not resume_text.strip():
+            errors.append("Paste resume text before continuing.")
+        if errors:
+            for message in errors:
+                callout("error", "Setup needs one more detail", message)
+            return
+        data["name"] = name.strip()
+        data["bio"] = bio.strip()
+        data["resume_type"] = "pdf" if resume_choice == "Upload PDF" else "text"
+        if resume_choice == "Paste text":
+            data["resume_text"] = resume_text.strip()
+        st.session_state.onboarding_step = 3
+        st.rerun()
+
+
+def _step_preferences() -> None:
+    is_intern = st.session_state.onboarding_data.get("job_type") == "internship"
+    data = st.session_state.onboarding_data
+    with section_shell("Set job preferences", "These settings decide what gets fetched, filtered, and scored first."):
+        with panel("Target roles", subtitle="Use line-based lists so the system can match titles and skills predictably"):
+            st.caption("Target titles and desired skills influence which roles are worth a scoring call. Hard-no phrases skip obvious mismatches early.")
+            default_titles = _DEFAULT_INTERN_TITLES if is_intern else _DEFAULT_FT_TITLES
+            titles_text = st.text_area("Target job titles", value="\n".join(data.get("titles", default_titles)), height=150, help="One title per line.")
+            skills_text = st.text_area("Desired skills", value="\n".join(data.get("desired_skills", _DEFAULT_SKILLS)), height=120, help="One skill per line.")
+            hard_no_default = _DEFAULT_INTERN_HARD_NO if is_intern else _DEFAULT_FT_HARD_NO
+            hard_no_text = st.text_area("Hard-no keywords", value="\n".join(data.get("hard_no_keywords", hard_no_default)), height=100, help="Jobs containing these phrases will be skipped before scoring.")
+
+        with panel("Location and compensation", subtitle="Tell the system where you can work and what compensation floor to keep in mind"):
+            remote_ok = st.checkbox("Open to remote roles", value=data.get("remote_ok", True))
+            preferred_locations = st.multiselect("Preferred locations", options=_LOCATION_OPTIONS, default=[loc for loc in data.get("preferred_locations", ["Remote", "San Francisco, CA", "New York, NY"]) if loc in _LOCATION_OPTIONS])
+            custom_loc = st.text_input("Add another location", value="", placeholder="Austin, TX")
+            if not is_intern:
+                col1, col2 = st.columns(2)
+                with col1:
+                    yoe = st.number_input("Years of experience", min_value=0, max_value=30, value=int(data.get("yoe", 0)))
+                with col2:
+                    min_salary = st.number_input("Minimum salary", min_value=0, step=5_000, value=int(data.get("min_salary", 130_000)))
+            else:
+                stipend = st.number_input("Target monthly stipend", min_value=0, step=500, value=int(data.get("stipend_expectation", 0)), help="Optional. Used as a soft scoring signal.")
+
+    clicked = _setup_step_navigation(2, "setup_step3_next", "Continue to AI provider", meta="Settings here can always be refined after setup.")
+    if clicked == "back":
+        st.session_state.onboarding_step = 2
+        st.rerun()
+    if clicked == "next":
+        all_locations = preferred_locations[:]
+        if custom_loc.strip() and custom_loc.strip() not in all_locations:
+            all_locations.append(custom_loc.strip())
+        data["titles"] = _lines_to_list(titles_text)
+        data["desired_skills"] = _lines_to_list(skills_text)
+        data["hard_no_keywords"] = _lines_to_list(hard_no_text)
+        data["remote_ok"] = remote_ok
+        data["preferred_locations"] = all_locations
+        if not is_intern:
+            data["yoe"] = int(yoe)
+            data["min_salary"] = int(min_salary)
+        else:
+            data["stipend_expectation"] = int(stipend)
+        st.session_state.onboarding_step = 4
+        st.rerun()
+
+
+def _step_llm_provider() -> None:
+    data = st.session_state.onboarding_data
+    with section_shell("Connect an AI provider", "Choose the model that balances quality, speed, and daily capacity for your workflow."):
+        with panel("Provider comparison", subtitle="Free limits matter because long scoring runs can burn through them quickly"):
+            st.caption("RPM means requests per minute. RPD means requests per day. Higher limits make long runs smoother.")
+            comparison_frame = pd.DataFrame(
+                [
+                    {
+                        "Provider": provider["provider"].title(),
+                        "Model": provider["model_id"],
+                        "Free RPM": provider["rpm"],
+                        "Free RPD": provider["rpd"] or "Unlimited",
+                        "Recommended": "Yes" if "recommended" in provider["label"].lower() else "",
+                        "Accuracy": f"{provider['stars']}{' (paid)' if provider['paid'] else ''}",
+                    }
+                    for provider in _PROVIDERS
+                ]
+            )
+            st.dataframe(comparison_frame, width="stretch", hide_index=True, placeholder="")
+
+        with panel("Selection", subtitle="Pick one provider now. You can switch later in your profile settings."):
+            current_label = data.get("provider_label", _PROVIDER_LABELS[0])
+            current_idx = _PROVIDER_LABELS.index(current_label) if current_label in _PROVIDER_LABELS else 0
+            selected_label = st.radio("Select provider and model", _PROVIDER_LABELS, index=current_idx, label_visibility="collapsed")
+            selected = next(p for p in _PROVIDERS if p["label"] == selected_label)
+            st.markdown(
+                badge("Recommended" if "recommended" in selected["label"].lower() else "Alternate", "success" if "recommended" in selected["label"].lower() else "neutral"),
+                unsafe_allow_html=True,
+            )
+            st.caption(f"Estimated runtime at 1,000 jobs: {_runtime_estimate(selected['rpm'], selected['rpd'])}.")
+            if selected["paid"]:
+                callout("warning", "Paid provider", "This provider bills by usage. Double-check the API key before running large scoring passes.")
+            api_key = st.text_input(
+                selected["env_var"],
+                value=data.get("api_key", "") if data.get("provider") == selected["provider"] else "",
+                type="password",
+                help="Stored in the repo-level .env file so future runs can reuse it.",
+            )
+
+    clicked = _setup_step_navigation(3, "setup_step4_next", "Continue to review", meta="The selected API key is required before profile creation.")
+    if clicked == "back":
+        st.session_state.onboarding_step = 3
+        st.rerun()
+    if clicked == "next":
+        if not api_key.strip():
+            callout("error", "API key required", f"Enter {selected['env_var']} before continuing.")
+            return
+        data["provider_label"] = selected_label
+        data["provider"] = selected["provider"]
+        data["model_key"] = selected["model_key"]
+        data["model_id"] = selected["model_id"]
+        data["env_var"] = selected["env_var"]
+        data["api_key"] = api_key.strip()
+        st.session_state.onboarding_step = 5
+        st.rerun()
+
+
+def _step_review_create() -> None:
+    data = st.session_state.onboarding_data
+    is_intern = data.get("job_type") == "internship"
+    suggested_slug = sanitize_slug(data.get("name", "profile"))
+    with section_shell("Review and create", "Double-check the setup, choose the profile slug, and create the workspace."):
+        with panel("Creation summary", subtitle="These decisions will be written into the profile folder and database right away"):
+            callout("info", "What happens next", "Creating the profile writes a dedicated config file, stores the chosen API key in .env, initializes a separate jobs database, and opens the profile dashboard.")
+            profile_slug = sanitize_slug(
+                st.text_input(
+                    "Profile slug",
+                    value=data.get("profile_slug", suggested_slug),
+                    help="Used as the folder name under profiles/. Lowercase and underscores only.",
+                )
+            )
+            if profile_slug:
+                st.caption(f"Profile folder: profiles/{profile_slug}/")
+
+            left, right = st.columns(2, gap="large")
+            with left:
+                st.markdown(f"**Name:** {data.get('name', '')}")
+                st.markdown(f"**Track:** {'Internship' if is_intern else 'Full-time'}")
+                st.markdown(f"**Resume source:** {'PDF upload' if data.get('resume_type') == 'pdf' else 'Pasted text'}")
+                st.markdown(f"**Provider:** {data.get('provider_label', '')}")
+            with right:
+                st.markdown(f"**Remote OK:** {'Yes' if data.get('remote_ok') else 'No'}")
+                st.markdown(f"**Locations:** {', '.join(data.get('preferred_locations', [])) or 'None set'}")
+                st.markdown(f"**Compensation:** {'$' + format(data.get('min_salary', 0), ',') if not is_intern else ('$' + format(data.get('stipend_expectation', 0), ',') + '/mo' if data.get('stipend_expectation') else 'Not set')}")
+                if is_intern:
+                    st.markdown(f"**Season:** {data.get('target_season', '')} {data.get('target_year', '')}".strip())
+
+            if data.get("titles"):
+                st.markdown("**Target titles**")
+                chip_row(data["titles"])
+
+        with panel("Launch options", subtitle="Choose how the app should celebrate and then create the profile"):
+            celebrate = st.checkbox(
+                "Show a celebration animation after creation",
+                value=bool(data.get("celebrate", st.session_state.get("celebrate_profile_create", False))),
+                key="celebrate_profile_create",
+                help="Purely visual. Safe to leave off if you prefer a quieter setup flow.",
+            )
+
+    clicked = toolbar(
+        primary_actions=[{"id": "create", "label": "Create profile", "key": "step5_create"}],
+        secondary_actions=[{"id": "back", "label": "Back", "key": "step5_back"}],
+        meta="Profile creation is instant. You will land directly in the new workspace.",
+    )
+    if clicked == "back":
+        st.session_state.onboarding_step = 4
+        st.rerun()
+    if clicked == "create":
+        if not profile_slug:
+            callout("error", "Profile slug required", "Add a profile slug before creating the workspace.")
+            return
+        profile_dir = _PROFILES_DIR / profile_slug
+        if profile_dir.exists():
+            callout("warning", "Profile already exists", f"A profile named '{profile_slug}' already exists. Choose a different slug.")
+            return
+        data["profile_slug"] = profile_slug
+        data["celebrate"] = celebrate
+        try:
+            create_profile(data)
+        except Exception as e:
+            callout("error", "Profile creation failed", str(e))
+            return
+        st.session_state.onboarding_step = 1
+        st.session_state.onboarding_data = {}
+        st.session_state.show_onboarding = False
+        st.session_state.active_profile = profile_slug
+        st.cache_data.clear()
+        callout("success", "Profile created", f"Profile '{profile_slug}' is ready for its first search run.")
+        if celebrate:
+            st.balloons()
+        st.rerun()
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -732,14 +1074,14 @@ def render_onboarding() -> None:
         st.session_state.onboarding_data = {}
 
     step = st.session_state.onboarding_step
-
-    st.progress(step / 5)
-    st.caption(f"Step {step} of 5 — New profile setup")
-    st.info(
-        "You will need your name, a resume, and one provider API key. Creating a profile writes "
-        "`profiles/<slug>/config.yaml`, initializes a dedicated jobs database, and opens that "
-        "profile in the dashboard."
-    )
+    header_action = _onboarding_intro(step)
+    if header_action == "cancel_onboarding":
+        st.session_state.show_onboarding = False
+        st.session_state.onboarding_step = 1
+        st.session_state.onboarding_data = {}
+        st.rerun()
+    st.progress(step / len(_ONBOARDING_STEPS), text=f"Step {step} of {len(_ONBOARDING_STEPS)}")
+    st.caption("Complete setup once and the app will create the workspace, save the profile, and open it automatically.")
 
     steps = [
         _step_job_type,
