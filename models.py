@@ -11,7 +11,7 @@ Uses Pydantic v2 field validators and can be used with instructor for structured
 """
 
 from typing import List, Optional
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 class ScoreResult(BaseModel):
@@ -82,7 +82,10 @@ class StructuredProfile(BaseModel):
     education: str = ""
     strengths: List[str] = []
     target_roles: List[str] = []
-    min_salary: int = 0
+    target_salary: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("target_salary", "min_salary"),
+    )
     remote_preference: str = "True"
     preferred_locations: List[str] = []
 
@@ -108,10 +111,12 @@ class StructuredProfile(BaseModel):
                 result.append(item_str)
         return result
 
-    @field_validator("min_salary", mode="before")
+    @field_validator("target_salary", mode="before")
     @classmethod
     def parse_salary(cls, v):
-        """Ensure min_salary is an integer."""
+        """Ensure target_salary is an integer when present."""
+        if v in (None, ""):
+            return None
         if isinstance(v, int):
             return v
         if isinstance(v, str):
@@ -120,8 +125,8 @@ class StructuredProfile(BaseModel):
             try:
                 return int(v)
             except ValueError:
-                return 0
-        return 0
+                return None
+        return None
 
     @field_validator("yoe", mode="before")
     @classmethod

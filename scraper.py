@@ -270,6 +270,14 @@ def _extract_yoe_numbers(text: str) -> List[int]:
     return [v for _, _, v in kept]
 
 
+def _configured_max_job_age_days(config: Dict[str, Any]) -> int:
+    """Return the configured max posting age in days, defaulting to 30."""
+    try:
+        return int(config.get("preferences", {}).get("filters", {}).get("max_job_age_days", 30))
+    except (TypeError, ValueError):
+        return 30
+
+
 def passes_filters(
     text: str,
     title: str,
@@ -367,6 +375,7 @@ def passes_filters(
         if not _is_us_location(location):
             if debug:
                 logger.debug(f"[SKIP] non-US location '{location}' | {title!r}")
+            return False
 
     elif source == "hackernews":
         # Unstructured free text — look for US signals and absence of non-US geo
@@ -407,9 +416,7 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
     preferred_titles = profile_info.get('titles') or preferences.get('titles', [])
     desired_skills = profile_info.get('desired_skills') or preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
-    min_salary = preferences.get('compensation', {}).get('min_salary', 0)
-    remote_ok = preferences.get('location', {}).get('remote_ok', False)
-    preferred_locations = preferences.get('location', {}).get('preferred_locations', [])
+    max_job_age_days = _configured_max_job_age_days(config)
 
     companies_checked = 0
     new_jobs_saved = 0
@@ -439,15 +446,15 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
             company_new_count = 0
 
             for job_posting in jobs:
-                # Skip if updated_at is older than 30 days
+                # Skip postings older than the configured age window.
                 updated_at_str = job_posting.get('updated_at')
                 if updated_at_str:
                     try:
                         # Parse ISO timestamp (e.g. "2016-01-14T10:55:28-05:00")
                         updated_at = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00'))
                         # Use UTC for comparison to avoid timezone issues
-                        thirty_days_ago = datetime.now(updated_at.tzinfo) - timedelta(days=30)
-                        if updated_at < thirty_days_ago:
+                        oldest_allowed = datetime.now(updated_at.tzinfo) - timedelta(days=max_job_age_days)
+                        if updated_at < oldest_allowed:
                             continue  # Skip old jobs
                     except (ValueError, TypeError):
                         # If we can't parse the date, continue processing (don't skip)
@@ -536,7 +543,6 @@ Description:
 
 
 LEVER_API_BASE = "https://api.lever.co/v0/postings"
-_MAX_JOB_AGE_DAYS = 30
 
 
 def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
@@ -562,7 +568,7 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
     logger.info("Looking for: %s", ", ".join(preferred_titles))
     logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
 
-    max_age = timedelta(days=_MAX_JOB_AGE_DAYS)
+    max_age = timedelta(days=_configured_max_job_age_days(config))
 
     for slug in companies:
         companies_checked += 1
@@ -689,9 +695,6 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
     preferred_titles = preferences.get('titles', [])
     desired_skills = preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
-    min_salary = preferences.get('compensation', {}).get('min_salary', 0)
-    remote_ok = preferences.get('location', {}).get('remote_ok', False)
-    preferred_locations = preferences.get('location', {}).get('preferred_locations', [])
 
     new_jobs_saved = 0
     jobs_scraped = 0

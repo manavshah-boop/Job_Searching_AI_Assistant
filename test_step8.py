@@ -59,7 +59,7 @@ def test_models():
         yoe=3,
         core_skills=['Python', 'Python', 'Go', 'Go', 'Rust'],
         languages=['Python', 'Go', 'Python'],
-        min_salary=150000,
+        target_salary=150000,
         remote_preference='True'
     )
     assert sp.core_skills == ['Python', 'Go', 'Rust'], f"Dedup failed: {sp.core_skills}"
@@ -132,7 +132,7 @@ def test_backward_compatibility():
         yoe=5,
         current_title='Senior Engineer',
         core_skills=['Python', 'Go'],
-        min_salary=180000
+        target_salary=180000
     )
     
     sp_dict = sp.model_dump()

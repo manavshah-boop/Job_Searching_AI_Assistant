@@ -384,6 +384,7 @@ def effective_config_summary(config: dict[str, Any], raw_config: dict[str, Any])
     prefs = config.get("preferences", {})
     location = prefs.get("location", {})
     compensation = prefs.get("compensation", {})
+    is_intern = config.get("profile", {}).get("job_type") == "internship"
     enabled_sources = [
         label
         for source, label in SOURCE_LABELS.items()
@@ -398,11 +399,65 @@ def effective_config_summary(config: dict[str, Any], raw_config: dict[str, Any])
         f"Desired skills: {len(prefs.get('desired_skills', []))}",
         f"Sources enabled: {', '.join(enabled_sources) if enabled_sources else 'None'}",
     ]
-    if "min_salary" in compensation:
+    if is_intern:
+        pay_preference = str(compensation.get("intern_pay_preference", "")).strip().lower()
+        if pay_preference not in {"paid_only", "unpaid_ok", "no_preference"}:
+            pay_preference = "paid_only" if compensation.get("monthly_stipend") else "no_preference"
+        pay_preference_label = {
+            "paid_only": "Paid only",
+            "unpaid_ok": "Unpaid OK",
+            "no_preference": "No preference",
+        }[pay_preference]
+        summary.append(f"Compensation preference: {pay_preference_label}")
+        if compensation.get("monthly_stipend") not in (None, "", 0):
+            summary.append(f"Monthly stipend target: ${int(compensation['monthly_stipend']):,}")
+    elif "min_salary" in compensation:
         summary.append(f"Minimum salary: ${int(compensation['min_salary']):,}")
-    if "monthly_stipend" in compensation:
-        summary.append(f"Monthly stipend target: ${int(compensation['monthly_stipend']):,}")
     return summary
+
+
+def _normalize_intern_pay_preference(compensation: dict[str, Any]) -> str:
+    preference = str(compensation.get("intern_pay_preference", "")).strip().lower()
+    if preference in {"paid_only", "unpaid_ok", "no_preference"}:
+        return preference
+    if compensation.get("monthly_stipend"):
+        return "paid_only"
+    return "no_preference"
+
+
+def _format_compensation_value(job_type: str, compensation: dict[str, Any]) -> str:
+    if job_type == "internship":
+        preference = _normalize_intern_pay_preference(compensation)
+        preference_label = {
+            "paid_only": "Paid only",
+            "unpaid_ok": "Unpaid OK",
+            "no_preference": "No preference",
+        }[preference]
+        stipend = compensation.get("monthly_stipend")
+        stipend_value = int(stipend) if stipend not in (None, "", 0) else 0
+        if preference == "paid_only" and stipend_value:
+            return f"{preference_label}, target ${stipend_value:,}/mo"
+        return preference_label
+
+    salary = compensation.get("min_salary")
+    if salary in (None, "", 0):
+        return "Not set"
+    return f"${int(salary):,}"
+
+
+def _compensation_rows(job_type: str, compensation: dict[str, Any]) -> list[tuple[str, str]]:
+    if job_type == "internship":
+        preference = _normalize_intern_pay_preference(compensation)
+        rows = [("Compensation preference", {
+            "paid_only": "Paid only",
+            "unpaid_ok": "Unpaid OK",
+            "no_preference": "No preference",
+        }[preference])]
+        stipend = compensation.get("monthly_stipend")
+        if stipend not in (None, "", 0):
+            rows.append(("Monthly stipend target", f"${int(stipend):,}/mo"))
+        return rows
+    return [("Compensation", _format_compensation_value(job_type, compensation))]
 
 
 def _section_heading(profile_name: str, section: str) -> None:
@@ -1037,6 +1092,7 @@ def _render_summary_list(items: list[tuple[str, Any]]) -> None:
 def _queue_pipeline_run(slug: str) -> None:
     if not _worker_is_running(slug):
         _launch_worker(slug)
+        st.session_state["_scroll_to_progress"] = True
     st.rerun()
 
 
@@ -2443,10 +2499,12 @@ def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str,
     prefs = config.get("preferences", {})
     loc = prefs.get("location", {})
     compensation = prefs.get("compensation", {})
+    job_type = profile_cfg.get("job_type", "fulltime")
+    is_intern = job_type == "internship"
     with section_shell("Profile", SECTION_COPY["Profile"]):
         stat_row(
             [
-                ("Profile type", profile_cfg.get("job_type", "fulltime").replace("_", " ").title(), "Current search mode"),
+                ("Profile type", job_type.replace("_", " ").title(), "Current search mode"),
                 ("Target titles", len(prefs.get("titles", [])), "Roles the system prioritizes"),
                 ("Desired skills", len(prefs.get("desired_skills", [])), "Skills used for matching"),
                 ("Sources enabled", sum(1 for cfg in raw_config.get("sources", {}).values() if cfg.get("enabled", False)), "Providers actively searched"),
@@ -2480,13 +2538,28 @@ def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str,
                         resume_display = f"Configured as {resume_value}"
 
                 callout("info", "Profile summary", profile_cfg.get("bio") or "Add a short bio in Settings to give the scorer more context.")
+                summary_rows = [
+                    ("Name", profile_cfg.get("name", "Unknown")),
+                    ("Job type", job_type.replace("_", " ").title()),
+                    ("Resume source", resume_display),
+                ]
+                if is_intern:
+                    summary_rows.extend(
+                        [
+                            ("School", profile_cfg.get("school", "") or "Not set"),
+                            ("Major", profile_cfg.get("major", "") or "Not set"),
+                            ("Graduation year", str(profile_cfg.get("graduation_year", "") or "Not set")),
+                            ("Target season", profile_cfg.get("target_season", "") or "Not set"),
+                        ]
+                    )
                 _render_html_block(
                     (
                         "<div class='summary-list'>"
-                        f"<div class='summary-row'><span>Name</span><strong>{html.escape(profile_cfg.get('name', 'Unknown'))}</strong></div>"
-                        f"<div class='summary-row'><span>Job type</span><strong>{html.escape(profile_cfg.get('job_type', 'fulltime').replace('_', ' ').title())}</strong></div>"
-                        f"<div class='summary-row'><span>Resume source</span><strong>{html.escape(resume_display)}</strong></div>"
-                        "</div>"
+                        + "".join(
+                            f"<div class='summary-row'><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong></div>"
+                            for label, value in summary_rows
+                        )
+                        + "</div>"
                     )
                 )
                 if resume_pdf_bytes and resume_file_name:
@@ -2506,13 +2579,19 @@ def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str,
 
         with top[1]:
             with panel("Search preferences", subtitle="Location and compensation signals that shape ranking and fit"):
+                compensation_rows = [
+                    ("Remote", "Open" if loc.get("remote_ok", True) else "Not preferred"),
+                    ("Preferred locations", ", ".join(loc.get("preferred_locations", [])) or "None set"),
+                    *_compensation_rows(job_type, compensation),
+                ]
                 _render_html_block(
                     (
                         "<div class='summary-list'>"
-                        f"<div class='summary-row'><span>Remote</span><strong>{'Open' if loc.get('remote_ok', True) else 'Not preferred'}</strong></div>"
-                        f"<div class='summary-row'><span>Preferred locations</span><strong>{html.escape(', '.join(loc.get('preferred_locations', [])) or 'None set')}</strong></div>"
-                        f"<div class='summary-row'><span>Compensation</span><strong>{html.escape('$' + format(int(compensation['min_salary']), ',') if 'min_salary' in compensation else ('$' + format(int(compensation['monthly_stipend']), ',') + '/mo' if 'monthly_stipend' in compensation else 'Not set'))}</strong></div>"
-                        "</div>"
+                        + "".join(
+                            f"<div class='summary-row'><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong></div>"
+                            for label, value in compensation_rows
+                        )
+                        + "</div>"
                     )
                 )
 
@@ -2548,6 +2627,8 @@ def _lines_to_list(text: str) -> list[str]:
 
 def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any], metrics: dict[str, Any]) -> None:
     editable = copy.deepcopy(raw_config)
+    job_type = editable.get("profile", {}).get("job_type", "fulltime")
+    is_intern = job_type == "internship"
     editable.setdefault("scoring", {})
     editable.setdefault("preferences", {})
     editable["preferences"].setdefault("location", {})
@@ -2560,8 +2641,9 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
         location_defaults = editable["preferences"]["location"].get("preferred_locations", [])
         location_options = sorted({*LOCATION_PICKER_OPTIONS, *location_defaults})
         compensation = editable["preferences"]["compensation"]
-        salary_value = int(compensation.get("min_salary", 0))
-        stipend_value = int(compensation.get("monthly_stipend", 0))
+        salary_value = int(compensation.get("min_salary", 0) or 0)
+        stipend_value = int(compensation.get("monthly_stipend", 0) or 0)
+        intern_pay_preference = _normalize_intern_pay_preference(compensation)
 
         with st.expander("Search preferences", expanded=True):
             st.caption("Keep the shortlist aligned with where and how you want to work.")
@@ -2622,16 +2704,16 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 key=f"edit_matching_rules_{slug}",
                 help="Switch between a compact summary and the full editor for titles, skills, exclusions, and source company lists.",
             )
-            if "min_salary" in compensation or "monthly_stipend" not in compensation:
+            if is_intern:
+                minimum_salary = None
+                monthly_stipend = stipend_value if intern_pay_preference == "paid_only" else 0
+                compensation_summary = _format_compensation_value(job_type, compensation)
+                compensation_label = "Compensation"
+            else:
                 minimum_salary = salary_value
                 monthly_stipend = None
                 compensation_summary = f"${salary_value:,}" if salary_value else "Not set"
                 compensation_label = "Minimum salary"
-            else:
-                monthly_stipend = stipend_value
-                minimum_salary = None
-                compensation_summary = f"${stipend_value:,}/mo" if stipend_value else "Not set"
-                compensation_label = "Monthly stipend target"
 
             if not edit_matching_rules:
                 _render_summary_list(
@@ -2654,12 +2736,27 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 titles_text = st.text_area("Target titles", value=titles_text, height=120, help="One title per line.")
                 skills_text = st.text_area("Desired skills", value=skills_text, height=120, help="One skill per line.")
                 hard_no_text = st.text_area("Hard-no keywords", value=hard_no_text, height=100, help="Any posting containing these phrases will be skipped early.")
-                if "min_salary" in compensation or "monthly_stipend" not in compensation:
+                if is_intern:
+                    preference_labels = {
+                        "paid_only": "Paid only",
+                        "unpaid_ok": "Unpaid OK",
+                        "no_preference": "No preference",
+                    }
+                    selected_label = st.radio(
+                        "Compensation preference",
+                        list(preference_labels.values()),
+                        index=list(preference_labels.keys()).index(intern_pay_preference),
+                        horizontal=True,
+                    )
+                    intern_pay_preference = {label: value for value, label in preference_labels.items()}[selected_label]
+                    if intern_pay_preference == "paid_only":
+                        monthly_stipend = st.number_input("Monthly stipend target", min_value=0, step=500, value=stipend_value, help="Used as a soft scoring preference for internship profiles.")
+                    else:
+                        monthly_stipend = 0
+                    minimum_salary = None
+                else:
                     minimum_salary = st.number_input("Minimum salary", min_value=0, step=5000, value=salary_value, help="Used as a soft scoring preference, not a hard filter.")
                     monthly_stipend = None
-                else:
-                    monthly_stipend = st.number_input("Monthly stipend target", min_value=0, step=500, value=stipend_value, help="Used as a soft scoring preference for internship profiles.")
-                    minimum_salary = None
                 gh_companies = st.text_area("Greenhouse companies", value=gh_companies, height=140, help="One company slug or name per line.")
                 lv_companies = st.text_area("Lever companies", value=lv_companies, height=140, help="One company slug or name per line.")
 
@@ -2677,10 +2774,14 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
             editable["preferences"]["hard_no_keywords"] = _lines_to_list(hard_no_text)
             editable["preferences"]["location"]["remote_ok"] = remote_ok
             editable["preferences"]["location"]["preferred_locations"] = list(preferred_locations)
-            if minimum_salary is not None:
-                editable["preferences"]["compensation"]["min_salary"] = int(minimum_salary)
-            if monthly_stipend is not None:
-                editable["preferences"]["compensation"]["monthly_stipend"] = int(monthly_stipend)
+            if is_intern:
+                editable["preferences"]["compensation"] = {
+                    "intern_pay_preference": intern_pay_preference,
+                }
+                if intern_pay_preference == "paid_only" and monthly_stipend not in (None, 0):
+                    editable["preferences"]["compensation"]["monthly_stipend"] = int(monthly_stipend)
+            else:
+                editable["preferences"]["compensation"] = {"min_salary": int(minimum_salary or 0)}
             editable["sources"]["greenhouse"]["enabled"] = gh_enabled
             editable["sources"]["greenhouse"]["companies"] = _lines_to_list(gh_companies)
             editable["sources"]["lever"]["enabled"] = lv_enabled
@@ -2799,6 +2900,7 @@ def _render_profile_dashboard(slug: str) -> None:
             st.rerun()
         else:
             _launch_worker(slug)
+            st.session_state["_scroll_to_progress"] = True
             st.rerun()
     if sidebar_action == "create_profile":
         _open_create_profile_dialog()
@@ -2806,6 +2908,19 @@ def _render_profile_dashboard(slug: str) -> None:
         st.session_state.active_profile = None
         set_active_profile(None)
         st.rerun()
+
+    if st.session_state.pop("_scroll_to_progress", False):
+        components.v1.html(
+            """<script>
+            (function() {
+                var main = window.parent.document.querySelector('section[data-testid="stMain"]')
+                        || window.parent.document.querySelector('.main')
+                        || window.parent.document.body;
+                main.scrollTo({top: 0, behavior: 'smooth'});
+            })();
+            </script>""",
+            height=0,
+        )
 
     progress_host = st.empty()
     if worker_running:
@@ -2816,8 +2931,6 @@ def _render_profile_dashboard(slug: str) -> None:
         else:
             with progress_host.container():
                 st.info("Worker is starting up, please wait...")
-        time.sleep(2)
-        st.rerun()
 
     last_error = st.session_state.get("last_pipeline_error")
     if last_error and last_error.get("profile") == slug:
@@ -2856,6 +2969,10 @@ def _render_profile_dashboard(slug: str) -> None:
         if st.button("Back to overview", key=f"section_error_back_{slug}"):
             st.session_state.dashboard_section = "Overview"
             st.rerun()
+
+    if worker_running:
+        time.sleep(2)
+        st.rerun()
 
 
 def _render_profile_selection() -> None:

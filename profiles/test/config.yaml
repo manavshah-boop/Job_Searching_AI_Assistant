@@ -103,14 +103,8 @@ sources:
     companies:
     - stripe
     - linear
-    - vercel
-    - notion
-    - retool
-    - figma
-    - rippling
-    - brex
-    - ramp
-    - scale
+  hn:
+    enabled: false
 scoring:
   min_display_score: 60
   weights:

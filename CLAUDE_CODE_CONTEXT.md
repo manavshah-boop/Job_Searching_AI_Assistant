@@ -269,7 +269,10 @@ Three Pydantic v2 models:
 **StructuredProfile** — LLM output for profile extraction
 - Fields: `name`, `yoe`, `current_title`, `core_skills`, `languages`,
   `frameworks`, `cloud`, `past_roles`, `education`, `strengths`,
-  `target_roles`, `min_salary`, `remote_preference`, `preferred_locations`
+  `target_roles`, `target_salary`, `remote_preference`, `preferred_locations`
+- `target_salary` is compensation-shape-neutral:
+  annual salary for full-time profiles, monthly stipend for paid-only internship
+  profiles, and `null` when an intern is open to unpaid roles
 - Validators: deduplicates all list fields, parses salary from string ($130,000),
   clamps yoe to >= 0
 
@@ -358,7 +361,7 @@ preferences:
     max_yoe: 5
     max_job_age_days: 30
     require_degree_filter: true
-    title_blocklist: [Staff, Principal, VP, Director, Head of, Manager, Lead]
+    title_blocklist: [Senior, Staff, Principal, VP, Director, Head of, Manager, Lead]
     countries_allowed: [United States, US, USA, Remote]
 
 sources:
@@ -381,6 +384,33 @@ scoring:
     growth:       0.10
     compensation: 0.05
 ```
+
+Internship profiles use this compensation shape instead:
+
+```yaml
+profile:
+  job_type: internship
+  target_season: "Summer 2027"
+  school: "..."
+  major: "..."
+  graduation_year: "2028"
+
+preferences:
+  compensation:
+    intern_pay_preference: paid_only | unpaid_ok | no_preference
+    monthly_stipend: 4500   # optional, only when paid_only
+  filters:
+    max_yoe: 1
+    max_job_age_days: 14
+    title_blocklist: [Senior, Staff, Principal, VP, Director, Head of, Manager, Lead, Executive, Full-time only]
+```
+
+Scoring behavior:
+- Full-time compensation scores against `compensation.min_salary`
+- Internship compensation scores against whether pay/stipend is mentioned
+- `intern_pay_preference=paid_only` penalizes unpaid internship postings
+- `unpaid_ok` and `no_preference` treat pay as a soft positive only
+- Internship prompts should not treat "pursuing a degree" as a master's/PhD disqualifier
 
 ---
 

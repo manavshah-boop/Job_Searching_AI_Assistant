@@ -108,8 +108,18 @@ _DEFAULT_FT_HARD_NO = [
 
 _DEFAULT_INTERN_HARD_NO = [
     "security clearance required", "full-time only", "10+ years",
-    "senior", "staff",
+    "senior", "staff", "principal", "director", "manager", "lead", "executive",
 ]
+
+_INTERN_PAY_PREFERENCE_OPTIONS = {
+    "Paid only": "paid_only",
+    "Unpaid OK": "unpaid_ok",
+    "No preference": "no_preference",
+}
+
+_INTERN_PAY_PREFERENCE_LABELS = {
+    value: label for label, value in _INTERN_PAY_PREFERENCE_OPTIONS.items()
+}
 
 _LOCATION_OPTIONS = [
     "Remote", "San Francisco, CA", "New York, NY", "Seattle, WA",
@@ -142,6 +152,25 @@ def _runtime_estimate(rpm: int, rpd: int | None, n_jobs: int = 1000) -> str:
         return f"~{rpd:,} jobs/day max on free tier ({rpd / rpm:.0f} min/day)"
     minutes = n_jobs / rpm
     return f"~{minutes:.0f} min to score {n_jobs:,} jobs"
+
+
+def _normalize_intern_pay_preference(data: Dict[str, Any]) -> str:
+    preference = str(data.get("intern_pay_preference", "")).strip().lower()
+    if preference in _INTERN_PAY_PREFERENCE_LABELS:
+        return preference
+    if data.get("stipend_expectation"):
+        return "paid_only"
+    return "no_preference"
+
+
+def _format_intern_compensation_summary(data: Dict[str, Any]) -> str:
+    preference = _normalize_intern_pay_preference(data)
+    preference_label = _INTERN_PAY_PREFERENCE_LABELS[preference]
+    stipend = data.get("stipend_expectation")
+    stipend_value = int(stipend) if stipend not in (None, "", 0) else 0
+    if preference == "paid_only" and stipend_value:
+        return f"{preference_label} (target ${stipend_value:,}/mo)"
+    return preference_label
 
 
 def _lines_to_list(text: str) -> list:
@@ -206,18 +235,19 @@ def generate_config(data: Dict[str, Any]) -> dict:
 
     # Preferences
     title_blocklist = [
-        "Staff", "Principal", "VP", "Director",
+        "Senior", "Staff", "Principal", "VP", "Director",
         "Head of", "Manager", "Lead", "Executive",
     ]
+    default_hard_no = _DEFAULT_INTERN_HARD_NO if is_intern else _DEFAULT_FT_HARD_NO
     if is_intern:
         title_blocklist.append("Full-time only")
     else:
         title_blocklist.append("Intern")
 
     preferences: Dict[str, Any] = {
-        "titles":          data.get("titles", []),
-        "desired_skills":  data.get("desired_skills", []),
-        "hard_no_keywords": data.get("hard_no_keywords", []),
+        "titles":          data.get("titles", _DEFAULT_INTERN_TITLES if is_intern else _DEFAULT_FT_TITLES),
+        "desired_skills":  data.get("desired_skills", _DEFAULT_SKILLS),
+        "hard_no_keywords": data.get("hard_no_keywords", default_hard_no),
         "location": {
             "remote_ok":           data.get("remote_ok", True),
             "preferred_locations": data.get("preferred_locations", []),
@@ -226,16 +256,20 @@ def generate_config(data: Dict[str, Any]) -> dict:
             "countries_allowed":    ["United States", "US", "USA", "Remote"],
             "min_yoe":              0,
             "max_yoe":              1 if is_intern else 5,
+            "max_job_age_days":     14 if is_intern else 30,
             "require_degree_filter": True,
             "title_blocklist":      title_blocklist,
         },
     }
 
     if is_intern:
-        preferences["filters"]["max_job_age_days"] = 14
+        pay_preference = _normalize_intern_pay_preference(data)
         preferences["compensation"] = {
-            "monthly_stipend": data.get("stipend_expectation") or 0
+            "intern_pay_preference": pay_preference,
         }
+        stipend = data.get("stipend_expectation")
+        if pay_preference == "paid_only" and stipend not in (None, "", 0):
+            preferences["compensation"]["monthly_stipend"] = int(stipend)
     else:
         preferences["yoe"] = data.get("yoe", 0)
         preferences["compensation"] = {"min_salary": data.get("min_salary", 100_000)}
@@ -904,7 +938,23 @@ def _step_preferences() -> None:
                 with col2:
                     min_salary = st.number_input("Minimum salary", min_value=0, step=5_000, value=int(data.get("min_salary", 130_000)))
             else:
-                stipend = st.number_input("Target monthly stipend", min_value=0, step=500, value=int(data.get("stipend_expectation", 0)), help="Optional. Used as a soft scoring signal.")
+                pay_pref_default = _INTERN_PAY_PREFERENCE_LABELS[_normalize_intern_pay_preference(data)]
+                pay_preference_label = st.radio(
+                    "Compensation preference",
+                    list(_INTERN_PAY_PREFERENCE_OPTIONS.keys()),
+                    index=list(_INTERN_PAY_PREFERENCE_OPTIONS.keys()).index(pay_pref_default),
+                    horizontal=True,
+                )
+                intern_pay_preference = _INTERN_PAY_PREFERENCE_OPTIONS[pay_preference_label]
+                stipend = 0
+                if intern_pay_preference == "paid_only":
+                    stipend = st.number_input(
+                        "Target monthly stipend",
+                        min_value=0,
+                        step=500,
+                        value=int(data.get("stipend_expectation", 0)),
+                        help="Optional. Leave at 0 if you only care that the role is paid.",
+                    )
 
     clicked = _setup_step_navigation(2, "setup_step3_next", "Continue to AI provider", meta="Settings here can always be refined after setup.")
     if clicked == "back":
@@ -923,7 +973,12 @@ def _step_preferences() -> None:
             data["yoe"] = int(yoe)
             data["min_salary"] = int(min_salary)
         else:
-            data["stipend_expectation"] = int(stipend)
+            data["intern_pay_preference"] = intern_pay_preference
+            data.pop("min_salary", None)
+            if intern_pay_preference == "paid_only" and int(stipend) > 0:
+                data["stipend_expectation"] = int(stipend)
+            else:
+                data.pop("stipend_expectation", None)
         st.session_state.onboarding_step = 4
         st.rerun()
 
@@ -1011,7 +1066,10 @@ def _step_review_create() -> None:
             with right:
                 st.markdown(f"**Remote OK:** {'Yes' if data.get('remote_ok') else 'No'}")
                 st.markdown(f"**Locations:** {', '.join(data.get('preferred_locations', [])) or 'None set'}")
-                st.markdown(f"**Compensation:** {'$' + format(data.get('min_salary', 0), ',') if not is_intern else ('$' + format(data.get('stipend_expectation', 0), ',') + '/mo' if data.get('stipend_expectation') else 'Not set')}")
+                if is_intern:
+                    st.markdown(f"**Compensation:** {_format_intern_compensation_summary(data)}")
+                else:
+                    st.markdown(f"**Compensation:** {'$' + format(data.get('min_salary', 0), ',') if data.get('min_salary') else 'Not set'}")
                 if is_intern:
                     st.markdown(f"**Season:** {data.get('target_season', '')} {data.get('target_year', '')}".strip())
 

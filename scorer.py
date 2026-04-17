@@ -360,7 +360,7 @@ def score_dimensions(
     If instructor_client is provided, uses instructor for reliable structured output.
     Otherwise falls back to raw LLM call with JSON parsing.
     """
-    prefs   = config["preferences"]
+    prefs   = config.get("preferences", {})
     weights = config["scoring"]["weights"]
     max_yoe = prefs.get("filters", {}).get("max_yoe", 5)
 
@@ -380,6 +380,26 @@ def score_dimensions(
 
     job_type = config.get("profile", {}).get("job_type", "fulltime")
     is_intern = job_type == "internship"
+    compensation = prefs.get("compensation", {})
+    intern_pay_preference = str(compensation.get("intern_pay_preference", "")).strip().lower()
+    if is_intern and intern_pay_preference not in {"paid_only", "unpaid_ok", "no_preference"}:
+        intern_pay_preference = "paid_only" if compensation.get("monthly_stipend") else "no_preference"
+
+    def _format_intern_compensation_line(target_value: Any) -> str:
+        stipend = None
+        if target_value not in (None, "", 0):
+            try:
+                stipend = int(target_value)
+            except (TypeError, ValueError):
+                stipend = None
+
+        if intern_pay_preference == "paid_only":
+            if stipend is not None:
+                return f"Compensation Preference: Paid only (target stipend: ${stipend:,}/mo)"
+            return "Compensation Preference: Paid only"
+        if intern_pay_preference == "unpaid_ok":
+            return "Compensation: Unpaid OK"
+        return "Compensation: Open to paid or unpaid"
 
     if structured_profile:
         sp = structured_profile
@@ -397,9 +417,23 @@ Cloud/Infra: {", ".join(sp.get("cloud", []))}
 Past Roles: {", ".join(sp.get("past_roles", []))}
 Education: {sp.get("education", "")}
 Target Roles: {", ".join(sp.get("target_roles", prefs.get("titles", [])))}
-Min Salary: ${sp.get("min_salary", prefs.get("compensation", {}).get("min_salary", 0)):,}
 Location: {remote_str}
 Preferred Cities: {", ".join(sp.get("preferred_locations", []))}"""
+        if is_intern:
+            profile_section += f"""
+{_format_intern_compensation_line(sp.get("target_salary", compensation.get("monthly_stipend")))}"""
+        else:
+            target_salary = sp.get("target_salary", compensation.get("min_salary"))
+            if target_salary not in (None, "", 0):
+                try:
+                    profile_section += f"""
+Min Salary: ${int(target_salary):,}"""
+                except (TypeError, ValueError):
+                    profile_section += """
+Min Salary: Not set"""
+            else:
+                profile_section += """
+Min Salary: Not set"""
     else:
         profile = config["profile"]
         profile_section = f"""Name: {profile.get('name', '')}
@@ -410,8 +444,22 @@ Resume:
 Target roles: {', '.join(prefs.get('titles', []))}
 Desired skills: {', '.join(prefs.get('desired_skills', []))}
 Years of experience: {prefs.get('yoe', 0)}
-Location preferences: remote_ok={prefs.get('location', {}).get('remote_ok', True)}, preferred={prefs.get('location', {}).get('preferred_locations', [])}
-Minimum salary: ${prefs.get('compensation', {}).get('min_salary', 0):,}"""
+Location preferences: remote_ok={prefs.get('location', {}).get('remote_ok', True)}, preferred={prefs.get('location', {}).get('preferred_locations', [])}"""
+        if is_intern:
+            profile_section += f"""
+{_format_intern_compensation_line(compensation.get('monthly_stipend'))}"""
+        else:
+            min_salary = compensation.get("min_salary")
+            if min_salary not in (None, "", 0):
+                try:
+                    profile_section += f"""
+Minimum salary: ${int(min_salary):,}"""
+                except (TypeError, ValueError):
+                    profile_section += """
+Minimum salary: Not set"""
+            else:
+                profile_section += """
+Minimum salary: Not set"""
 
     # Append internship context when candidate is a student
     if is_intern:
@@ -429,8 +477,15 @@ They are NOT a full-time hire — score accordingly."""
     # Dimension instructions differ for interns vs full-time candidates
     if is_intern:
         seniority_desc    = "Does this posting explicitly target students, new grads, or interns? Score 10 if yes, 0 if the role is clearly for experienced hires only."
-        compensation_desc = "Is a stipend, hourly rate, or intern-level pay mentioned? Score higher if compensation is explicitly offered."
+        compensation_desc = (
+            "Does the posting clearly mention pay, a stipend, or an hourly rate? "
+            "Score compensation according to the candidate's pay preference instead of assuming a minimum salary."
+        )
         disqualifier_intern_rule = ""  # interns WANT internship postings — don't disqualify them
+        if intern_pay_preference == "paid_only":
+            compensation_desc += " Penalize unpaid postings or postings that strongly imply unpaid work."
+        else:
+            compensation_desc += " Do not penalize unpaid postings or postings with no pay details when the candidate is open to that."
     else:
         seniority_desc    = "How well does the seniority level match the candidate's experience?"
         compensation_desc = "How likely is the compensation to meet or exceed the candidate's minimum salary?"
@@ -451,6 +506,10 @@ Set "disqualified" to true and fill "disqualify_reason" if ANY of the following 
 - Explicitly requires on-site relocation with no remote option
 - Requires a master's degree or PhD as a hard requirement (not just preferred)
 - Requires more than {max_yoe} years of experience as a hard minimum{disqualifier_intern_rule}
+
+Important interpretation notes:
+- Do NOT treat "currently pursuing", "working toward", or "enrolled in" a bachelor's/master's degree as an advanced-degree disqualifier for internship candidates.
+- Do NOT disqualify internship postings just because they mention students, graduation dates, or being in school.
 
 If disqualified, set all dimension scores to 0 and skip Step 2.
 
