@@ -253,6 +253,102 @@ def test_extract_from_chained_cause():
 
 
 # ---------------------------------------------------------------------------
+# Tests: StructuredProfile-shaped payload (Bug 1)
+# ---------------------------------------------------------------------------
+
+
+_STRUCTURED_PROFILE_FAILED_GENERATION = json.dumps([
+    {
+        "name": "StructuredProfile",
+        # No "parameters" key — fields are inlined directly in the list item.
+        # This is the shape that triggered "recovered 0 fields" in production.
+        "yoe": 2,
+        "current_title": "Software Engineer",
+        "core_skills": ["Python", "AWS"],
+        "languages": ["Python"],
+        "frameworks": ["FastAPI"],
+        "cloud": ["AWS"],
+        "past_roles": ["Backend Engineer"],
+        "education": "BS Computer Science",
+        "strengths": ["API design"],
+        "target_roles": ["ML Engineer"],
+        "target_salary": 120000,
+        "remote_preference": "True",
+        "preferred_locations": [],
+    }
+])
+
+_GROQ_400_BODY_PROFILE = {
+    "error": {
+        "message": "tool call validation failed: parameters for tool StructuredProfile did not match schema",
+        "type": "invalid_request_error",
+        "code": "tool_use_failed",
+        "failed_generation": _STRUCTURED_PROFILE_FAILED_GENERATION,
+    }
+}
+
+
+def test_extract_structured_profile_inlined_fields():
+    """
+    StructuredProfile failed_generation where fields are inlined in list[0] with
+    no 'parameters' key. Recovery must fall back to treating list[0] as the param
+    dict and return the correct field count (not 0).
+    """
+    exc = FakeGroqBadRequestError(_GROQ_400_BODY_PROFILE)
+    dims = extract_from_failed_generation(exc, label="profile")
+
+    assert dims is not None, "Expected dims, got None"
+    assert len(dims) > 0, f"Expected >0 fields, got {len(dims)}"
+    assert dims.get("yoe") == 2, f"yoe={dims.get('yoe')}"
+    assert dims.get("current_title") == "Software Engineer", f"current_title={dims.get('current_title')}"
+    assert dims.get("core_skills") == ["Python", "AWS"], f"core_skills={dims.get('core_skills')}"
+    assert dims.get("target_salary") == 120000, f"target_salary={dims.get('target_salary')}"
+    print(f"PASS  extract_from_failed_generation: StructuredProfile inlined fields ({len(dims)} fields)")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Python dict repr fallback via ast.literal_eval on body path (Bug 2)
+# ---------------------------------------------------------------------------
+
+
+# Single-quoted Python repr — json.loads rejects this, ast.literal_eval handles it.
+_PYTHON_REPR_FAILED_GENERATION = (
+    "[{'name': 'ScoreResult', 'parameters': {"
+    "'role_fit': 9, 'stack_match': 8, 'seniority': 7, "
+    "'compensation': 6, 'growth': 8, 'location': 9, "
+    "'disqualified': False, 'disqualify_reason': '', "
+    "'one_liner': 'Good fit', 'reasons': ['relevant'], 'flags': []"
+    "}}]"
+)
+
+_GROQ_400_BODY_REPR = {
+    "error": {
+        "message": "tool call validation failed",
+        "type": "invalid_request_error",
+        "code": "tool_use_failed",
+        "failed_generation": _PYTHON_REPR_FAILED_GENERATION,
+    }
+}
+
+
+def test_extract_python_repr_via_ast_on_body_path():
+    """
+    failed_generation string in .body is a Python dict repr (single-quoted keys),
+    not valid JSON. Recovery must fall back to ast.literal_eval and return fields.
+    This mirrors 'scorer | JSON parse of failed_generation failed: Expecting property
+    name enclosed in double quotes' from production logs.
+    """
+    exc = FakeGroqBadRequestError(_GROQ_400_BODY_REPR)
+    dims = extract_from_failed_generation(exc, label="scorer")
+
+    assert dims is not None, "Expected dims from ast.literal_eval body fallback, got None"
+    assert dims.get("role_fit") == 9, f"role_fit={dims.get('role_fit')}"
+    assert dims.get("stack_match") == 8, f"stack_match={dims.get('stack_match')}"
+    assert dims.get("disqualified") is False, f"disqualified={dims.get('disqualified')}"
+    print("PASS  extract_from_failed_generation: Python dict repr via ast.literal_eval on body path")
+
+
+# ---------------------------------------------------------------------------
 # Tests: graceful None return on unrecoverable input
 # ---------------------------------------------------------------------------
 
@@ -299,6 +395,10 @@ def main():
         test_extract_from_string_repr_via_ast,
         test_extract_from_instructor_retry_exception_via_chain,
         test_extract_from_chained_cause,
+        # Bug 1: StructuredProfile inlined fields
+        test_extract_structured_profile_inlined_fields,
+        # Bug 2: Python dict repr fallback
+        test_extract_python_repr_via_ast_on_body_path,
         test_extract_returns_none_on_unrelated_error,
         test_extract_returns_none_on_missing_failed_generation,
     ]

@@ -182,31 +182,53 @@ def extract_from_failed_generation(exc: Exception, label: str = "recovery") -> O
         )
         return None
 
+    # Bug 2: Groq sometimes returns a Python dict repr (single-quoted) instead of
+    # valid JSON when the generation was truncated or malformed. Try ast.literal_eval
+    # as a fallback before giving up.
     try:
         failed_gen = json.loads(fg_str)
-        # Format from Groq: [{"name": "ModelName", "parameters": {...}}]
-        if isinstance(failed_gen, list) and failed_gen:
-            params = failed_gen[0].get("parameters", {})
-        elif isinstance(failed_gen, dict):
-            params = failed_gen.get("parameters", failed_gen)
-        else:
+    except Exception as json_err:
+        try:
+            failed_gen = _ast.literal_eval(fg_str)
+            logger.info(f"{label} | JSON parse failed; ast.literal_eval recovered the payload")
+        except Exception:
             logger.info(
-                f"{label} | failed_generation parsed but structure unexpected "
+                f"{label} | JSON parse of failed_generation failed: {json_err} "
                 "— will use raw LLM fallback"
             )
             return None
 
-        result = unwrap_value_objects(params)
+    # Format from Groq: [{"name": "ModelName", "parameters": {...}}]
+    # Bug 1: StructuredProfile tool calls may not wrap fields under "parameters" —
+    # the key may be absent entirely. If params is empty, fall back to treating
+    # the parsed item itself as the param dict so the fields are not silently dropped.
+    if isinstance(failed_gen, list) and failed_gen:
+        params = failed_gen[0].get("parameters", {})
+        if not params:
+            logger.info(
+                f"{label} | list[0]['parameters'] empty "
+                f"(shape keys: {list(failed_gen[0].keys())}) "
+                "— trying list[0] as param dict"
+            )
+            params = {k: v for k, v in failed_gen[0].items() if k != "name"}
+    elif isinstance(failed_gen, dict):
+        params = failed_gen.get("parameters", failed_gen)
+    else:
         logger.info(
-            f"{label} | SUCCESS — recovered {len(result)} fields from failed_generation"
-        )
-        return result
-    except Exception as parse_err:
-        logger.info(
-            f"{label} | JSON parse of failed_generation failed: {parse_err} "
+            f"{label} | failed_generation parsed but structure unexpected "
             "— will use raw LLM fallback"
         )
         return None
+
+    result = unwrap_value_objects(params)
+    logger.info(
+        f"{label} | SUCCESS — recovered {len(result)} fields from failed_generation "
+        f"(shape: {type(failed_gen).__name__})"
+    )
+    if not result:
+        logger.info(f"{label} | recovered 0 fields — treating as failed recovery")
+        return None
+    return result
 
 
 # ---------------------------------------------------------------------------
