@@ -21,6 +21,9 @@ import html
 import json
 import os
 import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -52,10 +55,8 @@ from dashboard_ui import (
 )
 from logging_config import configure_logging
 from onboarding import render_onboarding, sanitize_slug
-from progress_tracker import ActivityType, ProgressTracker, Stage
-from scraper import scrape_greenhouse, scrape_hn, scrape_lever
-from scorer import RateLimitReached, score_all_jobs
-from theirstack import get_or_discover_slugs
+from progress_tracker import ProgressTracker
+from scorer import score_all_jobs
 from ui_shell import (
     badge,
     callout,
@@ -123,7 +124,6 @@ def _init_state() -> None:
         "dashboard_notice": None,
         "celebrate_profile_create": False,
         "dashboard_section": "Overview",
-        "pipeline_request_slug": None,
         "last_status_change": None,
         "last_pipeline_result": None,
         "last_pipeline_error": None,
@@ -135,6 +135,46 @@ def _init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+_WORKER_LOCKFILE  = ".worker_running"
+_WORKER_PROGRESS  = ".run_progress.json"
+_WORKER_STALE_SEC = 3 * 3600  # match worker/run_pipeline.py
+
+
+def _worker_lockfile(slug: str) -> Path:
+    return PROFILES_DIR / slug / _WORKER_LOCKFILE
+
+
+def _worker_progress_path(slug: str) -> Path:
+    return PROFILES_DIR / slug / _WORKER_PROGRESS
+
+
+def _worker_is_running(slug: str) -> bool:
+    lf = _worker_lockfile(slug)
+    if not lf.exists():
+        return False
+    return (time.time() - lf.stat().st_mtime) < _WORKER_STALE_SEC
+
+
+def _launch_worker(slug: str) -> None:
+    worker_script = BASE_DIR / "worker" / "run_pipeline.py"
+    subprocess.Popen(
+        [sys.executable, str(worker_script), "--profile", slug],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _read_progress_json(slug: str) -> dict[str, Any] | None:
+    path = _worker_progress_path(slug)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def _profile_config_path(slug: str) -> Path:
@@ -524,6 +564,8 @@ def _render_sidebar_nav(
     profile_name: str,
     config: dict[str, Any],
     metrics: dict[str, Any],
+    *,
+    worker_running: bool = False,
 ) -> str | None:
     available_profiles = list_profiles()
     secondary_actions = [
@@ -556,12 +598,14 @@ def _render_sidebar_nav(
         _render_html_block("<div class='shell-sidebar-divider shell-sidebar-divider--section' aria-hidden='true'></div>")
         _render_html_block("<div class='shell-sidebar-actions'>")
         _render_html_block("<div class='shell-inline-section-label shell-inline-section-label--sidebar'>Actions</div>")
+        run_label = "Running..." if worker_running else "Start discovery"
         primary_action = toolbar(
             primary_actions=[
                 {
                     "id": "run_search",
-                    "label": "Start discovery",
+                    "label": run_label,
                     "key": f"run_search_sidebar_{slug}",
+                    "disabled": worker_running,
                 }
             ],
             class_name="shell-toolbar shell-toolbar--sidebar-primary shell-toolbar--compact",
@@ -800,202 +844,6 @@ def _render_pipeline_snapshot(
                     st.code(diagnostics, language="text")
 
 
-def _run_pipeline(
-    config: dict[str, Any],
-    slug: str,
-    status_box: Any | None = None,
-    progress_host: Any | None = None,
-) -> dict[str, Any]:
-    enabled = _enabled_sources(config)
-    if not any(enabled.values()):
-        raise ValueError("No sources are enabled for this profile.")
-
-    config["_active_profile"] = slug
-    tracker = ProgressTracker()
-    run_id = start_run(profile=slug, source="dashboard")
-    slug_map = {"greenhouse": [], "lever": []}
-    total_new = 0
-    total_scraped = 0
-    total_filtered = 0
-    total_saved = 0
-    scored_results: list[dict[str, Any]] = []
-    tracker.start_stage(Stage.DISCOVERING)
-
-    if enabled["greenhouse"]:
-        tracker.register_source("Greenhouse", len(config.get("sources", {}).get("greenhouse", {}).get("companies", [])))
-    if enabled["lever"]:
-        tracker.register_source("Lever", len(config.get("sources", {}).get("lever", {}).get("companies", [])))
-    if enabled["hackernews"]:
-        tracker.register_source("HN Who's Hiring", 1)
-
-    def log(message: str) -> None:
-        tracker.add_activity_log(message)
-        _render_pipeline_snapshot(tracker, progress_host)
-        if status_box is not None:
-            status_box.write(message)
-        else:
-            st.write(message)
-
-    try:
-        if enabled["greenhouse"] or enabled["lever"]:
-            log("Resolving company lists and cached ATS slugs...")
-            slug_map = get_or_discover_slugs(config, profile=slug)
-            tracker.set_stage_metrics(
-                Stage.DISCOVERING,
-                greenhouse=len(slug_map.get("greenhouse", [])),
-                lever=len(slug_map.get("lever", [])),
-            )
-        tracker.complete_stage(Stage.DISCOVERING)
-        tracker.start_stage(Stage.FETCHING)
-
-        if enabled["greenhouse"]:
-            tracker.start_source("Greenhouse")
-            result = scrape_greenhouse(config, slugs=slug_map["greenhouse"], profile=slug)
-            total_new += result.get("new_jobs_saved", 0)
-            total_scraped += result.get("jobs_scraped", 0)
-            total_filtered += result.get("jobs_filtered", 0)
-            total_saved += result.get("new_jobs_saved", 0)
-            tracker.complete_source("Greenhouse", jobs_found=result.get("new_jobs_saved", 0))
-            tracker.set_stage_metrics(Stage.FETCHING, greenhouse_new=result.get("new_jobs_saved", 0))
-            log(f"Greenhouse saved {result.get('new_jobs_saved', 0)} new jobs.")
-
-        if enabled["lever"]:
-            tracker.start_source("Lever")
-            result = scrape_lever(config, slugs=slug_map["lever"], profile=slug)
-            total_new += result.get("new_jobs_saved", 0)
-            total_scraped += result.get("jobs_scraped", 0)
-            total_filtered += result.get("jobs_filtered", 0)
-            total_saved += result.get("new_jobs_saved", 0)
-            tracker.complete_source("Lever", jobs_found=result.get("new_jobs_saved", 0))
-            tracker.set_stage_metrics(Stage.FETCHING, lever_new=result.get("new_jobs_saved", 0))
-            log(f"Lever saved {result.get('new_jobs_saved', 0)} new jobs.")
-
-        if enabled["hackernews"]:
-            tracker.start_source("HN Who's Hiring")
-            result = scrape_hn(config, profile=slug)
-            total_new += result.get("new_jobs_saved", 0)
-            total_scraped += result.get("jobs_scraped", 0)
-            total_filtered += result.get("jobs_filtered", 0)
-            total_saved += result.get("new_jobs_saved", 0)
-            tracker.complete_source("HN Who's Hiring", jobs_found=result.get("new_jobs_saved", 0))
-            tracker.set_stage_metrics(Stage.FETCHING, hn_new=result.get("new_jobs_saved", 0))
-            log(f"HN Who's Hiring saved {result.get('new_jobs_saved', 0)} new jobs.")
-
-        tracker.complete_stage(Stage.FETCHING)
-        tracker.start_stage(Stage.SCRAPING)
-        tracker.complete_stage(Stage.SCRAPING)
-        tracker.start_stage(Stage.SCORING)
-        log("Scoring newly discovered jobs...")
-        scored_results = score_all_jobs(config, yes=True, profile=slug)
-        scored_ok = [result for result in scored_results if result.get("fit_score", 0) > 0]
-        avg_fit = round(
-            sum(result["fit_score"] for result in scored_ok) / len(scored_ok),
-            1,
-        ) if scored_ok else 0.0
-        tracker.complete_stage(Stage.SCORING)
-        tracker.start_stage(Stage.FINALIZING)
-        tracker.set_stage_metrics(Stage.SCORING, scored=len(scored_ok))
-
-        finish_run(
-            run_id,
-            jobs_scraped=total_scraped,
-            jobs_filtered=total_filtered,
-            jobs_saved=total_saved,
-            jobs_scored=len(scored_ok),
-            avg_fit_score=avg_fit,
-            errors=[],
-            status="complete",
-            profile=slug,
-        )
-
-        summary = {
-            "total_new": total_new,
-            "jobs_scraped": total_scraped,
-            "jobs_filtered": total_filtered,
-            "jobs_saved": total_saved,
-            "scored_count": len(scored_ok),
-            "avg_fit": avg_fit,
-        }
-        tracker.total_jobs_new = total_new
-        tracker.complete_stage(Stage.FINALIZING)
-        tracker.log_activity(
-            f"Pipeline complete: {summary['total_new']} new jobs and {summary['scored_count']} scored.",
-            ActivityType.METRIC_UPDATE,
-        )
-        _render_pipeline_snapshot(tracker, progress_host, summary=summary)
-        if status_box is not None:
-            status_box.update(
-                label=(
-                    f"Pipeline complete: {summary['total_new']} new jobs, "
-                    f"{summary['scored_count']} scored"
-                ),
-                state="complete",
-                expanded=False,
-            )
-        return summary
-
-    except RateLimitReached as exc:
-        logger.warning("Pipeline rate-limited for profile '{}': {}", slug, exc)
-        tracker.fail_stage(Stage.SCORING, str(exc))
-        tracker.add_warning(str(exc))
-        finish_run(
-            run_id,
-            jobs_scraped=total_scraped,
-            jobs_filtered=total_filtered,
-            jobs_saved=total_saved,
-            jobs_scored=0,
-            avg_fit_score=None,
-            errors=[str(exc)],
-            status="failed",
-            profile=slug,
-        )
-        diagnostics = (
-            f"profile={slug}\n"
-            f"jobs_scraped={total_scraped}\n"
-            f"jobs_filtered={total_filtered}\n"
-            f"jobs_saved={total_saved}\n"
-            f"error={exc}"
-        )
-        _render_pipeline_snapshot(
-            tracker,
-            progress_host,
-            error_message="The run stopped because the configured provider rate limit was reached.",
-            diagnostics=diagnostics,
-        )
-        if status_box is not None:
-            status_box.update(label="Pipeline stopped by rate limits", state="error", expanded=True)
-        raise
-
-    except Exception as exc:
-        logger.exception("Pipeline failed for profile '{}'", slug)
-        tracker.add_error(str(exc))
-        finish_run(
-            run_id,
-            jobs_scraped=total_scraped,
-            jobs_filtered=total_filtered,
-            jobs_saved=total_saved,
-            jobs_scored=0,
-            avg_fit_score=None,
-            errors=[str(exc)],
-            status="failed",
-            profile=slug,
-        )
-        diagnostics = (
-            f"profile={slug}\n"
-            f"jobs_scraped={total_scraped}\n"
-            f"jobs_filtered={total_filtered}\n"
-            f"jobs_saved={total_saved}\n"
-            f"error={exc}"
-        )
-        _render_pipeline_snapshot(
-            tracker,
-            progress_host,
-            error_message="The pipeline hit an unexpected error before completion.",
-            diagnostics=diagnostics,
-        )
-        if status_box is not None:
-            status_box.update(label="Pipeline failed", state="error", expanded=True)
-        raise
 
 
 def _clear_profile_jobs(slug: str) -> None:
@@ -1161,7 +1009,8 @@ def _render_summary_list(items: list[tuple[str, Any]]) -> None:
 
 
 def _queue_pipeline_run(slug: str) -> None:
-    st.session_state.pipeline_request_slug = slug
+    if not _worker_is_running(slug):
+        _launch_worker(slug)
     st.rerun()
 
 
@@ -2873,11 +2722,28 @@ def _render_profile_dashboard(slug: str) -> None:
     runs = _cached_recent_runs(slug)
     profile_name = config.get("profile", {}).get("name", slug.replace("_", " ").title())
 
-    _render_notice(slug)
-    sidebar_action = _render_sidebar_nav(slug, profile_name, config, metrics)
-    if sidebar_action == "run_search":
-        st.session_state.pipeline_request_slug = slug
+    worker_running = _worker_is_running(slug)
+    # Detect transition: worker just finished → invalidate caches once.
+    was_running_key = f"worker_was_running_{slug}"
+    was_running = st.session_state.get(was_running_key, False)
+    if was_running and not worker_running:
+        st.session_state[was_running_key] = False
+        invalidate_dashboard_caches()
+        _set_notice(slug, "success", "Pipeline complete. Results updated.")
         st.rerun()
+    if worker_running:
+        st.session_state[was_running_key] = True
+
+    _render_notice(slug)
+    sidebar_action = _render_sidebar_nav(slug, profile_name, config, metrics, worker_running=worker_running)
+    if sidebar_action == "run_search" and not worker_running:
+        missing = _check_api_key(config)
+        if missing:
+            _set_notice(slug, "error", f"Scoring requires {missing} in your environment.")
+            st.rerun()
+        else:
+            _launch_worker(slug)
+            st.rerun()
     if sidebar_action == "create_profile":
         _open_create_profile_dialog()
     if sidebar_action == "switch_profile":
@@ -2886,39 +2752,16 @@ def _render_profile_dashboard(slug: str) -> None:
         st.rerun()
 
     progress_host = st.empty()
-    if st.session_state.get("pipeline_request_slug") == slug:
-        missing = _check_api_key(config)
-        if missing:
-            st.session_state.pipeline_request_slug = None
-            st.session_state.last_pipeline_error = {
-                "profile": slug,
-                "message": f"Scoring requires {missing} in your environment.",
-                "diagnostics": missing,
-            }
-            st.rerun()
-        try:
-            result = _run_pipeline(config, slug, progress_host=progress_host)
-            st.session_state.pipeline_request_slug = None
-            st.session_state.last_pipeline_result = {"profile": slug, **result}
-            st.session_state.last_pipeline_error = None
-            _set_notice(
-                slug,
-                "success",
-                (
-                    f"Pipeline complete: {result['total_new']} new jobs, "
-                    f"{result['scored_count']} scored, avg fit {result['avg_fit']}/100."
-                ),
-            )
-            invalidate_dashboard_caches()
-            st.rerun()
-        except Exception as exc:
-            st.session_state.pipeline_request_slug = None
-            st.session_state.last_pipeline_error = {
-                "profile": slug,
-                "message": str(exc),
-                "diagnostics": str(exc),
-            }
-            st.rerun()
+    if worker_running:
+        progress_data = _read_progress_json(slug)
+        if progress_data:
+            tracker = ProgressTracker.from_dict(progress_data)
+            _render_pipeline_snapshot(tracker, progress_host)
+        else:
+            with progress_host.container():
+                st.info("Worker is starting up, please wait...")
+        time.sleep(2)
+        st.rerun()
 
     last_error = st.session_state.get("last_pipeline_error")
     if last_error and last_error.get("profile") == slug:

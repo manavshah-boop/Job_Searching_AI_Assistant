@@ -9,21 +9,13 @@ Supports both raw LLM with JSON parsing and instructor-based structured output.
 """
 
 import json
-import re
-import time
 from typing import Any, Callable, Optional, Tuple
 
 from loguru import logger
 
+from llm_utils import parse_llm_response, safe_structured_call
+
 LlmCall = Callable[[str, int], Tuple[str, int]]
-
-
-def parse_llm_json(raw: str) -> dict:
-    """Parse JSON from an LLM response, stripping markdown fences if present."""
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-    return json.loads(raw)
 
 
 def build_structured_profile(
@@ -86,39 +78,21 @@ Rules:
 
     profile_dict = None
 
-    # Try instructor-based structured output if available
+    # Structured output via instructor (preferred path)
     if instructor_client and model:
-        try:
-            for attempt in range(3):
-                try:
-                    result = instructor_client.messages.create(
-                        model=model,
-                        max_tokens=600,
-                        temperature=temperature or 0,
-                        messages=[{"role": "user", "content": prompt}],
-                        response_model=StructuredProfile,
-                    )
-                    # Convert StructuredProfile model to dict
-                    profile_dict = result.model_dump()
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        wait = 2 ** attempt * 10
-                        logger.warning(f"Profile extraction failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
-                        time.sleep(wait)
-                    else:
-                        raise
-        except Exception as e:
-            logger.info(f"Instructor profile extraction failed: {e}. Falling back to raw LLM.")
-            profile_dict = None
+        profile_dict = safe_structured_call(
+            instructor_client, model, prompt, StructuredProfile,
+            max_tokens=600,
+            temperature=temperature or 0,
+            label="profile",
+        )
 
-    # Fallback to raw LLM call with JSON parsing if instructor unavailable
+    # Fallback: raw LLM call + JSON parsing (also handles {"value": x} wrapping)
     if profile_dict is None:
         try:
             raw, _ = llm_call(prompt, 600)
-            profile_dict = parse_llm_json(raw)
+            profile_dict = parse_llm_response(raw)
         except Exception:
-            # Fallback - build a minimal profile directly from config.
             profile_dict = None
 
     # If we still don't have a profile, build a minimal one from config

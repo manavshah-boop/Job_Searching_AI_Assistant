@@ -38,6 +38,7 @@ from db import (
     write_score_error,
 )
 from candidate_profile import build_structured_profile, confirm_profile, print_profile_summary
+from llm_utils import parse_llm_response, safe_structured_call
 from models import ScoreResult, StructuredProfile
 
 class RateLimitReached(Exception):
@@ -326,60 +327,6 @@ def keyword_prescore(job: Job, config: Dict[str, Any]) -> float:
 
 # ── 2. Merged disqualifier + dimension scoring (single LLM call) ──────────────
 
-def _unwrap_value_objects(data: Any) -> Any:
-    """
-    Recursively unwrap {"value": x} single-key dicts produced by some models.
-    e.g. llama-4-scout wraps every field in {"value": ...} when using tool calling.
-    Leaves all other structures untouched.
-    """
-    if isinstance(data, dict):
-        if list(data.keys()) == ["value"]:
-            return _unwrap_value_objects(data["value"])
-        return {k: _unwrap_value_objects(v) for k, v in data.items()}
-    if isinstance(data, list):
-        return [_unwrap_value_objects(item) for item in data]
-    return data
-
-
-def _extract_dims_from_failed_generation(exc: Exception) -> Optional[dict]:
-    """
-    Some providers (Groq) include a 'failed_generation' field in 400 errors
-    when tool call parameter validation fails. The generation contains the
-    model's actual output — valid data wrapped in {"value": ...} objects.
-
-    Recover that data to avoid making an extra API call.
-    Returns a dims dict on success, None on any failure.
-    """
-    try:
-        body = getattr(exc, "body", None)
-        if isinstance(body, dict):
-            failed_gen_str = body.get("error", {}).get("failed_generation")
-        else:
-            # Parse from string repr as a last resort
-            msg = str(exc)
-            m = re.search(r"'failed_generation':\s*'(.*?)'(?=\s*[,}])", msg, re.DOTALL)
-            failed_gen_str = m.group(1).replace("\\'", "'") if m else None
-
-        if not failed_gen_str:
-            return None
-
-        failed_gen = json.loads(failed_gen_str)
-        # Format: [{"name": "ScoreResult", "parameters": {...}}]
-        if isinstance(failed_gen, list) and failed_gen:
-            params = failed_gen[0].get("parameters", {})
-        elif isinstance(failed_gen, dict):
-            params = failed_gen.get("parameters", failed_gen)
-        else:
-            return None
-
-        dims = _unwrap_value_objects(params)
-        logger.info("Recovered scoring data from failed_generation — saved an API call.")
-        return dims
-    except Exception as inner:
-        logger.debug(f"Could not extract failed_generation: {inner}")
-        return None
-
-
 def _llm_call_with_retry(llm_call: LlmCall, prompt: str, max_tokens: int, retries: int = 3) -> Tuple[str, int]:
     """Calls llm_call with exponential backoff on 429 rate-limit errors."""
     for attempt in range(retries):
@@ -543,64 +490,25 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
     tokens_used = 0
     dims = None
 
-    # Use instructor-based structured output if available
+    # Structured output via instructor (preferred path)
     if instructor_client:
-        last_exc = None
-        for attempt in range(3):
-            try:
-                result = instructor_client.messages.create(
-                    model=config["llm"]["model"][config["llm"]["provider"]],
-                    max_tokens=700,
-                    temperature=config["llm"].get("temperature", 0),
-                    messages=[{"role": "user", "content": prompt}],
-                    response_model=ScoreResult,
-                )
-                dims = result.model_dump()
-                tokens_used = getattr(result, "_full_output", {}).get("usage", {}).get("total_tokens", 500) if hasattr(result, "_full_output") else 500
-                break
-            except Exception as e:
-                last_exc = e
-                msg = str(e)
-                is_schema_err = (
-                    "400" in msg
-                    or "tool_use_failed" in msg
-                    or "tool call validation" in msg.lower()
-                    or "parameters for tool" in msg.lower()
-                )
-                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate_limit" in msg.lower()
+        provider  = config["llm"]["provider"]
+        model_name = config["llm"]["model"][provider]
+        logger.info(f"scorer | structured output via {provider}/{model_name}")
+        dims = safe_structured_call(
+            instructor_client, model_name, prompt, ScoreResult,
+            max_tokens=700,
+            temperature=config["llm"].get("temperature", 0),
+            label="scorer",
+        )
+        if dims is not None:
+            tokens_used = 500  # instructor doesn't expose real token counts
 
-                if is_schema_err:
-                    # Model returned malformed tool call — sleeping won't fix a schema mismatch.
-                    # Try to salvage the data from the failed_generation payload first.
-                    logger.warning(
-                        f"Model returned malformed tool call parameters (attempt {attempt + 1}). "
-                        "Attempting recovery from failed_generation before falling back to JSON mode."
-                    )
-                    dims = _extract_dims_from_failed_generation(e)
-                    break  # No point retrying — go straight to JSON fallback if recovery failed
-
-                if is_rate_limit and attempt < 2:
-                    wait = 2 ** attempt * 10
-                    logger.warning(f"Rate limited. Retrying in {wait}s... (attempt {attempt + 1}/3)")
-                    time.sleep(wait)
-                elif attempt < 2:
-                    wait = 2 ** attempt * 10
-                    logger.warning(f"Structured LLM call failed. Retrying in {wait}s... (attempt {attempt + 1}/3)")
-                    time.sleep(wait)
-                # else: retries exhausted, dims stays None
-
-        if dims is None and last_exc is not None:
-            logger.warning(f"Instructor call failed, falling back to raw JSON: {last_exc}")
-
-    # Fallback to raw LLM call with JSON parsing if instructor unavailable or failed
+    # Fallback: raw LLM call + JSON parsing (also handles {"value": x} wrapping)
     if dims is None:
         try:
             raw, tokens_used = _llm_call_with_retry(llm_call, prompt, 700)
-            raw = raw.strip()
-            raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-            raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE)
-            dims = json.loads(raw)
-            dims = _unwrap_value_objects(dims)  # handle {"value": x} wrapping from any model
+            dims = parse_llm_response(raw)
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse failed: {e}")
             return zeroed
@@ -747,7 +655,7 @@ def _cost_estimate(provider: str, n_jobs: int) -> str:
     return "~$0.00 (free tier)"
 
 
-def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[str] = None) -> list:
+def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[str] = None, on_job_scored=None) -> list:
     """
     Scores all eligible unscored jobs. Prompts for confirmation unless yes=True.
     Returns results sorted by fit score descending.
@@ -861,6 +769,11 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
             )
 
             results.append(result)
+            if on_job_scored is not None:
+                try:
+                    on_job_scored(i, len(jobs), result)
+                except Exception:
+                    pass
             liner = result["one_liner"][:60] if result["one_liner"] else "(skipped)"
             logger.debug(f"    fit={result['fit_score']}  ats={result['ats_score']}  {liner}")
 

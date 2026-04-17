@@ -69,6 +69,26 @@ class StageProgress:
         self.status = StageStatus.FAILED
         self.completed_at = time.time()
 
+    def to_dict(self) -> dict:
+        return {
+            "stage": self.stage.value,
+            "status": self.status.value,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "metrics": self.metrics,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StageProgress":
+        stage = next(s for s in Stage if s.value == data["stage"])
+        return cls(
+            stage=stage,
+            status=StageStatus(data["status"]),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            metrics=data.get("metrics", {}),
+        )
+
 
 @dataclass
 class Activity:
@@ -82,6 +102,23 @@ class Activity:
         """Return human-readable time."""
         dt = datetime.fromtimestamp(self.timestamp)
         return dt.strftime("%H:%M:%S")
+
+    def to_dict(self) -> dict:
+        return {
+            "type": self.type.value,
+            "timestamp": self.timestamp,
+            "message": self.message,
+            "details": self.details,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Activity":
+        return cls(
+            type=ActivityType(data["type"]),
+            timestamp=data["timestamp"],
+            message=data["message"],
+            details=data.get("details", {}),
+        )
 
 
 @dataclass
@@ -130,6 +167,30 @@ class SourceProgress:
         """Mark source as complete."""
         self.status = StageStatus.COMPLETE
         self.completed_at = time.time()
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "status": self.status.value,
+            "companies_total": self.companies_total,
+            "companies_processed": self.companies_processed,
+            "jobs_found": self.jobs_found,
+            "jobs_new": self.jobs_new,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SourceProgress":
+        obj = cls(name=data["name"])
+        obj.status = StageStatus(data["status"])
+        obj.companies_total = data.get("companies_total", 0)
+        obj.companies_processed = data.get("companies_processed", 0)
+        obj.jobs_found = data.get("jobs_found", 0)
+        obj.jobs_new = data.get("jobs_new", 0)
+        obj.started_at = data.get("started_at")
+        obj.completed_at = data.get("completed_at")
+        return obj
 
 
 class ProgressTracker:
@@ -312,3 +373,30 @@ class ProgressTracker:
             return "❌"
         else:
             return "⏹️"
+
+    def to_dict(self) -> dict:
+        return {
+            "stages": {stage.value: prog.to_dict() for stage, prog in self.stages.items()},
+            "sources": {name: src.to_dict() for name, src in self.sources.items()},
+            "activities": [a.to_dict() for a in self.activities],
+            "start_time": self.start_time,
+            "total_jobs_processed": self.total_jobs_processed,
+            "total_jobs_new": self.total_jobs_new,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ProgressTracker":
+        tracker = cls()
+        stages_data = data.get("stages", {})
+        for stage in Stage:
+            if stage.value in stages_data:
+                tracker.stages[stage] = StageProgress.from_dict(stages_data[stage.value])
+        tracker.sources = {
+            name: SourceProgress.from_dict(src)
+            for name, src in data.get("sources", {}).items()
+        }
+        tracker.activities = [Activity.from_dict(a) for a in data.get("activities", [])]
+        tracker.start_time = data.get("start_time", time.time())
+        tracker.total_jobs_processed = data.get("total_jobs_processed", 0)
+        tracker.total_jobs_new = data.get("total_jobs_new", 0)
+        return tracker
