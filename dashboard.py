@@ -653,6 +653,18 @@ def _deserialize_job_record(row: sqlite3.Row) -> dict[str, Any]:
         "growth": record.get("growth"),
         "compensation": record.get("compensation"),
     }
+    # Canonical disqualified signal from DB column; fall back to flags for
+    # jobs scored before the disqualified column existed.
+    disq_from_db = bool(record.get("disqualified", 0))
+    disq_reason = record.get("disqualify_reason", "") or ""
+    if not disq_from_db and not disq_reason:
+        for flag in record["flags"]:
+            if str(flag).startswith("disqualified:"):
+                disq_from_db = True
+                disq_reason = str(flag).replace("disqualified:", "", 1).strip()
+                break
+    record["disqualified"] = disq_from_db
+    record["disqualify_reason"] = disq_reason
     return record
 
 
@@ -686,7 +698,9 @@ def _fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
                 s.location AS score_location,
                 s.growth,
                 s.compensation,
-                s.scored_at
+                s.scored_at,
+                s.disqualified,
+                s.disqualify_reason
             FROM jobs j
             LEFT JOIN scores s ON j.id = s.job_id
             ORDER BY COALESCE(s.fit_score, -1) DESC, j.created_at DESC
@@ -728,7 +742,9 @@ def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
                 s.location AS score_location,
                 s.growth,
                 s.compensation,
-                s.scored_at
+                s.scored_at,
+                s.disqualified,
+                s.disqualify_reason
             FROM jobs j
             LEFT JOIN scores s ON j.id = s.job_id
             WHERE j.id = ?
@@ -761,7 +777,7 @@ def _search_job_ids_by_raw_text(slug: str, query: str) -> set[str]:
 
 
 def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]:
-    counts = count_jobs(profile=slug)
+    # `records` is already filtered to non-disqualified jobs by the caller.
     source_counts: dict[str, int] = {}
     scored = 0
     pending = 0
@@ -786,11 +802,17 @@ def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]
         else:
             retries += 1
 
-    fit_scores = [record["fit_score"] for record in records if record["fit_score"] is not None]
+    # avg_fit excludes 0-score disqualified jobs automatically since records
+    # is pre-filtered; we also exclude pending (None) scores.
+    fit_scores = [
+        record["fit_score"]
+        for record in records
+        if record["fit_score"] is not None and record["fit_score"] > 0
+    ]
     avg_fit = round(sum(fit_scores) / len(fit_scores), 1) if fit_scores else 0.0
 
     return {
-        "total": counts["total"],
+        "total": len(records),
         "scored": scored,
         "pending": pending,
         "failed": failed,
@@ -799,6 +821,10 @@ def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]
         "skipped": skipped,
         "avg_fit": avg_fit,
         "source_counts": source_counts,
+        # Callers inject disqualified_count, disqualified_by_reason, db_total.
+        "disqualified_count": 0,
+        "disqualified_by_reason": {},
+        "db_total": len(records),
     }
 
 
@@ -2385,6 +2411,22 @@ def _render_activity_tab(
         with right:
             _render_review_status_card(slug, metrics, raw_config)
 
+        disq_count = metrics.get("disqualified_count", 0)
+        if disq_count > 0:
+            disq_label = f"Filtered out ({disq_count} job{'s' if disq_count != 1 else ''} hidden by scoring rules)"
+            with st.expander(disq_label, expanded=False):
+                st.caption(
+                    "These jobs were disqualified by hard-no rules during scoring (e.g. "
+                    "intern-only, location mismatch, YOE mismatch, or title blocklist). "
+                    "They are stored in the database but excluded from the review queue and metrics."
+                )
+                by_reason = metrics.get("disqualified_by_reason", {})
+                if by_reason:
+                    rows = sorted(by_reason.items(), key=lambda kv: -kv[1])
+                    _render_summary_list([(reason, f"{count}×") for reason, count in rows])
+                else:
+                    st.write("No breakdown available.")
+
         with st.expander("Advanced details", expanded=False):
             gh_slugs = load_discovered_slugs(ats="greenhouse", profile=slug)
             lv_slugs = load_discovered_slugs(ats="lever", profile=slug)
@@ -2682,14 +2724,14 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                         except Exception as exc:
                             callout("error", "Re-score failed", str(exc))
                 st.checkbox(
-                    f"I understand this will rescore {metrics['total']} jobs and replace existing scores.",
+                    f"I understand this will rescore {metrics.get('db_total', metrics['total'])} jobs and replace existing scores.",
                     key=f"confirm_rescore_{slug}",
                 )
 
         with st.expander("Danger zone", expanded=False):
             callout("error", "Destructive action", "This removes the current profile database and run history. It cannot be undone from the UI.")
             confirm_clear = st.checkbox(
-                f"I understand this will permanently erase {metrics['total']} jobs and all run history for this profile.",
+                f"I understand this will permanently erase {metrics.get('db_total', metrics['total'])} jobs and all run history for this profile.",
                 key=f"confirm_clear_{slug}",
             )
             if st.button("Clear profile database", key=f"clear_all_{slug}", disabled=not confirm_clear):
@@ -2717,8 +2759,22 @@ def _render_profile_dashboard(slug: str) -> None:
             st.rerun()
         return
 
-    records = _cached_fetch_job_summaries(slug)
+    all_records = _cached_fetch_job_summaries(slug)
+    # Disqualified jobs stay in the DB but are hidden from the user-facing UI.
+    # Genuine scoring failures (score_error set, no score row) still surface.
+    records = [r for r in all_records if not r.get("disqualified")]
+    disq_records = [r for r in all_records if r.get("disqualified")]
     metrics = _collect_metrics(slug, records)
+    # Inject disqualified summary for the Activity tab without touching the
+    # rest of the metrics dict consumers.
+    by_reason: dict[str, int] = {}
+    for r in disq_records:
+        reason = r.get("disqualify_reason") or "unknown"
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    metrics["disqualified_count"] = len(disq_records)
+    metrics["disqualified_by_reason"] = by_reason
+    # Keep DB-accurate total so settings warnings ("erase N jobs") are correct.
+    metrics["db_total"] = metrics["total"] + len(disq_records)
     runs = _cached_recent_runs(slug)
     profile_name = config.get("profile", {}).get("name", slug.replace("_", " ").title())
 

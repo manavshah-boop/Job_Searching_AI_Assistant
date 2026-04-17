@@ -83,6 +83,16 @@ def _migrate_db(db_path: Path) -> None:
         except sqlite3.OperationalError:
             pass  # column already exists
 
+    for col, col_type in [
+        ("disqualified",      "INTEGER DEFAULT 0"),
+        ("disqualify_reason", "TEXT DEFAULT ''"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE scores ADD COLUMN {col} {col_type}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scores (
             job_id       TEXT PRIMARY KEY REFERENCES jobs(id),
@@ -181,11 +191,13 @@ def save_score(
     loc_score: int,
     growth: int,
     compensation: int,
-    reasons: str,       # JSON array string
-    flags: str,         # JSON array string
-    skill_misses: str,  # JSON array string
+    reasons: str,           # JSON array string
+    flags: str,             # JSON array string
+    skill_misses: str,      # JSON array string
     one_liner: str,
     ats_score: int,
+    disqualified: int = 0,
+    disqualify_reason: str = "",
     profile: Optional[str] = None,
 ) -> None:
     """Writes scoring results to the scores table (INSERT OR REPLACE)."""
@@ -193,10 +205,12 @@ def save_score(
     conn.execute("""
         INSERT OR REPLACE INTO scores
             (job_id, fit_score, role_fit, stack_match, seniority, location,
-             growth, compensation, reasons, flags, skill_misses, one_liner, ats_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             growth, compensation, reasons, flags, skill_misses, one_liner, ats_score,
+             disqualified, disqualify_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (job_id, fit_score, role_fit, stack_match, seniority, loc_score,
-          growth, compensation, reasons, flags, skill_misses, one_liner, ats_score))
+          growth, compensation, reasons, flags, skill_misses, one_liner, ats_score,
+          disqualified, disqualify_reason))
     conn.commit()
     conn.close()
 

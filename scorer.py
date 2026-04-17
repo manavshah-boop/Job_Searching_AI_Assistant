@@ -765,6 +765,8 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
                 skill_misses=json.dumps(result["skill_misses"]),
                 one_liner=result["one_liner"],
                 ats_score=result["ats_score"],
+                disqualified=1 if result.get("disqualified") else 0,
+                disqualify_reason=result.get("disqualify_reason", "") or "",
                 profile=profile,
             )
 

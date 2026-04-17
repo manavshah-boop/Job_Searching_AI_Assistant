@@ -4,64 +4,33 @@
 
 A personal AI job search agent. Scrapes Greenhouse, Lever, and HN Who's Hiring,
 scores every job against a user profile using an LLM, and surfaces the best
-matches. Two users (Manav + sister), fully isolated profiles, deployed to Railway.
+matches. Two users (Manav + sister), fully isolated profiles, deployed to GCP.
 
 ## Core philosophy
 
 - Get signal fast — scraper + AI filter is the highest-value piece
 - Incremental — each step is independently runnable
-- Simple infra — SQLite now, Postgres before Railway deploy
+- Simple infra — SQLite, profile-isolated DBs
 - No overengineering — if it works for two people, it's done
-- Learning — technologies chosen partly for career relevance (embeddings,
-  LangGraph, MLflow directly applicable to agentic AI engineering roles)
 
 ---
 
-## Current status — what's actually in the repo
-
-### PHASE 1 — Prototype
+## Current status
 
 | Step | Status | Description |
 |---|---|---|
-| 1 | ✅ | Skeleton, config.yaml, db.py |
-| 2 | ✅ | Greenhouse scraper |
-| 3 | ✅ | HN Who's Hiring scraper |
-| 4 | ✅ | LLM scorer — multi-dimension, ATS score, multi-provider, RateLimiter |
-| 4.5 | ✅ | TheirStack company discovery + Lever scraper |
-| 5 | ✅ | main.py orchestrator with full CLI flags |
-| 6 | ✅ | Profile system + Streamlit onboarding (onboarding.py) |
-| 7 | ✅ | Streamlit dashboard — 4 tabs, sidebar pipeline runner (dashboard.py) |
-| 8 | ✅ | Pydantic models (models.py) + instructor integration in scorer.py |
-
-### PHASE 2 — Harden + Deploy
-
-| Step | Status | Description |
-|---|---|---|
-| 9 | ⬜ | Loguru + pipeline run logging — scrape_runs table, structured logs |
-| 10 | ⬜ | SQLite → PostgreSQL — multi-user write safety |
-| 11 | ⬜ | Deploy to Railway |
-
-### PHASE 3 — Smarter Agent
-
-| Step | Status | Description |
-|---|---|---|
-| 12 | ⬜ | Embeddings + ChromaDB — semantic job matching |
-| 13 | ⬜ | MLflow experiment tracking |
-| 14 | ⬜ | Feedback loop — thumbs up/down → labeled dataset |
-| 15 | ⬜ | APScheduler — automatic runs |
-
-### PHASE 4 — Agentic
-
-| Step | Status | Description |
-|---|---|---|
-| 16 | ⬜ | LangGraph — stateful decision graph |
-| 17 | ⬜ | pgvector + FAISS |
-| 18 | ⬜ | Fine-tuned classifier on feedback data |
-| 19 | ⬜ | Celery + Redis |
+| 1-5 | ✅ | Skeleton, scrapers, LLM scorer, TheirStack, main.py |
+| 6 | ✅ | Profile system + Streamlit onboarding |
+| 7 | ✅ | Streamlit dashboard with sidebar, 5-section nav |
+| 8 | ✅ | Pydantic models + instructor structured output |
+| 9 | ✅ | Loguru + scrape_runs table + per-profile logging |
+| 10 | ✅ | llm_utils.py recovery layer (llama-4-scout {"value":x} wrapping fix) |
+| 11 | ✅ | Out-of-process dashboard pipeline (subprocess + lockfile + progress JSON) |
+| 12 | ✅ | Filter disqualified jobs from UI; "Filtered out" summary in Activity tab |
 
 ---
 
-## Actual file structure (as of latest commit)
+## Actual file structure
 
 ```
 job-agent/
@@ -71,30 +40,222 @@ job-agent/
 ├── scraper.py               # Greenhouse + Lever + HN scrapers
 ├── scorer.py                # LLM pipeline, RateLimiter, instructor integration
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
+├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
 ├── theirstack.py            # company discovery, slug resolution GH + Lever
 ├── models.py                # Pydantic: ScoreResult, StructuredProfile, ScoringWeights
-├── main.py                  # CLI orchestrator
+├── progress_tracker.py      # ProgressTracker + dataclasses with to_dict/from_dict
+├── main.py                  # CLI orchestrator (unchanged CLI interface)
 ├── onboarding.py            # Streamlit 5-step profile creation flow
-├── dashboard.py             # Streamlit web UI entry point
-├── test_step8.py            # Pydantic model tests
-├── pytest.ini
-├── requirements.txt
-├── .env
-├── .env.example
-├── .gitignore
-├── .claude/settings.local.json
+├── dashboard.py             # Streamlit web UI — polling-only, no inline pipeline
+├── dashboard_ui.py          # render_progress_header, render_pipeline_stages, etc.
+├── logging_config.py        # configure_logging(profile, debug)
+├── ui_shell.py              # toolbar(), panel(), callout(), badge(), etc.
+├── ui_theme.py              # PAGE_TITLE, apply_page_scaffold()
+├── test_scorer_recovery.py  # 10 unit tests for llm_utils recovery layer
+├── worker/
+│   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
 ├── profiles/
-│   └── default/
-│       └── config.yaml      # default profile with company lists
-└── jobs.db                  # root DB (CLI use only)
+│   └── {slug}/
+│       ├── config.yaml
+│       ├── {slug}.db
+│       ├── .worker_running      # lockfile: PID + started_at JSON, deleted on finish
+│       ├── .run_progress.json   # live tracker state, written atomically during run
+│       └── .last_run            # final status JSON written on finish
+└── logs/
+    └── {slug}/agent.log
 ```
+
+---
+
+## llm_utils.py — the resilience layer (read before touching LLM calls)
+
+**MODULE CONTRACT: Any code that makes structured-output LLM calls MUST go
+through `safe_structured_call()`. Do NOT call instructor directly.**
+
+### Why this exists
+
+Some models (e.g. llama-4-scout-17b via Groq) wrap every tool-call parameter
+in `{"value": x}` objects instead of returning raw scalars. Groq's API
+validates the tool schema before instructor sees the response and rejects it
+with a 400 "tool_use_failed". Without llm_utils:
+
+- instructor's tenacity loop retries 2-3 times, sleeping ~10 s each → 30 s dead time per job
+- the `failed_generation` payload (which has all the correct data, just wrapped)
+  is silently discarded, forcing an extra API call
+
+### Public API
+
+```python
+unwrap_value_objects(data: Any) -> Any
+    # Recursively unwrap {"value": x} single-key dicts. No-op for other shapes.
+
+parse_llm_response(raw: str) -> dict
+    # Strip markdown fences, JSON parse, then unwrap_value_objects.
+    # Use this in all raw-LLM fallback paths.
+
+is_schema_error(exc) -> bool
+    # True if 400 / tool_use_failed / "parameters for tool" in message.
+
+is_rate_limit_error(exc) -> bool
+    # True if 429 / RESOURCE_EXHAUSTED / rate_limit in message.
+
+extract_from_failed_generation(exc, label="recovery") -> Optional[dict]
+    # Extract the model's actual output from a Groq 400 response.
+    # Walks the full exception chain via .body, ast.literal_eval, __cause__,
+    # __context__, and .last_attempt (InstructorRetryException).
+    # Returns unwrapped param dict on success, None on failure.
+
+safe_structured_call(client, model, prompt, response_model, *, max_tokens=700,
+                     temperature=0, label="llm", max_retries=3) -> Optional[dict]
+    # The only approved way to call instructor. Sets max_retries=0 per call
+    # to prevent instructor's internal tenacity delays. Short-circuits on schema
+    # errors (deterministic — retrying won't help). Runs pydantic validation on
+    # recovered data. Returns model_dump() dict or None (caller uses raw LLM).
+```
+
+### Exception chain walking strategy
+
+`extract_from_failed_generation` does breadth-first search across:
+1. `exc.body` dict (raw `groq.BadRequestError`)
+2. `ast.literal_eval` on `"Error code: 400 - {'error':..."` in str(exc)
+3. `exc.last_attempt.result()` — raises inner exc (InstructorRetryException path)
+4. `exc.__cause__` and `exc.__context__`
+
+All extraction results are logged at INFO level (visible in journalctl).
+
+---
+
+## Out-of-process pipeline architecture
+
+### Why
+
+The Streamlit process blocks during a pipeline run. If the user closes the
+browser tab or Streamlit restarts, the run dies. The fix: detach the run into
+a subprocess and have the dashboard poll a progress file.
+
+### How it works
+
+**Launching:**
+- User clicks "Start discovery" in dashboard → `_queue_pipeline_run(slug)` →
+  `_launch_worker(slug)` → `subprocess.Popen([sys.executable, "worker/run_pipeline.py",
+  "--profile", slug], start_new_session=True, stdout/stderr=DEVNULL)`
+- `start_new_session=True` detaches from the Streamlit process group
+
+**Lockfile:** `profiles/{slug}/.worker_running` — JSON with `{pid, started_at}`.
+- Written at worker start, deleted in `finally` block (success or failure)
+- Stale threshold: 3 hours (same in worker and dashboard)
+- Dashboard reads `_worker_is_running(slug)` before every render
+
+**Progress JSON:** `profiles/{slug}/.run_progress.json`
+- Written atomically (tmp + `os.replace`) by the worker after every stage
+  transition and every 5 scored jobs
+- Format: `ProgressTracker.to_dict()` — stages dict keyed by stage value,
+  sources dict, activities list, start_time float, job counters
+- Dashboard reads and reconstructs via `ProgressTracker.from_dict(data)`,
+  passes result to `_render_pipeline_snapshot(tracker, host)`
+
+**Polling:**
+- Dashboard checks `_worker_is_running(slug)` on every render
+- If running: read `.run_progress.json`, reconstruct tracker, render progress,
+  `time.sleep(2)`, `st.rerun()`
+- Button shows "Running..." and is `disabled=True` during run
+- Worker finish detection: session state `worker_was_running_{slug}` transitions
+  True → False → `invalidate_dashboard_caches()` + success notice + rerun
+
+**Status file:** `profiles/{slug}/.last_run` — JSON with
+`{started_at, finished_at, status, jobs_scored, error_message}`. Written at
+the very end (or on error) and is separate from the progress JSON.
+
+**Systemd timer:** Uses the same `worker/run_pipeline.py` entry point and CLI
+interface. Progress JSON writes are transparent — exit codes unchanged.
+
+### ProgressTracker serialization
+
+All dataclasses and ProgressTracker itself have `to_dict()` / `from_dict()`:
+
+```python
+tracker.to_dict()     # -> JSON-serializable dict
+ProgressTracker.from_dict(data)  # reconstructs from dict
+```
+
+Stage values (enum) are stored by `.value` string (e.g. "🔍 Discovering companies").
+
+---
+
+## Filter-skipped jobs (disqualified)
+
+### What are they
+
+Jobs that the LLM decides to disqualify during scoring — e.g. "intern-only",
+"location mismatch", "YOE too high", "title blocklist" — get `disqualified=True`
+and `fit_score=0` from `score_job()`. They are stored in the DB (score row
+written) but must not pollute the review queue.
+
+### Canonical signal
+
+`scores.disqualified INTEGER DEFAULT 0` (added via `_migrate_db`).
+`scores.disqualify_reason TEXT DEFAULT ''` — the human-readable reason.
+
+Backwards compat: `_deserialize_job_record()` also checks `flags` for items
+starting with `"disqualified:"` so pre-migration rows are caught too.
+
+### How filtering works
+
+In `_render_profile_dashboard()`:
+```python
+all_records = _cached_fetch_job_summaries(slug)
+records = [r for r in all_records if not r.get("disqualified")]   # visible
+disq_records = [r for r in all_records if r.get("disqualified")]  # hidden
+```
+
+`records` (non-disqualified) flows into all downstream renderers:
+- `_collect_metrics()` — scored/pending/avg_fit computed from visible only
+- `_render_jobs_tab()` — review queue table
+- `_render_overview_tab()` — top matches, scoreboard
+- `_render_top_matches()` — best opportunities panel
+
+`disq_records` summary is injected into `metrics` as:
+- `metrics["disqualified_count"]` — total hidden jobs
+- `metrics["disqualified_by_reason"]` — {reason: count}
+- `metrics["db_total"]` — true DB count including disqualified (used in settings warnings)
+
+### Where disqualified jobs appear
+
+Activity tab → "Filtered out (N jobs hidden by scoring rules)" expander shows
+count grouped by reason. This confirms the filter is working without cluttering
+the main views.
+
+### Genuine scoring failures still visible
+
+Jobs with `score_error` set and no score row (or failed attempts < 3) still
+appear with `score_state = "Needs retry"` or `"Failed"`. The filter only hides
+jobs where `disqualified=1` — it does NOT hide error states.
+
+---
+
+## scorer.py key points
+
+- `score_all_jobs(config, yes=False, profile=None, on_job_scored=None) -> list`
+  — optional `on_job_scored(i, total, result)` callback called after each
+  successful score; used by worker for per-job progress updates
+- `save_score()` now accepts `disqualified=int` and `disqualify_reason=str`
+- `safe_structured_call` from llm_utils is used for structured output; raw
+  `llm_call` + `parse_llm_response` is the fallback
+- `config["_active_profile"]` must be set before any LLM call so DB writes
+  scope to the correct profile
+
+## candidate_profile.py key points
+
+- Uses `safe_structured_call` for structured output (same recovery as scorer)
+- Falls back to `llm_call` + `parse_llm_response` if instructor fails
+- Returns a minimal hard-coded profile dict if both LLM paths fail
 
 ---
 
 ## Key module details
 
-### models.py (Step 8 — complete)
+### models.py
 
 Three Pydantic v2 models:
 
@@ -116,19 +277,6 @@ Three Pydantic v2 models:
 - Fields: all 6 dimension weights as floats
 - Validator: weights must sum to 1.0 ± 0.01
 
-### scorer.py
-
-- `get_llm_client(config) -> LlmCall` — returns `(prompt, max_tokens) -> (str, int)`
-- `get_instructor_client(config)` — returns instructor-wrapped client for structured output
-- `RateLimiter(max_rpm, max_tpm, max_rpd)` — rolling 60s window, hard RPD stop via sys.exit(0)
-- `keyword_prescore(job, config) -> float` — 0.0–1.0, skip LLM if < 0.15
-- `score_dimensions(job, config, llm_call, structured_profile) -> dict` — single LLM call,
-  returns disqualified + all dimension scores + reasons/flags/one_liner.
-  Adjusts prompt for internship vs fulltime based on `config["profile"]["job_type"]`.
-- `compute_ats_score(job, config) -> dict` — pure Python, keyword overlap
-- `score_all_jobs(config, yes=False, profile=None) -> list` — full pipeline
-- `print_results(results, config)` — terminal display
-
 ### db.py
 
 Profile resolution order: explicit `profile=` arg → `_ACTIVE_PROFILE` module var → root jobs.db
@@ -137,10 +285,10 @@ Key functions (all accept `profile=None`):
 - `set_active_profile(profile)` / `get_db_path(profile=None)`
 - `init_db(profile=None)` — creates profile folder if needed, runs migrations
 - `insert_job(job, profile=None) -> bool`
-- `save_score(job_id, ..., profile=None)`
+- `save_score(job_id, ..., disqualified=0, disqualify_reason="", profile=None)`
 - `get_unscored(profile=None) -> list[Job]` — jobs with score IS NULL and score_attempts < 3
 - `get_top_jobs(min_score, profile=None) -> list`
-- `count_jobs(profile=None) -> dict` — {total, scored}
+- `count_jobs(profile=None) -> dict` — {total, scored} (includes disqualified in total)
 - `rescore_reset(profile=None)` — clears scores, resets score_attempts to 0
 - `update_job_status(job_id, status, profile=None)`
 - `save_discovered_slug(slug, company_name, ats, profile=None)`
@@ -148,41 +296,26 @@ Key functions (all accept `profile=None`):
 - `increment_score_attempts(job_id, profile=None)`
 - `write_score_error(job_id, error, profile=None)`
 
-### Job dataclass
-
-```python
-@dataclass
-class Job:
-    id: str           # "{source}_{source_id}"
-    title: str
-    company: str
-    location: str
-    url: str
-    raw_text: str     # cleaned, capped at 2000 chars
-    source: str       # "greenhouse" | "lever" | "hackernews"
-    score_attempts: int = 0
-    score_error: Optional[str] = None
-    status: str = "new"
-```
-
-### Scores table
+### Scores table (with migrations)
 
 ```sql
 CREATE TABLE scores (
-    job_id       TEXT PRIMARY KEY,
-    fit_score    INTEGER,
-    role_fit     INTEGER,
-    stack_match  INTEGER,
-    seniority    INTEGER,
-    location     INTEGER,
-    growth       INTEGER,
-    compensation INTEGER,
-    reasons      TEXT,       -- JSON array, max 4 items
-    flags        TEXT,       -- JSON array
-    skill_misses TEXT,       -- JSON array, top 5 missing skills
-    one_liner    TEXT,
-    ats_score    INTEGER,
-    scored_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    job_id            TEXT PRIMARY KEY,
+    fit_score         INTEGER,
+    role_fit          INTEGER,
+    stack_match       INTEGER,
+    seniority         INTEGER,
+    location          INTEGER,
+    growth            INTEGER,
+    compensation      INTEGER,
+    reasons           TEXT,       -- JSON array, max 4 items
+    flags             TEXT,       -- JSON array
+    skill_misses      TEXT,       -- JSON array, top 5 missing skills
+    one_liner         TEXT,
+    ats_score         INTEGER,
+    disqualified      INTEGER DEFAULT 0,   -- 1 = hidden from review queue
+    disqualify_reason TEXT DEFAULT '',     -- human-readable reason
+    scored_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 ```
 
@@ -193,32 +326,20 @@ profile:
   name: "..."
   job_type: "fulltime" | "internship"
   resume_file: "path/to/resume.pdf"   # OR use resume: inline text
-  resume: |
-    ...
   bio: |
     ...
-  # internship-only:
-  target_season: "Summer 2026"
-  school: "..."
-  major: "..."
-  gpa: "..."
-  graduation_year: 2027
 
 llm:
   provider: "groq"
   model:
     groq: "meta-llama/llama-4-scout-17b-16e-instruct"
-    groq_balanced: "llama-3.3-70b-versatile"
-    groq_testing: "llama-3.1-8b-instant"
     gemini: "gemini-2.5-flash"
-    gemini_lite: "gemini-2.5-flash-lite-preview-06-17"
     anthropic: "claude-sonnet-4-20250514"
     openai: "gpt-4o-mini"
   temperature: 0
   rate_limits:
     groq:      {max_rpm: 28, max_tpm: 28000, max_rpd: 950}
     gemini:    {max_rpm: 9,  max_tpm: 240000, max_rpd: 250}
-    gemini_lite: {max_rpm: 14, max_tpm: 240000, max_rpd: 1000}
     anthropic: {max_rpm: 50, max_tpm: 9000000}
     openai:    {max_rpm: 50, max_tpm: 9000000}
 
@@ -243,12 +364,12 @@ preferences:
 sources:
   greenhouse:
     enabled: true
-    companies: [anthropic, stripe, figma, databricks, ...]
+    companies: [anthropic, stripe, figma, ...]
   lever:
     enabled: true
-    companies: [stripe, linear, vercel, notion, ...]
+    companies: [stripe, linear, vercel, ...]
   hn:
-    enabled: true   # note: key is "hn" not "hackernews" in sources
+    enabled: true   # key is "hn" not "hackernews" in sources
 
 scoring:
   min_display_score: 60
@@ -261,133 +382,37 @@ scoring:
     compensation: 0.05
 ```
 
-### scraper.py
-
-All scrapers accept `profile=None` and call `init_db(profile=profile)` internally.
-
-- `scrape_greenhouse(config, slugs, profile=None) -> dict` — {companies_checked, new_jobs_saved, errors}
-- `scrape_lever(config, slugs, profile=None) -> dict`
-- `scrape_hn(config, profile=None) -> dict` — {thread_found, new_jobs_saved, errors}
-- `passes_filters(text, title, location, config, source, debug=False) -> bool`
-- `strip_html(html_text) -> str` — handles double-encoded entities via html.unescape()
-
-### theirstack.py
-
-- `fetch_companies(config) -> list` — TheirStack API, filtered to US tech 10-5000 employees
-- `resolve_greenhouse_slug(company) -> str | None`
-- `resolve_lever_slug(company) -> str | None`
-- `get_or_discover_slugs(config, profile=None) -> dict[str, list[str]]`
-  Returns {"greenhouse": [...], "lever": [...]}
-
-### onboarding.py
-
-5-step Streamlit flow, all state in `st.session_state.onboarding_data`.
-Entry point: `render_onboarding()` — called by dashboard.py.
-
-Steps: job_type → basic_info → preferences → llm_provider → review_create
-
-Key functions:
-- `generate_config(data) -> dict` — builds complete config.yaml from onboarding data
-- `create_profile(data)` — writes config.yaml, copies PDF, calls init_db(profile=slug),
-  upserts API key into root .env via `_upsert_env_key()`
-- `sanitize_slug(name) -> str` — lowercase, spaces→underscores, strip specials
-
-Intern vs fulltime branching is fully implemented.
-
-### dashboard.py
-
-Entry point: `streamlit run dashboard.py`
-
-Routing: show_onboarding → profile selector → full dashboard
-
-Full dashboard has:
-- Sidebar: avatar, switch profile, DB stats, last run time, "Run job search" button
-- Tab 1 Jobs: filterable table with score badges, status dropdown (persists immediately),
-  eye toggle to expand job detail panel with dimension bar chart + reasons/flags/ATS misses
-- Tab 2 Analytics: score histogram, jobs by source, by status, top companies, ATS vs fit scatter
-- Tab 3 Profile: read-only config view
-- Tab 4 Settings: min score slider, weights sliders (must sum to 1.0), save to config.yaml,
-  re-score button (double confirm), clear all jobs (double confirm), manage companies section
-
-`_run_pipeline(config, slug)` handles the full scrape + score flow inside Streamlit,
-catches `SystemExit` from RPD limiter so Streamlit server doesn't die.
-
-### main.py CLI flags
-
-```
-python main.py                  # full run: scrape → score → display
-python main.py --scrape-only
-python main.py --score-only
-python main.py --show
-python main.py --rescore
-python main.py --yes
-python main.py --min-score 75
-python main.py --profile manav
-```
-
-### requirements.txt (current)
-
-```
-pyyaml>=6.0
-python-dotenv>=1.0.0
-httpx>=0.27.0
-beautifulsoup4>=4.12.0
-PyPDF2>=3.0.0
-groq>=0.9.0
-streamlit>=1.28.0
-pydantic>=2.7.0
-instructor>=1.3.0
-pandas  # used by dashboard.py
-```
-
 ---
 
 ## Environment variables
 
-Per-profile keys are preferred — suffix with the uppercase profile slug (written by onboarding):
+Per-profile keys (written by onboarding):
 ```
-GROQ_API_KEY_MANAV=       # profile: manav, provider: groq
-GROQ_API_KEY_SISTER=      # profile: sister, provider: groq
-ANTHROPIC_API_KEY_MANAV=  # profile: manav, provider: anthropic
-```
-
-Unsuffixed keys are a fallback for single-user / CLI use (no `--profile` flag):
-```
-GROQ_API_KEY=         # active default provider
-ANTHROPIC_API_KEY=    # if provider: anthropic
-GEMINI_API_KEY=       # if provider: gemini
-OPENAI_API_KEY=       # if provider: openai
-THEIRSTACK_API_KEY=   # optional — enables dynamic company discovery
+GROQ_API_KEY_MANAV=
+GROQ_API_KEY_SISTER=
+ANTHROPIC_API_KEY_MANAV=
 ```
 
-Resolution order: `{KEY}_{PROFILE_UPPER}` → `{KEY}` (unsuffixed fallback).
-Onboarding writes the suffixed form. The unsuffixed key is used only when `--profile` is omitted.
+Unsuffixed fallback for CLI / single-user:
+```
+GROQ_API_KEY=
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+OPENAI_API_KEY=
+THEIRSTACK_API_KEY=
+```
+
+Resolution order: `{KEY}_{PROFILE_UPPER}` → `{KEY}` (fallback).
 
 ---
 
 ## Known issues / things to watch
 
-- `config.py` still uses PyPDF2 — should migrate to pdfplumber for better text extraction
-- HN sources key in config is `"hn"` not `"hackernews"` — dashboard checks `sources.get("hn")`
-- `score_all_jobs()` uses `sys.exit(0)` for RPD limit — dashboard catches SystemExit,
-  but main.py does not — should be changed to raise a custom exception instead
-- `config.py` and `db.py` both have `load_config()` — db.py re-exports from config.py;
-  callers should import from `db` for consistency
-
----
-
-## Next: Step 9 — Loguru + Pipeline Run Logging
-
-Replace all `print()` statements with structured loguru logging.
-Add a `scrape_runs` table to track every pipeline execution end-to-end.
-
-Goals:
-1. Every module logs with loguru instead of print — consistent format, log levels, timestamps
-2. `scrape_runs` table records: run_id, profile, started_at, finished_at, source,
-   jobs_scraped, jobs_filtered, jobs_saved, jobs_scored, errors_json, avg_fit_score
-3. Dashboard Tab 2 Analytics gets a "Run history" section showing recent pipeline runs
-4. Log file written to `logs/{profile}/agent.log` with rotation (10MB, 7 days)
-5. `sys.exit(0)` in scorer replaced with a custom `RateLimitReached` exception —
-   caught in main.py and dashboard.py, logged properly instead of crashing
-
-Full spec coming when ready to build.
+- `config.py` still uses PyPDF2 — should migrate to pdfplumber for better extraction
+- HN config key is `"hn"` not `"hackernews"` — dashboard/worker check `sources.get("hn")`
+- `count_jobs(profile)` returns DB total including disqualified — use `metrics["db_total"]`
+  in settings warnings, `metrics["total"]` elsewhere (visible only)
+- `_collect_metrics()` expects pre-filtered records (no disqualified) — the split
+  happens in `_render_profile_dashboard()` before passing records downstream
+- Old disqualified rows (pre-migration) are caught by the flags fallback in
+  `_deserialize_job_record()` — no data migration needed
