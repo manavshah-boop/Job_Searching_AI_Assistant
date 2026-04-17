@@ -316,7 +316,15 @@ def keyword_prescore(job: Job, config: Dict[str, Any]) -> float:
     """
     Pure Python. Fraction of desired_skills present in raw_text.
     Returns 0.0–1.0. Below 0.15 → skip the LLM call entirely.
+
+    Exception: if the job title is an exact (case-insensitive) match to any
+    preferred title in preferences.titles, return 1.0 to guarantee LLM scoring.
+    A user who explicitly listed a title wants every instance of it scored.
     """
+    preferred_titles = [t.lower() for t in config.get("preferences", {}).get("titles", [])]
+    if preferred_titles and job.title.lower() in preferred_titles:
+        return 1.0
+
     text   = job.raw_text.lower()
     skills = config["preferences"]["desired_skills"]
     if not skills:

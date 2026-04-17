@@ -2941,7 +2941,7 @@ def _render_profile_dashboard(slug: str) -> None:
         st.rerun()
 
     if st.session_state.pop("_scroll_to_progress", False):
-        components.v1.html(
+        components.html(
             """<script>
             (function() {
                 var main = window.parent.document.querySelector('section[data-testid="stMain"]')

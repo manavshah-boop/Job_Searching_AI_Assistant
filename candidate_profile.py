@@ -90,8 +90,14 @@ def build_structured_profile(
     from models import StructuredProfile
     
     profile_cfg = config.get("profile", {})
-    resume_text = profile_cfg.get("resume", "")
+    resume_text = profile_cfg.get("resume", "") or ""
     bio = profile_cfg.get("bio", "")
+    if not resume_text.strip():
+        logger.warning(
+            "build_structured_profile: resume text is empty — "
+            "profile will be extracted from bio and preferences only. "
+            "Scoring accuracy will be reduced without a resume."
+        )
     prefs = config.get("preferences", {})
     location = prefs.get("location", {})
     is_intern = profile_cfg.get("job_type") == "internship"
