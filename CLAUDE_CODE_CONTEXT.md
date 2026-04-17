@@ -398,7 +398,7 @@ profile:
 preferences:
   compensation:
     intern_pay_preference: paid_only | unpaid_ok | no_preference
-    monthly_stipend: 4500   # optional, only when paid_only
+    monthly_stipend: 4500   # optional, only when paid_only and the user entered a target
   filters:
     max_yoe: 1
     max_job_age_days: 14

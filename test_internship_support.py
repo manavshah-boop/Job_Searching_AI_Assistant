@@ -70,6 +70,33 @@ def test_generate_config_for_internship_without_paid_requirement_omits_stipend()
     assert "min_salary" not in compensation
 
 
+def test_generate_config_for_paid_only_internship_can_omit_stipend_target():
+    config = generate_config(
+        {
+            "profile_slug": "intern_paid_no_target",
+            "name": "Intern Paid No Target",
+            "job_type": "internship",
+            "bio": "Student seeking paid internships.",
+            "resume_type": "text",
+            "resume_text": "resume body",
+            "titles": ["Software Engineering Intern"],
+            "desired_skills": ["Python"],
+            "hard_no_keywords": ["senior"],
+            "remote_ok": True,
+            "preferred_locations": ["Remote"],
+            "intern_pay_preference": "paid_only",
+            "provider": "groq",
+            "model_key": "groq",
+            "model_id": "test-model",
+        }
+    )
+
+    compensation = config["preferences"]["compensation"]
+
+    assert compensation == {"intern_pay_preference": "paid_only"}
+    assert "monthly_stipend" not in compensation
+
+
 def test_build_structured_profile_for_intern_uses_target_salary_and_prompt_guidance():
     captured = {}
     config = {
@@ -117,6 +144,75 @@ def test_build_structured_profile_for_intern_uses_target_salary_and_prompt_guida
     assert "monthly stipend target only when they want paid internships only" in captured["prompt"]
     assert profile["target_salary"] is None
     assert profile["intern_pay_preference"] == "unpaid_ok"
+
+
+def test_score_dimensions_for_paid_only_internship_without_stipend_target_mentions_paid_only():
+    captured = {}
+    config = {
+        "profile": {
+            "name": "Intern Test",
+            "job_type": "internship",
+            "resume": "resume body",
+            "bio": "Student builder",
+            "target_season": "Summer 2027",
+            "school": "State University",
+            "major": "Computer Science",
+        },
+        "preferences": {
+            "titles": ["Software Engineering Intern"],
+            "desired_skills": ["Python", "AWS"],
+            "location": {"remote_ok": True, "preferred_locations": ["Remote"]},
+            "compensation": {"intern_pay_preference": "paid_only"},
+            "filters": {"max_yoe": 1},
+            "yoe": 0,
+        },
+        "scoring": {
+            "weights": {
+                "role_fit": 0.3,
+                "stack_match": 0.25,
+                "seniority": 0.2,
+                "location": 0.1,
+                "growth": 0.1,
+                "compensation": 0.05,
+            }
+        },
+        "llm": {"provider": "groq", "model": {"groq": "test-model"}, "temperature": 0},
+    }
+    job = Job(
+        id="intern-2",
+        title="Software Engineering Intern",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/intern-2",
+        raw_text="Paid software engineering internship for students.",
+        source="greenhouse",
+    )
+
+    def fake_llm(prompt: str, max_tokens: int):
+        captured["prompt"] = prompt
+        return (
+            json.dumps(
+                {
+                    "disqualified": False,
+                    "disqualify_reason": "",
+                    "role_fit": 9,
+                    "stack_match": 8,
+                    "seniority": 10,
+                    "location": 9,
+                    "growth": 7,
+                    "compensation": 9,
+                    "reasons": ["Intern title match", "Python stack", "Paid internship"],
+                    "flags": [],
+                    "one_liner": "Strong fit for a paid software engineering internship.",
+                }
+            ),
+            100,
+        )
+
+    score_dimensions(job, config, fake_llm)
+
+    assert "Compensation Preference: Paid only" in captured["prompt"]
+    assert "target stipend:" not in captured["prompt"]
 
 
 def test_score_dimensions_for_internship_mentions_paid_preference_and_avoids_min_salary():

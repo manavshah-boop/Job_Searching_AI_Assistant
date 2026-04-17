@@ -425,6 +425,26 @@ def _normalize_intern_pay_preference(compensation: dict[str, Any]) -> str:
     return "no_preference"
 
 
+def _optional_int_input_value(value: Any) -> str:
+    if value in (None, "", 0):
+        return ""
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value).strip()
+
+
+def _parse_optional_int_input(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, int):
+        return value
+    cleaned = str(value).strip().replace("$", "").replace(",", "")
+    if not cleaned:
+        return None
+    return int(cleaned)
+
+
 def _format_compensation_value(job_type: str, compensation: dict[str, Any]) -> str:
     if job_type == "internship":
         preference = _normalize_intern_pay_preference(compensation)
@@ -2706,7 +2726,7 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
             )
             if is_intern:
                 minimum_salary = None
-                monthly_stipend = stipend_value if intern_pay_preference == "paid_only" else 0
+                monthly_stipend = stipend_value if intern_pay_preference == "paid_only" else None
                 compensation_summary = _format_compensation_value(job_type, compensation)
                 compensation_label = "Compensation"
             else:
@@ -2750,9 +2770,14 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                     )
                     intern_pay_preference = {label: value for value, label in preference_labels.items()}[selected_label]
                     if intern_pay_preference == "paid_only":
-                        monthly_stipend = st.number_input("Monthly stipend target", min_value=0, step=500, value=stipend_value, help="Used as a soft scoring preference for internship profiles.")
+                        monthly_stipend = st.text_input(
+                            "Monthly stipend target",
+                            value=_optional_int_input_value(compensation.get("monthly_stipend")),
+                            placeholder="4500",
+                            help="Optional. Leave blank if the internship just needs to be paid.",
+                        )
                     else:
-                        monthly_stipend = 0
+                        monthly_stipend = None
                     minimum_salary = None
                 else:
                     minimum_salary = st.number_input("Minimum salary", min_value=0, step=5000, value=salary_value, help="Used as a soft scoring preference, not a hard filter.")
@@ -2768,6 +2793,12 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
         )
 
         if submitted:
+            if is_intern:
+                try:
+                    parsed_monthly_stipend = _parse_optional_int_input(monthly_stipend) if intern_pay_preference == "paid_only" else None
+                except ValueError:
+                    callout("error", "Settings need one more detail", "Monthly stipend target must be a whole number or left blank.")
+                    return
             editable["scoring"]["min_display_score"] = int(min_display)
             editable["preferences"]["titles"] = _lines_to_list(titles_text)
             editable["preferences"]["desired_skills"] = _lines_to_list(skills_text)
@@ -2778,8 +2809,8 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 editable["preferences"]["compensation"] = {
                     "intern_pay_preference": intern_pay_preference,
                 }
-                if intern_pay_preference == "paid_only" and monthly_stipend not in (None, 0):
-                    editable["preferences"]["compensation"]["monthly_stipend"] = int(monthly_stipend)
+                if intern_pay_preference == "paid_only" and parsed_monthly_stipend is not None:
+                    editable["preferences"]["compensation"]["monthly_stipend"] = parsed_monthly_stipend
             else:
                 editable["preferences"]["compensation"] = {"min_salary": int(minimum_salary or 0)}
             editable["sources"]["greenhouse"]["enabled"] = gh_enabled

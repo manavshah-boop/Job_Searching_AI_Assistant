@@ -163,6 +163,28 @@ def _normalize_intern_pay_preference(data: Dict[str, Any]) -> str:
     return "no_preference"
 
 
+def _optional_int_input_value(value: Any) -> str:
+    """Render optional numeric values as a blank-friendly text input value."""
+    if value in (None, "", 0):
+        return ""
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value).strip()
+
+
+def _parse_optional_int_input(value: Any) -> int | None:
+    """Parse an optional integer input, accepting blanks and simple currency formatting."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, int):
+        return value
+    cleaned = str(value).strip().replace("$", "").replace(",", "")
+    if not cleaned:
+        return None
+    return int(cleaned)
+
+
 def _format_intern_compensation_summary(data: Dict[str, Any]) -> str:
     preference = _normalize_intern_pay_preference(data)
     preference_label = _INTERN_PAY_PREFERENCE_LABELS[preference]
@@ -946,14 +968,13 @@ def _step_preferences() -> None:
                     horizontal=True,
                 )
                 intern_pay_preference = _INTERN_PAY_PREFERENCE_OPTIONS[pay_preference_label]
-                stipend = 0
+                stipend_text = ""
                 if intern_pay_preference == "paid_only":
-                    stipend = st.number_input(
+                    stipend_text = st.text_input(
                         "Target monthly stipend",
-                        min_value=0,
-                        step=500,
-                        value=int(data.get("stipend_expectation", 0)),
-                        help="Optional. Leave at 0 if you only care that the role is paid.",
+                        value=_optional_int_input_value(data.get("stipend_expectation")),
+                        placeholder="4500",
+                        help="Optional. Leave blank if you only care that the role is paid.",
                     )
 
     clicked = _setup_step_navigation(2, "setup_step3_next", "Continue to AI provider", meta="Settings here can always be refined after setup.")
@@ -973,10 +994,15 @@ def _step_preferences() -> None:
             data["yoe"] = int(yoe)
             data["min_salary"] = int(min_salary)
         else:
+            try:
+                stipend_value = _parse_optional_int_input(stipend_text) if intern_pay_preference == "paid_only" else None
+            except ValueError:
+                callout("error", "Compensation needs one more detail", "Monthly stipend target must be a whole number or left blank.")
+                return
             data["intern_pay_preference"] = intern_pay_preference
             data.pop("min_salary", None)
-            if intern_pay_preference == "paid_only" and int(stipend) > 0:
-                data["stipend_expectation"] = int(stipend)
+            if intern_pay_preference == "paid_only" and stipend_value is not None:
+                data["stipend_expectation"] = stipend_value
             else:
                 data.pop("stipend_expectation", None)
         st.session_state.onboarding_step = 4
