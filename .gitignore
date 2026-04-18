@@ -47,7 +47,8 @@ Thumbs.db
 *.sqlite3
 
 # Profiles
-profiles/
+profiles/default
+profiles/test
 
 # Logs
 *.log
