@@ -285,11 +285,12 @@ def passes_filters(
     config: Dict[str, Any],
     source: str = "",
     debug: bool = False,
-) -> bool:
+) -> tuple:
     """
     Unified pre-filter applied before insert_job().
 
-    Returns True if the job should be kept, False if it should be skipped.
+    Returns (True, "") if the job should be kept, or (False, reason) if rejected.
+    reason is a short consistent string e.g. "title_blocklist: Staff", "yoe_max: 8 > 5".
     Prints a one-line skip reason when debug=True.
     """
     filters = config.get('preferences', {}).get('filters', {})
@@ -311,7 +312,7 @@ def passes_filters(
         if re.search(r'\b' + re.escape(blocked) + r'\b', check_text):
             if debug:
                 logger.debug(f"[SKIP] title_blocklist matched '{blocked}' | {title!r}")
-            return False
+            return False, f"title_blocklist: {blocked}"
 
     # ------------------------------------------------------------------
     # 2. YOE filter (both sources)
@@ -323,11 +324,11 @@ def passes_filters(
         if yoe_max_found > max_yoe:
             if debug:
                 logger.debug(f"[SKIP] yoe_max {yoe_max_found} > {max_yoe} | {title!r}")
-            return False
+            return False, f"yoe_max: {yoe_max_found} > {max_yoe}"
         if yoe_min_found < min_yoe:
             if debug:
                 logger.debug(f"[SKIP] yoe_min {yoe_min_found} < {min_yoe} | {title!r}")
-            return False
+            return False, f"yoe_min: {yoe_min_found} < {min_yoe}"
 
     # ------------------------------------------------------------------
     # 3. HN-only: hiring intent filter
@@ -357,7 +358,7 @@ def passes_filters(
         if not found_intent:
             if debug:
                 logger.debug(f"[SKIP] no hiring intent near title/skill keyword | {title!r}")
-            return False
+            return False, "hiring_intent_not_found"
 
     # ------------------------------------------------------------------
     # 4. Degree requirement filter (both sources)
@@ -365,7 +366,7 @@ def passes_filters(
     if filters.get('require_degree_filter', False) and requires_advanced_degree(text):
         if debug:
             logger.debug(f"[SKIP] requires advanced degree | {title!r}")
-        return False
+        return False, "degree_required"
 
     # ------------------------------------------------------------------
     # 5. US location filter
@@ -375,7 +376,7 @@ def passes_filters(
         if not _is_us_location(location):
             if debug:
                 logger.debug(f"[SKIP] non-US location '{location}' | {title!r}")
-            return False
+            return False, "non_us_location"
 
     elif source == "hackernews":
         # Unstructured free text — look for US signals and absence of non-US geo
@@ -397,9 +398,9 @@ def passes_filters(
         else:
             if debug:
                 logger.debug("[SKIP] no US/remote signal in HN post | %s", title)
-            return False
+            return False, "non_us_location"
 
-    return True
+    return True, ""
 
 
 def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
@@ -495,27 +496,24 @@ Description:
                     continue
 
                 # Pre-filter (title blocklist, YOE, US location)
-                if not passes_filters(full_text, title, location, config, source="greenhouse", debug=True):
+                job_id = make_id("greenhouse", str(job_posting["id"]))
+                passed, filter_reason = passes_filters(full_text, title, location, config, source="greenhouse", debug=True)
+                if not passed:
                     jobs_filtered += 1
+                    insert_job(Job(
+                        id=job_id, title=title, company=company_slug,
+                        location=location, url=url, raw_text=raw_text,
+                        source="greenhouse", scrape_qualified=0,
+                        scrape_filter_reason=filter_reason,
+                    ), profile=profile)
                     continue
 
-                # Create Job object
-                job = Job(
-                    id="",  # Will be set below
-                    title=title,
-                    company=company_slug,
-                    location=location,
-                    url=url,
-                    raw_text=raw_text,
-                    source="greenhouse"
-                )
-
-                # Generate simple ID: greenhouse_{api_id}
-                from db import make_id
-                job.id = make_id("greenhouse", str(job_posting["id"]))
-
                 # Insert and track
-                if insert_job(job, profile=profile):
+                if insert_job(Job(
+                    id=job_id, title=title, company=company_slug,
+                    location=location, url=url, raw_text=raw_text,
+                    source="greenhouse",
+                ), profile=profile):
                     new_jobs_saved += 1
                     company_new_count += 1
 
@@ -641,21 +639,23 @@ Description:
                 ):
                     effective_location = "Remote"
 
-                if not passes_filters(full_text, title, effective_location, config, source="lever", debug=True):
+                job_id = make_id("lever", posting["id"])
+                passed, filter_reason = passes_filters(full_text, title, effective_location, config, source="lever", debug=True)
+                if not passed:
                     jobs_filtered += 1
+                    insert_job(Job(
+                        id=job_id, title=title, company=slug,
+                        location=location, url=url, raw_text=raw_text,
+                        source="lever", scrape_qualified=0,
+                        scrape_filter_reason=filter_reason,
+                    ), profile=profile)
                     continue
 
-                job = Job(
-                    id=make_id("lever", posting["id"]),
-                    title=title,
-                    company=slug,
-                    location=location,
-                    url=url,
-                    raw_text=raw_text,
+                if insert_job(Job(
+                    id=job_id, title=title, company=slug,
+                    location=location, url=url, raw_text=raw_text,
                     source="lever",
-                )
-
-                if insert_job(job, profile=profile):
+                ), profile=profile):
                     new_jobs_saved += 1
                     company_new_count += 1
 
@@ -825,27 +825,25 @@ Thread: {thread_title}
                     continue
 
                 # Pre-filter (title blocklist, YOE, hiring intent, US location)
-                if not passes_filters(comment_text, title, "", config, source="hackernews", debug=True):
+                job_id = make_id("hackernews", str(comment_id))
+                hn_url = f"https://news.ycombinator.com/item?id={comment_id}"
+                passed, filter_reason = passes_filters(comment_text, title, "", config, source="hackernews", debug=True)
+                if not passed:
                     jobs_filtered += 1
+                    insert_job(Job(
+                        id=job_id, title=title, company="Unknown",
+                        location="Unknown", url=hn_url, raw_text=raw_text,
+                        source="hackernews", scrape_qualified=0,
+                        scrape_filter_reason=filter_reason,
+                    ), profile=profile)
                     continue
 
-                # Create Job object
-                job = Job(
-                    id="",  # Will be set below
-                    title=title,
-                    company="Unknown",  # Will be extracted by Claude
-                    location="Unknown",  # Will be extracted by Claude
-                    url=f"https://news.ycombinator.com/item?id={comment_id}",
-                    raw_text=raw_text,
-                    source="hackernews"
-                )
-
-                # Generate simple ID: hackernews_{comment_id}
-                from db import make_id
-                job.id = make_id("hackernews", str(comment_id))
-
                 # Insert and track
-                if insert_job(job, profile=profile):
+                if insert_job(Job(
+                    id=job_id, title=title, company="Unknown",
+                    location="Unknown", url=hn_url, raw_text=raw_text,
+                    source="hackernews",
+                ), profile=profile):
                     new_jobs_saved += 1
 
         logger.info("Saved %d new HN jobs", new_jobs_saved)

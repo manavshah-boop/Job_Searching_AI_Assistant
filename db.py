@@ -57,6 +57,8 @@ class Job:
     score_attempts: int = 0
     score_error: Optional[str] = None
     status: str = "new"  # new | applied | skipped
+    scrape_qualified: int = 1       # 1 = passed filters, 0 = rejected at scrape time
+    scrape_filter_reason: str = ""  # e.g. "title_blocklist: Staff", "yoe_max: 8 > 5"
 
 
 def make_id(source: str, source_id: str) -> str:
@@ -76,6 +78,16 @@ def _migrate_db(db_path: Path) -> None:
     for col, col_type in [
         ("score_attempts", "INTEGER DEFAULT 0"),
         ("score_error",    "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    for col, col_type in [
+        ("scrape_qualified",     "INTEGER DEFAULT 1"),
+        ("scrape_filter_reason", "TEXT DEFAULT ''"),
     ]:
         try:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {col_type}")
@@ -170,10 +182,13 @@ def insert_job(job: Job, profile: Optional[str] = None) -> bool:
     conn = sqlite3.connect(get_db_path(profile))
     try:
         conn.execute("""
-            INSERT INTO jobs (id, title, company, location, url, raw_text, source, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs
+                (id, title, company, location, url, raw_text, source, status,
+                 scrape_qualified, scrape_filter_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (job.id, job.title, job.company, job.location,
-              job.url, job.raw_text, job.source, job.status))
+              job.url, job.raw_text, job.source, job.status,
+              job.scrape_qualified, job.scrape_filter_reason))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -271,6 +286,8 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         score_attempts=row["score_attempts"] if "score_attempts" in keys else 0,
         score_error=row["score_error"] if "score_error" in keys else None,
         status=row["status"],
+        scrape_qualified=row["scrape_qualified"] if "scrape_qualified" in keys else 1,
+        scrape_filter_reason=row["scrape_filter_reason"] if "scrape_filter_reason" in keys else "",
     )
 
 
@@ -285,6 +302,7 @@ def get_unscored(profile: Optional[str] = None) -> list:
         SELECT * FROM jobs
         WHERE id NOT IN (SELECT job_id FROM scores)
           AND score_attempts < 3
+          AND scrape_qualified = 1
         ORDER BY created_at DESC
     """).fetchall()
     conn.close()

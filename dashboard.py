@@ -100,7 +100,7 @@ SECTION_COPY = {
     "Profile": "Inspect candidate context, preferences, and source coverage as the scorer sees them.",
     "Settings": "Adjust search behavior, scoring thresholds, sources, and maintenance actions safely.",
 }
-JOB_VISIBLE_OPTIONAL_COLUMNS = ["Location", "Source", "ATS", "Summary", "Posting"]
+JOB_VISIBLE_OPTIONAL_COLUMNS = ["Location", "Source", "ATS", "Summary", "Posting", "Filter reason"]
 LOCATION_PICKER_OPTIONS = [
     "Remote",
     "San Francisco, CA",
@@ -272,6 +272,7 @@ def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
                 "ATS": record["ats_score"],
                 "Summary": record["one_liner"],
                 "Posting": record["url"] or "",
+                "Filter reason": record.get("scrape_filter_reason", ""),
             }
             for record in records
         ]
@@ -290,6 +291,7 @@ def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
                 "ATS",
                 "Summary",
                 "Posting",
+                "Filter reason",
             ]
         )
 
@@ -353,6 +355,7 @@ def _job_filter_state_keys(slug: str) -> dict[str, str]:
         "statuses": f"jobs_statuses_{slug}",
         "score_states": f"jobs_score_states_{slug}",
         "visible_columns": f"jobs_visible_columns_{slug}",
+        "show_scrape_rejected": f"jobs_show_scrape_rejected_{slug}",
     }
 
 
@@ -369,7 +372,8 @@ def reset_job_filter_state(
     st.session_state[keys["sources"]] = list(source_options)
     st.session_state[keys["statuses"]] = list(status_options)
     st.session_state[keys["score_states"]] = list(score_state_options)
-    st.session_state[keys["visible_columns"]] = list(JOB_VISIBLE_OPTIONAL_COLUMNS)
+    st.session_state[keys["visible_columns"]] = [c for c in JOB_VISIBLE_OPTIONAL_COLUMNS if c != "Filter reason"]
+    st.session_state[keys["show_scrape_rejected"]] = False
 
 
 def resolve_job_table_columns(selected_optional_columns: list[str]) -> list[str]:
@@ -740,6 +744,8 @@ def _deserialize_job_record(row: sqlite3.Row) -> dict[str, Any]:
                 break
     record["disqualified"] = disq_from_db
     record["disqualify_reason"] = disq_reason
+    record["scrape_qualified"] = int(record.get("scrape_qualified") or 1)
+    record["scrape_filter_reason"] = record.get("scrape_filter_reason") or ""
     return record
 
 
@@ -761,6 +767,8 @@ def _fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
                 j.score_error,
                 j.status,
                 j.created_at,
+                j.scrape_qualified,
+                j.scrape_filter_reason,
                 s.fit_score,
                 s.ats_score,
                 s.reasons,
@@ -805,6 +813,8 @@ def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
                 j.score_error,
                 j.status,
                 j.created_at,
+                j.scrape_qualified,
+                j.scrape_filter_reason,
                 s.fit_score,
                 s.ats_score,
                 s.reasons,
@@ -896,9 +906,12 @@ def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]
         "skipped": skipped,
         "avg_fit": avg_fit,
         "source_counts": source_counts,
-        # Callers inject disqualified_count, disqualified_by_reason, db_total.
+        # Callers inject disqualified_count, disqualified_by_reason, db_total,
+        # scrape_rejected_count, and scrape_rejected_by_reason.
         "disqualified_count": 0,
         "disqualified_by_reason": {},
+        "scrape_rejected_count": 0,
+        "scrape_rejected_by_reason": {},
         "db_total": len(records),
     }
 
@@ -2227,7 +2240,12 @@ def _render_overview_tab(
         _render_overview_run_bar(runs)
 
 
-def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
+def _render_jobs_tab(
+    records: list[dict[str, Any]],
+    slug: str,
+    *,
+    scrape_rejected_records: list[dict[str, Any]] | None = None,
+) -> None:
     profile_name = st.session_state.get("active_profile", slug).replace("_", " ").title()
     with section_shell("Jobs", SECTION_COPY["Jobs"]):
         if not records:
@@ -2304,6 +2322,12 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
                 help="Choose one or more scoring states to include.",
             )
 
+            st.checkbox(
+                "Show scrape-filtered jobs",
+                key=state_keys["show_scrape_rejected"],
+                help="Jobs rejected during scraping before any LLM scoring — usually title mismatches or YOE filters.",
+            )
+
             with st.expander("Show/hide columns", expanded=False):
                 visible_columns = st.multiselect(
                     "Visible optional columns",
@@ -2319,6 +2343,7 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
         search = st.session_state[state_keys["search"]]
         include_full_text = st.session_state[state_keys["include_full_text"]]
         visible_columns = st.session_state[state_keys["visible_columns"]]
+        show_scrape_rejected = st.session_state.get(state_keys["show_scrape_rejected"], False)
 
         filter_chips = build_jobs_filter_chips(
             selected_sources,
@@ -2334,7 +2359,10 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
         _render_html_block("<div class='filter-chip-title'>Applied filters</div>")
         chip_row(filter_chips)
 
-        filtered = records
+        pool = list(records)
+        if show_scrape_rejected and scrape_rejected_records:
+            pool.extend(scrape_rejected_records)
+        filtered = pool
         if selected_sources:
             filtered = [record for record in filtered if record["source_label"] in selected_sources]
         if selected_statuses:
@@ -2499,6 +2527,22 @@ def _render_activity_tab(
                 by_reason = metrics.get("disqualified_by_reason", {})
                 if by_reason:
                     rows = sorted(by_reason.items(), key=lambda kv: -kv[1])
+                    _render_summary_list([(reason, f"{count}×") for reason, count in rows])
+                else:
+                    st.write("No breakdown available.")
+
+        scrape_rej_count = metrics.get("scrape_rejected_count", 0)
+        if scrape_rej_count > 0:
+            rej_label = f"Scrape-filtered ({scrape_rej_count} job{'s' if scrape_rej_count != 1 else ''} rejected before scoring)"
+            with st.expander(rej_label, expanded=False):
+                st.caption(
+                    "These jobs were rejected during scraping by pre-LLM filters (title blocklist, "
+                    "YOE limits, location check). They are stored in the database for auditability "
+                    "but never sent to the LLM. Enable 'Show scrape-filtered jobs' in the Jobs tab to inspect them."
+                )
+                rej_by_reason = metrics.get("scrape_rejected_by_reason", {})
+                if rej_by_reason:
+                    rows = sorted(rej_by_reason.items(), key=lambda kv: -kv[1])
                     _render_summary_list([(reason, f"{count}×") for reason, count in rows])
                 else:
                     st.write("No breakdown available.")
@@ -2892,21 +2936,31 @@ def _render_profile_dashboard(slug: str) -> None:
         return
 
     all_records = _cached_fetch_job_summaries(slug)
-    # Disqualified jobs stay in the DB but are hidden from the user-facing UI.
-    # Genuine scoring failures (score_error set, no score row) still surface.
-    records = [r for r in all_records if not r.get("disqualified")]
+    # Three mutually exclusive partitions:
+    # - records: passed scrape filters and not LLM-disqualified → review queue
+    # - disq_records: LLM-disqualified (scored with disqualified=1) → hidden
+    # - scrape_rejected_records: rejected pre-LLM (scrape_qualified=0) → optionally shown
+    records = [r for r in all_records if not r.get("disqualified") and r.get("scrape_qualified", 1)]
     disq_records = [r for r in all_records if r.get("disqualified")]
+    scrape_rejected_records = [r for r in all_records if not r.get("scrape_qualified", 1)]
     metrics = _collect_metrics(slug, records)
-    # Inject disqualified summary for the Activity tab without touching the
-    # rest of the metrics dict consumers.
+    # Inject disqualified summary for the Activity tab.
     by_reason: dict[str, int] = {}
     for r in disq_records:
         reason = r.get("disqualify_reason") or "unknown"
         by_reason[reason] = by_reason.get(reason, 0) + 1
     metrics["disqualified_count"] = len(disq_records)
     metrics["disqualified_by_reason"] = by_reason
+    # Inject scrape-rejected summary for the Activity tab.
+    rej_by_reason: dict[str, int] = {}
+    for r in scrape_rejected_records:
+        reason = r.get("scrape_filter_reason") or "unknown"
+        prefix = reason.split(":")[0] if ":" in reason else reason
+        rej_by_reason[prefix] = rej_by_reason.get(prefix, 0) + 1
+    metrics["scrape_rejected_count"] = len(scrape_rejected_records)
+    metrics["scrape_rejected_by_reason"] = rej_by_reason
     # Keep DB-accurate total so settings warnings ("erase N jobs") are correct.
-    metrics["db_total"] = metrics["total"] + len(disq_records)
+    metrics["db_total"] = metrics["total"] + len(disq_records) + len(scrape_rejected_records)
     runs = _cached_recent_runs(slug)
     profile_name = config.get("profile", {}).get("name", slug.replace("_", " ").title())
 
@@ -2974,7 +3028,7 @@ def _render_profile_dashboard(slug: str) -> None:
         if section == "Overview":
             _render_overview_tab(slug, config, raw_config, records, runs, metrics)
         elif section == "Jobs":
-            _render_jobs_tab(records, slug)
+            _render_jobs_tab(records, slug, scrape_rejected_records=scrape_rejected_records)
         elif section == "Activity":
             _render_activity_tab(slug, runs, metrics, raw_config, config)
         elif section == "Profile":

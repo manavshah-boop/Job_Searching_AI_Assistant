@@ -27,6 +27,7 @@ matches. Two users (Manav + sister), fully isolated profiles, deployed to GCP.
 | 10 | ✅ | llm_utils.py recovery layer (llama-4-scout {"value":x} wrapping fix) |
 | 11 | ✅ | Out-of-process dashboard pipeline (subprocess + lockfile + progress JSON) |
 | 12 | ✅ | Filter disqualified jobs from UI; "Filtered out" summary in Activity tab |
+| 13 | ✅ | Scrape-filter rejection persistence: scrape_qualified/scrape_filter_reason columns, auditable dashboard toggle |
 
 ---
 
@@ -183,54 +184,77 @@ Stage values (enum) are stored by `.value` string (e.g. "🔍 Discovering compan
 
 ---
 
-## Filter-skipped jobs (disqualified)
+## Filter-skipped jobs (disqualified and scrape-rejected)
 
-### What are they
+There are two distinct hidden-job systems. Do not confuse them.
+
+### 1. LLM-disqualified jobs
 
 Jobs that the LLM decides to disqualify during scoring — e.g. "intern-only",
 "location mismatch", "YOE too high", "title blocklist" — get `disqualified=True`
 and `fit_score=0` from `score_job()`. They are stored in the DB (score row
 written) but must not pollute the review queue.
 
-### Canonical signal
-
-`scores.disqualified INTEGER DEFAULT 0` (added via `_migrate_db`).
-`scores.disqualify_reason TEXT DEFAULT ''` — the human-readable reason.
-
+**Canonical signal:** `scores.disqualified INTEGER DEFAULT 0`, `scores.disqualify_reason TEXT DEFAULT ''`.
 Backwards compat: `_deserialize_job_record()` also checks `flags` for items
 starting with `"disqualified:"` so pre-migration rows are caught too.
 
-### How filtering works
+### 2. Scrape-rejected jobs
 
-In `_render_profile_dashboard()`:
-```python
-all_records = _cached_fetch_job_summaries(slug)
-records = [r for r in all_records if not r.get("disqualified")]   # visible
-disq_records = [r for r in all_records if r.get("disqualified")]  # hidden
+Jobs that failed `passes_filters()` during scraping — title blocklist, YOE limits,
+non-US location, no hiring intent (HN). These are inserted into the DB with
+`scrape_qualified=0` and a human-readable `scrape_filter_reason` (e.g.
+`"title_blocklist: Staff"`, `"yoe_max: 8 > 5"`, `"non_us_location"`).
+
+**New DB columns (added via `_migrate_db`):**
+```
+jobs.scrape_qualified     INTEGER DEFAULT 1  -- 0 = rejected at scrape time
+jobs.scrape_filter_reason TEXT DEFAULT ''    -- human-readable filter reason
 ```
 
-`records` (non-disqualified) flows into all downstream renderers:
-- `_collect_metrics()` — scored/pending/avg_fit computed from visible only
-- `_render_jobs_tab()` — review queue table
-- `_render_overview_tab()` — top matches, scoreboard
-- `_render_top_matches()` — best opportunities panel
+`passes_filters()` now returns `tuple[bool, str]` — `(True, "")` on pass,
+`(False, reason)` on reject. All 3 call sites (Greenhouse, Lever, HN) unpack
+the tuple and insert rejected jobs with `scrape_qualified=0`.
 
-`disq_records` summary is injected into `metrics` as:
-- `metrics["disqualified_count"]` — total hidden jobs
+`get_unscored()` has `AND scrape_qualified = 1` in its WHERE clause so
+scrape-rejected jobs are never fetched for scoring. `score_job()` also checks
+`job.scrape_qualified == 0` as a safety net and returns early with
+`flags=["scrape_filtered: {reason}"]` if a job somehow slips through.
+
+### How filtering works in the dashboard
+
+In `_render_profile_dashboard()`, three mutually exclusive partitions:
+```python
+records = [r for r in all_records if not r.get("disqualified") and r.get("scrape_qualified", 1)]
+disq_records = [r for r in all_records if r.get("disqualified")]
+scrape_rejected_records = [r for r in all_records if not r.get("scrape_qualified", 1)]
+```
+
+`records` (clean jobs) flows into all downstream renderers.
+
+`disq_records` summary injected into `metrics`:
+- `metrics["disqualified_count"]` — hidden LLM-disqualified count
 - `metrics["disqualified_by_reason"]` — {reason: count}
-- `metrics["db_total"]` — true DB count including disqualified (used in settings warnings)
 
-### Where disqualified jobs appear
+`scrape_rejected_records` summary injected into `metrics`:
+- `metrics["scrape_rejected_count"]` — hidden scrape-rejected count
+- `metrics["scrape_rejected_by_reason"]` — {reason_prefix: count} (grouped by part before `:`)
 
-Activity tab → "Filtered out (N jobs hidden by scoring rules)" expander shows
-count grouped by reason. This confirms the filter is working without cluttering
-the main views.
+`metrics["db_total"]` = `metrics["total"]` + disq + scrape_rejected (used in settings warnings).
+
+### Where each appears
+
+- Activity tab → "Filtered out (N jobs hidden by scoring rules)" — LLM-disqualified breakdown
+- Activity tab → "Scrape-filtered (N jobs rejected before scoring)" — scrape-rejected breakdown
+- Jobs tab → "Show scrape-filtered jobs" checkbox (inside Review controls expander, hidden by default):
+  when checked, `scrape_rejected_records` are merged into the visible pool before filters apply.
+  Jobs table shows a "Filter reason" optional column (hidden by default, toggleable via Show/hide columns).
 
 ### Genuine scoring failures still visible
 
 Jobs with `score_error` set and no score row (or failed attempts < 3) still
-appear with `score_state = "Needs retry"` or `"Failed"`. The filter only hides
-jobs where `disqualified=1` — it does NOT hide error states.
+appear with `score_state = "Needs retry"` or `"Failed"`. Neither filter hides
+error states — only `disqualified=1` and `scrape_qualified=0` hide jobs.
 
 ---
 
@@ -289,7 +313,7 @@ Key functions (all accept `profile=None`):
 - `init_db(profile=None)` — creates profile folder if needed, runs migrations
 - `insert_job(job, profile=None) -> bool`
 - `save_score(job_id, ..., disqualified=0, disqualify_reason="", profile=None)`
-- `get_unscored(profile=None) -> list[Job]` — jobs with score IS NULL and score_attempts < 3
+- `get_unscored(profile=None) -> list[Job]` — jobs with score IS NULL, score_attempts < 3, AND scrape_qualified = 1
 - `get_top_jobs(min_score, profile=None) -> list`
 - `count_jobs(profile=None) -> dict` — {total, scored} (includes disqualified in total)
 - `rescore_reset(profile=None)` — clears scores, resets score_attempts to 0
@@ -298,6 +322,27 @@ Key functions (all accept `profile=None`):
 - `load_discovered_slugs(ats, profile=None) -> list[str]`
 - `increment_score_attempts(job_id, profile=None)`
 - `write_score_error(job_id, error, profile=None)`
+
+### Jobs table (with migrations)
+
+```sql
+CREATE TABLE jobs (
+    id                   TEXT PRIMARY KEY,
+    title                TEXT NOT NULL,
+    company              TEXT NOT NULL,
+    location             TEXT,
+    url                  TEXT,
+    raw_text             TEXT,
+    source               TEXT,
+    score_attempts       INTEGER DEFAULT 0,
+    score_error          TEXT,
+    status               TEXT DEFAULT 'new',
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- added via _migrate_db:
+    scrape_qualified     INTEGER DEFAULT 1,  -- 0 = rejected by passes_filters() at scrape time
+    scrape_filter_reason TEXT DEFAULT ''     -- e.g. "title_blocklist: Staff", "yoe_max: 8 > 5"
+)
+```
 
 ### Scores table (with migrations)
 

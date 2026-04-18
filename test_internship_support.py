@@ -5,7 +5,7 @@ from candidate_profile import build_structured_profile
 from db import Job
 from onboarding import generate_config
 from scraper import requires_advanced_degree
-from scorer import score_dimensions
+from scorer import keyword_prescore, score_dimensions
 
 
 def test_generate_config_for_internship_uses_intern_compensation_shape():
@@ -319,3 +319,28 @@ def test_effective_config_summary_for_intern_does_not_show_min_salary_zero():
 
     assert "Compensation preference: No preference" in summary
     assert not any("Minimum salary" in line for line in summary)
+
+
+def test_keyword_prescore_allows_close_title_variants_without_skill_phrase_overlap():
+    config = {
+        "preferences": {
+            "titles": ["Software Engineer", "Backend Engineer"],
+            "desired_skills": [
+                "Machine learning infrastructure",
+                "LLM systems",
+                "Distributed systems",
+                "CI/CD pipelines",
+            ],
+        }
+    }
+    job = Job(
+        id="early-career-1",
+        title="Software Engineer - Early Career",
+        company="Datadog",
+        location="New York, United States",
+        url="https://example.com/early-career-1",
+        raw_text="Build backend services with Python.",
+        source="greenhouse",
+    )
+
+    assert keyword_prescore(job, config) == 1.0

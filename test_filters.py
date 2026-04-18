@@ -204,8 +204,8 @@ def run():
     passed = 0
     failed = 0
     for desc, text, title, location, source, expected in CASES:
-        result = passes_filters(text, title, location, CONFIG, source=source, debug=False)
-        ok = result == expected
+        kept, reason = passes_filters(text, title, location, CONFIG, source=source, debug=False)
+        ok = kept == expected
         status = "PASS" if ok else "FAIL"
         if not ok:
             failed += 1
@@ -213,7 +213,7 @@ def run():
             print(f"\n{'─'*60}")
             print(f"[{status}] {desc}")
             print(f"  title={title!r}  location={location!r}  source={source}")
-            print(f"  expected={'KEEP' if expected else 'SKIP'}, got={'KEEP' if result else 'SKIP'}")
+            print(f"  expected={'KEEP' if expected else 'SKIP'}, got={'KEEP' if kept else 'SKIP'} (reason={reason!r})")
             passes_filters(text, title, location, CONFIG, source=source, debug=True)
         else:
             passed += 1

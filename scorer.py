@@ -317,13 +317,25 @@ def keyword_prescore(job: Job, config: Dict[str, Any]) -> float:
     Pure Python. Fraction of desired_skills present in raw_text.
     Returns 0.0–1.0. Below 0.15 → skip the LLM call entirely.
 
-    Exception: if the job title is an exact (case-insensitive) match to any
+    Exception: if the job title is an exact or close normalized variant of any
     preferred title in preferences.titles, return 1.0 to guarantee LLM scoring.
-    A user who explicitly listed a title wants every instance of it scored.
+    A user who explicitly listed a title wants close variants of it scored too.
     """
+    def _normalize_title(title: str) -> str:
+        # Collapse punctuation and spacing so title variants compare cleanly.
+        return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
     preferred_titles = [t.lower() for t in config.get("preferences", {}).get("titles", [])]
-    if preferred_titles and job.title.lower() in preferred_titles:
-        return 1.0
+    if preferred_titles:
+        job_title = job.title.lower()
+        normalized_job_title = _normalize_title(job.title)
+        for preferred_title in preferred_titles:
+            if job_title == preferred_title:
+                return 1.0
+
+            normalized_preferred_title = _normalize_title(preferred_title)
+            if normalized_preferred_title and normalized_preferred_title in normalized_job_title:
+                return 1.0
 
     text   = job.raw_text.lower()
     skills = config["preferences"]["desired_skills"]
@@ -689,6 +701,11 @@ def score_job(
         "dimension_scores": {},
         "skill_misses": [],
     }
+
+    # Stage 0: scrape-filter gate — job was admitted to DB for dedup but rejected at scrape time
+    if job.scrape_qualified == 0:
+        base["flags"] = [f"scrape_filtered: {job.scrape_filter_reason}"]
+        return base
 
     # Stage 1: keyword pre-score — skip LLM call if no skill overlap
     if keyword_prescore(job, config) < 0.15:
