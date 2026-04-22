@@ -2,9 +2,10 @@
 
 ## What we're building
 
-A personal AI job search agent. Scrapes Greenhouse, Lever, and HN Who's Hiring,
-scores every job against a user profile using an LLM, and surfaces the best
-matches. Two users (Manav + sister), fully isolated profiles, deployed to GCP.
+A personal AI job search agent. Scrapes Greenhouse, Lever, Ashby, Workable,
+Himalayas, and HN Who's Hiring, scores every job against a user profile using
+an LLM, and surfaces the best matches. Two users (Manav + sister), fully
+isolated profiles, deployed to GCP.
 
 ## Core philosophy
 
@@ -213,7 +214,7 @@ jobs.scrape_filter_reason TEXT DEFAULT ''    -- human-readable filter reason
 ```
 
 `passes_filters()` now returns `tuple[bool, str]` — `(True, "")` on pass,
-`(False, reason)` on reject. All 3 call sites (Greenhouse, Lever, HN) unpack
+`(False, reason)` on reject. Scraper call sites unpack
 the tuple and insert rejected jobs with `scrape_qualified=0`.
 
 `get_unscored()` has `AND scrape_qualified = 1` in its WHERE clause so
@@ -421,9 +422,9 @@ sources:
     companies: [linear, vercel, retool, ...]   # YC/growth startups; same slug shape as GH/Lever
   workable:
     enabled: false
-    companies: []
+    companies: []   # public widget API slugs from apply.workable.com/{slug}
   himalayas:
-    enabled: false   # remote-only feed; no company list needed
+    enabled: false   # remote-only public feed; no company list needed
   hn:
     enabled: true   # key is "hn" not "hackernews" in sources
 

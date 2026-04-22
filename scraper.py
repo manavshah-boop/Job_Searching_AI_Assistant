@@ -278,19 +278,44 @@ def _configured_max_job_age_days(config: Dict[str, Any]) -> int:
         return 30
 
 
-def _is_iso_timestamp_older_than(timestamp: Optional[str], max_age: timedelta) -> bool:
-    """Return True only when a parseable ISO timestamp is older than max_age."""
-    if not timestamp:
-        return False
+def _preferred_titles(config: Dict[str, Any]) -> List[str]:
+    profile_info = config.get("profile", {})
+    preferences = config.get("preferences", {})
+    return profile_info.get("titles") or preferences.get("titles", [])
+
+
+def _parse_posted_at(value: Any) -> Optional[datetime]:
+    """Parse ISO strings, epoch seconds, or epoch milliseconds into UTC datetimes."""
+    if value in (None, ""):
+        return None
 
     try:
-        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except (AttributeError, ValueError, TypeError):
-        return False
+        if isinstance(value, (int, float)):
+            timestamp = value / 1000 if value > 10_000_000_000 else value
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+        text = str(value).strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d+(\.\d+)?", text):
+            timestamp = float(text)
+            timestamp = timestamp / 1000 if timestamp > 10_000_000_000 else timestamp
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (OSError, ValueError, TypeError):
+        return None
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return datetime.now(tz=timezone.utc) - parsed.astimezone(timezone.utc) > max_age
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_posted_at_older_than(value: Any, max_age: timedelta) -> bool:
+    posted_at = _parse_posted_at(value)
+    if posted_at is None:
+        return False
+    return datetime.now(tz=timezone.utc) - posted_at > max_age
 
 
 def _build_raw_text(
@@ -310,6 +335,31 @@ URL: {url}
 Description:
 {description}""".strip()
     return extract_job_context(raw_text, max_chars=max_chars)
+
+
+def _insert_scraped_job(
+    *,
+    source: str,
+    job_id: str,
+    title: str,
+    company: str,
+    location: str,
+    url: str,
+    raw_text: str,
+    profile: Optional[str],
+    filter_reason: str = "",
+) -> bool:
+    return insert_job(Job(
+        id=job_id,
+        title=title,
+        company=company,
+        location=location,
+        url=url,
+        raw_text=raw_text,
+        source=source,
+        scrape_qualified=0 if filter_reason else 1,
+        scrape_filter_reason=filter_reason,
+    ), profile=profile)
 
 
 def passes_filters(
@@ -450,9 +500,7 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
 
     companies = slugs if slugs is not None else []
     preferences = config.get('preferences', {})
-    profile_info = config.get('profile', {})
-
-    preferred_titles = profile_info.get('titles') or preferences.get('titles', [])
+    preferred_titles = _preferred_titles(config)
     desired_skills = profile_info.get('desired_skills') or preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
     max_job_age_days = _configured_max_job_age_days(config)
@@ -591,7 +639,7 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
     companies = slugs if slugs is not None else []
     preferences = config.get('preferences', {})
 
-    preferred_titles = preferences.get('titles', [])
+    preferred_titles = _preferred_titles(config)
     hard_no_keywords = preferences.get('hard_no_keywords', [])
 
     companies_checked = 0
@@ -625,15 +673,8 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
 
             for posting in postings:
                 # Date filter — createdAt is milliseconds
-                created_at_ms = posting.get('createdAt')
-                if created_at_ms:
-                    try:
-                        from datetime import timezone
-                        created_dt = datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
-                        if datetime.now(tz=timezone.utc) - created_dt > max_age:
-                            continue
-                    except (ValueError, TypeError, OSError):
-                        pass
+                if _is_posted_at_older_than(posting.get('createdAt'), max_age):
+                    continue
 
                 title = posting.get('text', '')
                 categories = posting.get('categories', {})
@@ -653,15 +694,13 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 description_clean = strip_html(description_html + ' ' + lists_html)
 
                 workplace_note = f"\nWorkplace: {workplace_type}" if workplace_type else ""
-                raw_text = f"""Title: {title}
-Company: {slug.upper()}
-Location: {location}{workplace_note}
-URL: {url}
-
-Description:
-{description_clean}""".strip()
-
-                raw_text = extract_job_context(raw_text, max_chars=2000)
+                raw_text = _build_raw_text(
+                    title=title,
+                    company=slug.upper(),
+                    location=f"{location}{workplace_note}",
+                    url=url,
+                    description=description_clean,
+                )
 
                 full_text = title + " " + description_clean
                 jobs_scraped += 1
@@ -681,19 +720,29 @@ Description:
                 passed, filter_reason = passes_filters(full_text, title, effective_location, config, source="lever", debug=True)
                 if not passed:
                     jobs_filtered += 1
-                    insert_job(Job(
-                        id=job_id, title=title, company=slug,
-                        location=location, url=url, raw_text=raw_text,
-                        source="lever", scrape_qualified=0,
-                        scrape_filter_reason=filter_reason,
-                    ), profile=profile)
+                    _insert_scraped_job(
+                        source="lever",
+                        job_id=job_id,
+                        title=title,
+                        company=slug,
+                        location=location,
+                        url=url,
+                        raw_text=raw_text,
+                        profile=profile,
+                        filter_reason=filter_reason,
+                    )
                     continue
 
-                if insert_job(Job(
-                    id=job_id, title=title, company=slug,
-                    location=location, url=url, raw_text=raw_text,
+                if _insert_scraped_job(
                     source="lever",
-                ), profile=profile):
+                    job_id=job_id,
+                    title=title,
+                    company=slug,
+                    location=location,
+                    url=url,
+                    raw_text=raw_text,
+                    profile=profile,
+                ):
                     new_jobs_saved += 1
                     company_new_count += 1
 
@@ -728,9 +777,7 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
     init_db(profile=profile)
 
     preferences = config.get('preferences', {})
-    profile_info = config.get('profile', {})
-
-    preferred_titles = preferences.get('titles', [])
+    preferred_titles = _preferred_titles(config)
     desired_skills = preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
 
@@ -965,31 +1012,6 @@ def _fetch_ashby_board(
     return last_response, company_slug, last_error
 
 
-def _insert_ashby_job(
-    *,
-    job_id: str,
-    title: str,
-    company: str,
-    location: str,
-    url: str,
-    raw_text: str,
-    profile: Optional[str],
-    filter_reason: str = "",
-) -> bool:
-    scrape_qualified = 0 if filter_reason else 1
-    return insert_job(Job(
-        id=job_id,
-        title=title,
-        company=company,
-        location=location,
-        url=url,
-        raw_text=raw_text,
-        source="ashby",
-        scrape_qualified=scrape_qualified,
-        scrape_filter_reason=filter_reason,
-    ), profile=profile)
-
-
 def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Scrape all configured Ashby companies.
@@ -1001,7 +1023,7 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
     preferences = config.get('preferences', {})
     profile_info = config.get('profile', {})
 
-    preferred_titles = profile_info.get('titles') or preferences.get('titles', [])
+    preferred_titles = _preferred_titles(config)
     hard_no_keywords = preferences.get('hard_no_keywords', [])
     max_job_age_days = _configured_max_job_age_days(config)
 
@@ -1037,7 +1059,7 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     continue
 
                 published_at = posting.get("publishedAt") or posting.get("publishedDate")
-                if _is_iso_timestamp_older_than(published_at, max_age):
+                if _is_posted_at_older_than(published_at, max_age):
                     continue
 
                 title = posting.get("title", "")
@@ -1066,7 +1088,8 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 passed, filter_reason = passes_filters(full_text, title, location, config, source="ashby", debug=True)
                 if not passed:
                     jobs_filtered += 1
-                    _insert_ashby_job(
+                    _insert_scraped_job(
+                        source="ashby",
                         job_id=job_id,
                         title=title,
                         company=resolved_slug,
@@ -1078,7 +1101,8 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     )
                     continue
 
-                if _insert_ashby_job(
+                if _insert_scraped_job(
+                    source="ashby",
                     job_id=job_id,
                     title=title,
                     company=resolved_slug,
@@ -1113,7 +1137,70 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
     }
 
 
-WORKABLE_API_BASE = "https://apply.workable.com/api/v3/accounts"
+WORKABLE_WIDGET_API_BASE = "https://apply.workable.com/api/v1/widget/accounts"
+
+
+def _workable_postings(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    postings = data.get("jobs", data.get("results", []))
+    return postings if isinstance(postings, list) else []
+
+
+def _workable_location(posting: Dict[str, Any]) -> str:
+    if posting.get("telecommuting"):
+        return "Remote"
+
+    location_data = posting.get("location")
+    if isinstance(location_data, dict):
+        city = location_data.get("city", "")
+        region = location_data.get("region") or location_data.get("state", "")
+        country = location_data.get("country", "")
+    else:
+        city = posting.get("city", "")
+        region = posting.get("state", "")
+        country = posting.get("country", "")
+
+    parts = [part for part in (city, region, country) if part]
+    if parts:
+        return ", ".join(parts)
+
+    locations = posting.get("locations") or []
+    names = []
+    for item in locations:
+        if not isinstance(item, dict):
+            continue
+        item_parts = [
+            item.get("city", ""),
+            item.get("region", ""),
+            item.get("country", ""),
+        ]
+        name = ", ".join(part for part in item_parts if part)
+        if name:
+            names.append(name)
+    if names:
+        return " | ".join(names)
+
+    return "Unknown"
+
+
+def _workable_description(posting: Dict[str, Any]) -> str:
+    description = strip_html(posting.get("description", "") or "")
+    metadata = [
+        f"{label}: {posting[key]}"
+        for key, label in (
+            ("department", "Department"),
+            ("employment_type", "Employment type"),
+            ("experience", "Experience"),
+            ("education", "Education"),
+            ("function", "Function"),
+            ("industry", "Industry"),
+        )
+        if posting.get(key)
+    ]
+    return "\n".join([part for part in (description, "\n".join(metadata)) if part])
+
+
+def _workable_job_id(posting: Dict[str, Any]) -> str:
+    return str(posting.get("id") or posting.get("shortcode") or posting.get("url") or posting.get("shortlink") or "")
 
 
 def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
@@ -1144,7 +1231,7 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
     for slug in companies:
         companies_checked += 1
         try:
-            url = f"{WORKABLE_API_BASE}/{slug}/jobs"
+            url = f"{WORKABLE_WIDGET_API_BASE}/{slug}"
             with httpx.Client(timeout=10.0) as client:
                 response = client.get(url)
 
@@ -1153,61 +1240,37 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
                 continue
 
             data = response.json()
-            postings = data.get("results", [])
-            if not isinstance(postings, list):
+            postings = _workable_postings(data)
+            if not postings and "jobs" not in data and "results" not in data:
                 errors.append(f"[!] {slug}: unexpected response (not a list)")
                 continue
 
             company_new_count = 0
 
             for posting in postings:
-                # Date filter
-                created_at = posting.get("created_at")
-                if created_at:
-                    try:
-                        from datetime import timezone
-                        created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                        if datetime.now(tz=timezone.utc) - created_dt > max_age:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
+                posted_at = posting.get("published_on") or posting.get("created_at")
+                if _is_posted_at_older_than(posted_at, max_age):
+                    continue
 
                 title = posting.get("title", "")
-                location_data = posting.get("location", {})
-                telecommuting = posting.get("telecommuting", location_data.get("telecommuting", False))
-                city = location_data.get("city", "")
-                country = location_data.get("country", "")
+                telecommuting = bool(posting.get("telecommuting"))
+                location = _workable_location(posting)
 
-                # Derive effective location string; telecommuting=true -> Remote
-                if telecommuting:
-                    location = "Remote"
-                elif city and country:
-                    location = f"{city}, {country}"
-                elif city:
-                    location = city
-                elif country:
-                    location = country
-                else:
-                    location = "Unknown"
-
-                job_url = posting.get("url", "")
+                job_url = posting.get("url") or posting.get("shortlink") or posting.get("application_url") or ""
 
                 if not title_matches(title, preferred_titles):
                     continue
 
-                description = posting.get("description", "") or ""
-                description_clean = strip_html(description)
+                description_clean = _workable_description(posting)
 
                 workplace_note = "\nWorkplace: Remote" if telecommuting else ""
-                raw_text = f"""Title: {title}
-Company: {slug.upper()}
-Location: {location}{workplace_note}
-URL: {job_url}
-
-Description:
-{description_clean}""".strip()
-
-                raw_text = extract_job_context(raw_text, max_chars=2000)
+                raw_text = _build_raw_text(
+                    title=title,
+                    company=slug.upper(),
+                    location=f"{location}{workplace_note}",
+                    url=job_url,
+                    description=description_clean,
+                )
 
                 full_text = title + " " + description_clean
                 jobs_scraped += 1
@@ -1216,23 +1279,33 @@ Description:
                     jobs_filtered += 1
                     continue
 
-                job_id = make_id("workable", str(posting.get("id", "")))
+                job_id = make_id("workable", _workable_job_id(posting))
                 passed, filter_reason = passes_filters(full_text, title, location, config, source="workable", debug=True)
                 if not passed:
                     jobs_filtered += 1
-                    insert_job(Job(
-                        id=job_id, title=title, company=slug,
-                        location=location, url=job_url, raw_text=raw_text,
-                        source="workable", scrape_qualified=0,
-                        scrape_filter_reason=filter_reason,
-                    ), profile=profile)
+                    _insert_scraped_job(
+                        source="workable",
+                        job_id=job_id,
+                        title=title,
+                        company=slug,
+                        location=location,
+                        url=job_url,
+                        raw_text=raw_text,
+                        profile=profile,
+                        filter_reason=filter_reason,
+                    )
                     continue
 
-                if insert_job(Job(
-                    id=job_id, title=title, company=slug,
-                    location=location, url=job_url, raw_text=raw_text,
+                if _insert_scraped_job(
                     source="workable",
-                ), profile=profile):
+                    job_id=job_id,
+                    title=title,
+                    company=slug,
+                    location=location,
+                    url=job_url,
+                    raw_text=raw_text,
+                    profile=profile,
+                ):
                     new_jobs_saved += 1
                     company_new_count += 1
 
@@ -1262,6 +1335,34 @@ Description:
 HIMALAYAS_API_URL = "https://himalayas.app/jobs/api"
 
 
+def _himalayas_company(posting: Dict[str, Any]) -> str:
+    if posting.get("companyName"):
+        return str(posting["companyName"])
+
+    company_info = posting.get("company", {})
+    if isinstance(company_info, dict):
+        return str(company_info.get("name") or "Unknown")
+    if company_info:
+        return str(company_info)
+    return "Unknown"
+
+
+def _himalayas_location(posting: Dict[str, Any]) -> str:
+    location = posting.get("location")
+    if location:
+        return str(location)
+
+    restrictions = posting.get("locationRestrictions") or []
+    if restrictions:
+        return " | ".join(str(item) for item in restrictions)
+
+    return "Remote"
+
+
+def _himalayas_url(posting: Dict[str, Any]) -> str:
+    return str(posting.get("applicationLink") or posting.get("url") or posting.get("guid") or "")
+
+
 def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Scrape Himalayas remote job feed (no company list — feed-based like HN).
@@ -1271,7 +1372,7 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
 
     preferences = config.get('preferences', {})
 
-    preferred_titles = preferences.get('titles', [])
+    preferred_titles = _preferred_titles(config)
     hard_no_keywords = preferences.get('hard_no_keywords', [])
     max_job_age_days = _configured_max_job_age_days(config)
     max_age = timedelta(days=max_job_age_days)
@@ -1304,26 +1405,13 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
         logger.info("Himalayas: %d jobs returned", len(postings))
 
         for posting in postings:
-            # Date filter
-            pub_date = posting.get("pubDate")
-            if pub_date:
-                try:
-                    from datetime import timezone
-                    pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                    if datetime.now(tz=timezone.utc) - pub_dt > max_age:
-                        continue
-                except (ValueError, TypeError):
-                    pass
+            if _is_posted_at_older_than(posting.get("pubDate"), max_age):
+                continue
 
             title = posting.get("title", "")
-            company_info = posting.get("company", {})
-            company_name = (
-                company_info.get("name", "Unknown")
-                if isinstance(company_info, dict)
-                else str(company_info)
-            )
-            location = posting.get("location", "Remote") or "Remote"
-            job_url = posting.get("url", "")
+            company_name = _himalayas_company(posting)
+            location = _himalayas_location(posting)
+            job_url = _himalayas_url(posting)
 
             if not title_matches(title, preferred_titles):
                 jobs_filtered += 1
@@ -1332,15 +1420,13 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
             description = posting.get("description", "") or ""
             description_clean = strip_html(description)
 
-            raw_text = f"""Title: {title}
-Company: {company_name}
-Location: {location}
-URL: {job_url}
-
-Description:
-{description_clean}""".strip()
-
-            raw_text = extract_job_context(raw_text, max_chars=2000)
+            raw_text = _build_raw_text(
+                title=title,
+                company=company_name,
+                location=location,
+                url=job_url,
+                description=description_clean,
+            )
 
             full_text = title + " " + description_clean
             jobs_scraped += 1
@@ -1353,19 +1439,29 @@ Description:
             passed, filter_reason = passes_filters(full_text, title, location, config, source="himalayas", debug=True)
             if not passed:
                 jobs_filtered += 1
-                insert_job(Job(
-                    id=job_id, title=title, company=company_name,
-                    location=location, url=job_url, raw_text=raw_text,
-                    source="himalayas", scrape_qualified=0,
-                    scrape_filter_reason=filter_reason,
-                ), profile=profile)
+                _insert_scraped_job(
+                    source="himalayas",
+                    job_id=job_id,
+                    title=title,
+                    company=company_name,
+                    location=location,
+                    url=job_url,
+                    raw_text=raw_text,
+                    profile=profile,
+                    filter_reason=filter_reason,
+                )
                 continue
 
-            if insert_job(Job(
-                id=job_id, title=title, company=company_name,
-                location=location, url=job_url, raw_text=raw_text,
+            if _insert_scraped_job(
                 source="himalayas",
-            ), profile=profile):
+                job_id=job_id,
+                title=title,
+                company=company_name,
+                location=location,
+                url=job_url,
+                raw_text=raw_text,
+                profile=profile,
+            ):
                 new_jobs_saved += 1
 
     except Exception as e:

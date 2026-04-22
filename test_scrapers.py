@@ -121,7 +121,7 @@ def test_resolve_ashby_slug_returns_none_on_404(monkeypatch):
 def test_resolve_workable_slug_returns_valid(monkeypatch):
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {"results": []}
+    mock_resp.json.return_value = {"jobs": []}
 
     monkeypatch.setattr("theirstack.httpx.get", lambda url, timeout: mock_resp)
     monkeypatch.setattr("theirstack.time.sleep", lambda _: None)
@@ -304,15 +304,19 @@ def test_scrape_ashby_strips_html_from_description(mock_client, mock_insert, moc
 # ── scrape_workable ────────────────────────────────────────────────────────────
 
 def _workable_posting(title="Software Engineer", telecommuting=True, country="US", days_old=1, posting_id="wk1"):
-    created = (datetime.now(timezone.utc) - timedelta(days=days_old)).isoformat()
+    created = (datetime.now(timezone.utc) - timedelta(days=days_old)).date().isoformat()
     return {
-        "id": posting_id,
+        "shortcode": posting_id,
         "title": title,
-        "location": {"city": "New York", "country": country, "telecommuting": telecommuting},
+        "city": "New York",
+        "state": "NY",
+        "country": country,
         "telecommuting": telecommuting,
         "url": f"https://apply.workable.com/company/jobs/{posting_id}",
         "description": "<p>We need a <b>Python</b> developer.</p>",
-        "created_at": created,
+        "published_on": created,
+        "department": "Engineering",
+        "employment_type": "Full-time",
     }
 
 
@@ -322,7 +326,7 @@ def _workable_posting(title="Software Engineer", telecommuting=True, country="US
 def test_scrape_workable_saves_matching_job(mock_client, mock_insert, mock_init):
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"results": [_workable_posting()]}
+    resp.json.return_value = {"jobs": [_workable_posting()]}
     mock_client.return_value.__enter__.return_value.get.return_value = resp
 
     result = scrape_workable(_base_config(), slugs=["acme"])
@@ -337,7 +341,7 @@ def test_scrape_workable_saves_matching_job(mock_client, mock_insert, mock_init)
 def test_scrape_workable_telecommuting_sets_remote_location(mock_client, mock_insert, mock_init):
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"results": [_workable_posting(telecommuting=True)]}
+    resp.json.return_value = {"jobs": [_workable_posting(telecommuting=True)]}
     mock_client.return_value.__enter__.return_value.get.return_value = resp
 
     scrape_workable(_base_config(), slugs=["acme"])
@@ -352,7 +356,7 @@ def test_scrape_workable_telecommuting_sets_remote_location(mock_client, mock_in
 def test_scrape_workable_non_us_filtered(mock_client, mock_insert, mock_init):
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"results": [_workable_posting(telecommuting=False, country="Germany")]}
+    resp.json.return_value = {"jobs": [_workable_posting(telecommuting=False, country="Germany")]}
     mock_client.return_value.__enter__.return_value.get.return_value = resp
 
     result = scrape_workable(_base_config(), slugs=["acme"])
@@ -366,7 +370,7 @@ def test_scrape_workable_non_us_filtered(mock_client, mock_insert, mock_init):
 def test_scrape_workable_filters_old_jobs(mock_client, mock_insert, mock_init):
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"results": [_workable_posting(days_old=60)]}
+    resp.json.return_value = {"jobs": [_workable_posting(days_old=60)]}
     mock_client.return_value.__enter__.return_value.get.return_value = resp
 
     result = scrape_workable(_base_config(max_age_days=30), slugs=["acme"])
@@ -381,7 +385,7 @@ def test_scrape_workable_filters_old_jobs(mock_client, mock_insert, mock_init):
 def test_scrape_workable_dedup(mock_client, mock_insert, mock_init):
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"results": [_workable_posting()]}
+    resp.json.return_value = {"jobs": [_workable_posting()]}
     mock_client.return_value.__enter__.return_value.get.return_value = resp
 
     result = scrape_workable(_base_config(), slugs=["acme"])
@@ -397,7 +401,7 @@ def test_scrape_workable_strips_html(mock_client, mock_insert, mock_init):
     posting["description"] = "<b>Strong</b> Python skills required."
     resp = MagicMock()
     resp.status_code = 200
-    resp.json.return_value = {"results": [posting]}
+    resp.json.return_value = {"jobs": [posting]}
     mock_client.return_value.__enter__.return_value.get.return_value = resp
 
     scrape_workable(_base_config(), slugs=["acme"])
@@ -409,13 +413,13 @@ def test_scrape_workable_strips_html(mock_client, mock_insert, mock_init):
 # ── scrape_himalayas ───────────────────────────────────────────────────────────
 
 def _himalayas_posting(title="Software Engineer", days_old=1, posting_id="him1"):
-    pub = (datetime.now(timezone.utc) - timedelta(days=days_old)).isoformat()
+    pub = int((datetime.now(timezone.utc) - timedelta(days=days_old)).timestamp())
     return {
-        "id": posting_id,
+        "guid": f"https://himalayas.app/jobs/{posting_id}",
         "title": title,
-        "company": {"name": "RemoteCo"},
-        "location": "Remote",
-        "url": f"https://himalayas.app/jobs/{posting_id}",
+        "companyName": "RemoteCo",
+        "locationRestrictions": ["United States"],
+        "applicationLink": f"https://himalayas.app/jobs/{posting_id}",
         "description": "<p>We need a <b>Python</b> developer.</p>",
         "pubDate": pub,
     }
@@ -435,6 +439,10 @@ def test_scrape_himalayas_saves_matching_job(mock_client, mock_insert, mock_init
     assert result["new_jobs_saved"] == 1
     assert result["thread_found"] is True
     assert result["errors"] == []
+    job = mock_insert.call_args[0][0]
+    assert job.company == "RemoteCo"
+    assert job.location == "United States"
+    assert job.url == "https://himalayas.app/jobs/him1"
 
 
 @patch("scraper.init_db")

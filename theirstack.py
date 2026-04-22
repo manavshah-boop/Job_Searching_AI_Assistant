@@ -135,12 +135,12 @@ def resolve_workable_slug(company: dict) -> Optional[str]:
     for slug in candidates:
         try:
             resp = httpx.get(
-                f"https://apply.workable.com/api/v3/accounts/{slug}/jobs",
+                f"https://apply.workable.com/api/v1/widget/accounts/{slug}",
                 timeout=5,
             )
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get("results") is not None:
+                if data.get("jobs") is not None:
                     return slug
         except Exception:
             continue
