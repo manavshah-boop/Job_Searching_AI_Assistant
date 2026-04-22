@@ -41,10 +41,11 @@ def test_build_jobs_table_frame_returns_expected_columns_and_values():
         "Job status",
         "Score state",
         "Fit",
-        "ATS",
-        "Summary",
-        "Posting",
-    ]
+            "ATS",
+            "Summary",
+            "Posting",
+            "Filter reason",
+        ]
     assert frame.iloc[0].to_dict() == {
         "id": "job-1",
         "Title": "Backend Engineer",
@@ -57,6 +58,7 @@ def test_build_jobs_table_frame_returns_expected_columns_and_values():
         "ATS": 76,
         "Summary": "Strong match for Python backend work.",
         "Posting": "https://example.com/job-1",
+        "Filter reason": "",
     }
     assert str(frame["Fit"].dtype) == "Int64"
     assert str(frame["ATS"].dtype) == "Int64"

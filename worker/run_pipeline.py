@@ -128,8 +128,11 @@ def _enabled_sources(config: dict) -> dict:
     sources = config.get("sources", {})
     return {
         "greenhouse": sources.get("greenhouse", {}).get("enabled", True),
-        "lever": sources.get("lever", {}).get("enabled", True),
-        "hackernews": sources.get("hn", {}).get("enabled", False),
+        "lever":      sources.get("lever",      {}).get("enabled", True),
+        "hackernews": sources.get("hn",         {}).get("enabled", False),
+        "ashby":      sources.get("ashby",      {}).get("enabled", False),
+        "workable":   sources.get("workable",   {}).get("enabled", False),
+        "himalayas":  sources.get("himalayas",  {}).get("enabled", False),
     }
 
 
@@ -142,7 +145,7 @@ def _run(profile: str, tracker) -> int:
     from config import load_config
     from db import finish_run, init_db, start_run
     from progress_tracker import ActivityType, Stage
-    from scraper import scrape_greenhouse, scrape_hn, scrape_lever
+    from scraper import scrape_ashby, scrape_greenhouse, scrape_himalayas, scrape_hn, scrape_lever, scrape_workable
     from scorer import RateLimitReached, score_all_jobs
     from theirstack import get_or_discover_slugs
 
@@ -164,13 +167,15 @@ def _run(profile: str, tracker) -> int:
     tracker.start_stage(Stage.DISCOVERING)
     _write_progress(profile, tracker)
 
-    slug_map = {"greenhouse": [], "lever": []}
-    if enabled["greenhouse"] or enabled["lever"]:
+    slug_map = {"greenhouse": [], "lever": [], "ashby": [], "workable": []}
+    if enabled["greenhouse"] or enabled["lever"] or enabled["ashby"] or enabled["workable"]:
         slug_map = get_or_discover_slugs(config, profile=profile)
         tracker.set_stage_metrics(
             Stage.DISCOVERING,
             greenhouse=len(slug_map.get("greenhouse", [])),
             lever=len(slug_map.get("lever", [])),
+            ashby=len(slug_map.get("ashby", [])),
+            workable=len(slug_map.get("workable", [])),
         )
     tracker.complete_stage(Stage.DISCOVERING)
 
@@ -218,6 +223,48 @@ def _run(profile: str, tracker) -> int:
         total_saved += result.get("new_jobs_saved", 0)
         tracker.complete_source("HN Who's Hiring", jobs_found=result.get("new_jobs_saved", 0))
         tracker.set_stage_metrics(Stage.FETCHING, hn_new=result.get("new_jobs_saved", 0))
+        _write_progress(profile, tracker)
+
+    if enabled["ashby"]:
+        tracker.register_source(
+            "Ashby",
+            len(config.get("sources", {}).get("ashby", {}).get("companies", [])),
+        )
+        tracker.start_source("Ashby")
+        result = scrape_ashby(config, slugs=slug_map["ashby"], profile=profile)
+        total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
+        tracker.complete_source("Ashby", jobs_found=result.get("new_jobs_saved", 0))
+        tracker.set_stage_metrics(Stage.FETCHING, ashby_new=result.get("new_jobs_saved", 0))
+        _write_progress(profile, tracker)
+
+    if enabled["workable"]:
+        tracker.register_source(
+            "Workable",
+            len(config.get("sources", {}).get("workable", {}).get("companies", [])),
+        )
+        tracker.start_source("Workable")
+        result = scrape_workable(config, slugs=slug_map["workable"], profile=profile)
+        total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
+        tracker.complete_source("Workable", jobs_found=result.get("new_jobs_saved", 0))
+        tracker.set_stage_metrics(Stage.FETCHING, workable_new=result.get("new_jobs_saved", 0))
+        _write_progress(profile, tracker)
+
+    if enabled["himalayas"]:
+        tracker.register_source("Himalayas", 1)
+        tracker.start_source("Himalayas")
+        result = scrape_himalayas(config, profile=profile)
+        total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
+        tracker.complete_source("Himalayas", jobs_found=result.get("new_jobs_saved", 0))
+        tracker.set_stage_metrics(Stage.FETCHING, himalayas_new=result.get("new_jobs_saved", 0))
         _write_progress(profile, tracker)
 
     tracker.complete_stage(Stage.FETCHING)

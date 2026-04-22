@@ -374,7 +374,7 @@ def count_jobs(profile: Optional[str] = None) -> dict:
 
 # ── Discovered slugs (TheirStack cache) ──────────────────────────────────────
 
-_VALID_ATS = {"greenhouse", "lever"}
+_VALID_ATS = {"greenhouse", "lever", "ashby", "workable"}
 
 
 def _ensure_discovered_slugs_table(conn: sqlite3.Connection, ats: str) -> None:

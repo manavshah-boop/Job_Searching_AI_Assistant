@@ -19,7 +19,7 @@ matches. Two users (Manav + sister), fully isolated profiles, deployed to GCP.
 
 | Step | Status | Description |
 |---|---|---|
-| 1-5 | ✅ | Skeleton, scrapers, LLM scorer, TheirStack, main.py |
+| 1-5 | ✅ | Skeleton, scrapers, LLM scorer, main.py |
 | 6 | ✅ | Profile system + Streamlit onboarding |
 | 7 | ✅ | Streamlit dashboard with sidebar, 5-section nav |
 | 8 | ✅ | Pydantic models + instructor structured output |
@@ -38,12 +38,12 @@ job-agent/
 ├── config.yaml              # root config — CLI fallback when no --profile
 ├── db.py                    # SQLite, profile-aware, all DB logic
 ├── config.py                # load_config() with PyPDF2 resume extraction
-├── scraper.py               # Greenhouse + Lever + HN scrapers
+├── scraper.py               # Greenhouse + Lever + HN + Ashby + Workable + Himalayas scrapers
 ├── scorer.py                # LLM pipeline, RateLimiter, instructor integration
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
-├── theirstack.py            # company discovery, slug resolution GH + Lever
+├── theirstack.py            # slug resolution utilities for GH, Lever, Ashby, Workable; get_or_discover_slugs()
 ├── models.py                # Pydantic: ScoreResult, StructuredProfile, ScoringWeights
 ├── progress_tracker.py      # ProgressTracker + dataclasses with to_dict/from_dict
 ├── main.py                  # CLI orchestrator (unchanged CLI interface)
@@ -318,7 +318,7 @@ Key functions (all accept `profile=None`):
 - `count_jobs(profile=None) -> dict` — {total, scored} (includes disqualified in total)
 - `rescore_reset(profile=None)` — clears scores, resets score_attempts to 0
 - `update_job_status(job_id, status, profile=None)`
-- `save_discovered_slug(slug, company_name, ats, profile=None)`
+- `save_discovered_slug(slug, company_name, ats, profile=None)` — valid ats: greenhouse, lever, ashby, workable
 - `load_discovered_slugs(ats, profile=None) -> list[str]`
 - `increment_score_attempts(job_id, profile=None)`
 - `write_score_error(job_id, error, profile=None)`
@@ -416,6 +416,14 @@ sources:
   lever:
     enabled: true
     companies: [stripe, linear, vercel, ...]
+  ashby:
+    enabled: true
+    companies: [linear, vercel, retool, ...]   # YC/growth startups; same slug shape as GH/Lever
+  workable:
+    enabled: false
+    companies: []
+  himalayas:
+    enabled: false   # remote-only feed; no company list needed
   hn:
     enabled: true   # key is "hn" not "hackernews" in sources
 
@@ -474,7 +482,6 @@ GROQ_API_KEY=
 ANTHROPIC_API_KEY=
 GEMINI_API_KEY=
 OPENAI_API_KEY=
-THEIRSTACK_API_KEY=
 ```
 
 Resolution order: `{KEY}_{PROFILE_UPPER}` → `{KEY}` (fallback).

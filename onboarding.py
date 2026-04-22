@@ -333,12 +333,29 @@ def generate_config(data: Dict[str, Any]) -> dict:
     sources = {
         "greenhouse": {
             "enabled": True,
-            "companies": ["anthropic", "stripe", "figma", "databricks"],
+            "companies": data.get("gh_companies", ["anthropic", "stripe", "figma", "databricks"]),
         },
         "lever": {
             "enabled": True,
-            "companies": ["stripe", "linear", "vercel", "notion", "retool",
-                          "figma", "rippling", "brex", "ramp", "scale"],
+            "companies": data.get("lv_companies", [
+                "stripe", "linear", "vercel", "notion", "retool",
+                "figma", "rippling", "brex", "ramp", "scale",
+            ]),
+        },
+        "ashby": {
+            "enabled": bool(data.get("ashby_companies")),
+            "companies": data.get("ashby_companies", [
+                "linear", "vercel", "retool", "notion", "rippling", "brex", "ramp",
+                "scale-ai", "weights-biases", "cohere", "mistral", "perplexity",
+                "cursor", "replit", "harvey", "glean", "vanta", "drata", "merge", "finch",
+            ]),
+        },
+        "workable": {
+            "enabled": False,
+            "companies": data.get("wl_companies", []),
+        },
+        "himalayas": {
+            "enabled": bool(data.get("himalayas_enabled", False)),
         },
     }
 
@@ -977,6 +994,32 @@ def _step_preferences() -> None:
                         help="Optional. Leave blank if you only care that the role is paid.",
                     )
 
+        _DEFAULT_ASHBY_COMPANIES = [
+            "linear", "vercel", "retool", "notion", "rippling", "brex", "ramp",
+            "scale-ai", "weights-biases", "cohere", "mistral", "perplexity",
+            "cursor", "replit", "harvey", "glean", "vanta", "drata", "merge", "finch",
+        ]
+        with panel("Source company lists", subtitle="Ashby and Workable require a list of company slugs to scrape"):
+            ashby_default = data.get("ashby_companies", _DEFAULT_ASHBY_COMPANIES)
+            ashby_text = st.text_area(
+                "Ashby companies (one slug per line)",
+                value="\n".join(ashby_default),
+                height=160,
+                help="YC-backed and growth startups commonly use Ashby. Pre-populated with known companies.",
+            )
+            wl_default = data.get("wl_companies", [])
+            wl_text = st.text_area(
+                "Workable companies (one slug per line)",
+                value="\n".join(wl_default),
+                height=100,
+                help="Add company slugs for any companies using Workable's job board.",
+            )
+            himalayas_enabled = st.checkbox(
+                "Enable Himalayas (remote-only feed)",
+                value=bool(data.get("himalayas_enabled", False)),
+                help="Pulls remote-only jobs from himalayas.app. No company list needed.",
+            )
+
     clicked = _setup_step_navigation(2, "setup_step3_next", "Continue to AI provider", meta="Settings here can always be refined after setup.")
     if clicked == "back":
         st.session_state.onboarding_step = 2
@@ -990,6 +1033,9 @@ def _step_preferences() -> None:
         data["hard_no_keywords"] = _lines_to_list(hard_no_text)
         data["remote_ok"] = remote_ok
         data["preferred_locations"] = all_locations
+        data["ashby_companies"]  = _lines_to_list(ashby_text)
+        data["wl_companies"]     = _lines_to_list(wl_text)
+        data["himalayas_enabled"] = himalayas_enabled
         if not is_intern:
             data["yoe"] = int(yoe)
             data["min_salary"] = int(min_salary)

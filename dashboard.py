@@ -90,6 +90,9 @@ SOURCE_LABELS = {
     "greenhouse": "Greenhouse",
     "lever": "Lever",
     "hackernews": "HN Who's Hiring",
+    "ashby": "Ashby",
+    "workable": "Workable",
+    "himalayas": "Himalayas",
 }
 
 SECTION_ORDER = ["Overview", "Jobs", "Activity", "Profile", "Settings"]
@@ -593,8 +596,11 @@ def _enabled_sources(config: dict[str, Any]) -> dict[str, bool]:
     sources = config.get("sources", {})
     return {
         "greenhouse": sources.get("greenhouse", {}).get("enabled", True),
-        "lever": sources.get("lever", {}).get("enabled", True),
-        "hackernews": sources.get("hn", {}).get("enabled", False),
+        "lever":      sources.get("lever",      {}).get("enabled", True),
+        "hackernews": sources.get("hn",         {}).get("enabled", False),
+        "ashby":      sources.get("ashby",      {}).get("enabled", False),
+        "workable":   sources.get("workable",   {}).get("enabled", False),
+        "himalayas":  sources.get("himalayas",  {}).get("enabled", False),
     }
 
 
@@ -1895,10 +1901,17 @@ def _render_activity_tab(slug: str, runs: list[dict[str, Any]], metrics: dict[st
             else:
                 empty_state("No source data yet", "Start discovery to populate source-level metrics.")
 
-        with panel("Cached ATS slugs", subtitle="Discovery cache health for Greenhouse and Lever"):
-            gh_slugs = load_discovered_slugs(ats="greenhouse", profile=slug)
-            lv_slugs = load_discovered_slugs(ats="lever", profile=slug)
-            stat_row([("Greenhouse cache", len(gh_slugs)), ("Lever cache", len(lv_slugs))])
+        with panel("Cached ATS slugs", subtitle="Discovery cache health for Greenhouse, Lever, Ashby, and Workable"):
+            gh_slugs   = load_discovered_slugs(ats="greenhouse", profile=slug)
+            lv_slugs   = load_discovered_slugs(ats="lever",      profile=slug)
+            ash_slugs  = load_discovered_slugs(ats="ashby",      profile=slug)
+            wl_slugs   = load_discovered_slugs(ats="workable",   profile=slug)
+            stat_row([
+                ("Greenhouse cache", len(gh_slugs)),
+                ("Lever cache",      len(lv_slugs)),
+                ("Ashby cache",      len(ash_slugs)),
+                ("Workable cache",   len(wl_slugs)),
+            ])
 
 
 def _render_top_matches(records: list[dict[str, Any]]) -> None:
@@ -2548,12 +2561,16 @@ def _render_activity_tab(
                     st.write("No breakdown available.")
 
         with st.expander("Advanced details", expanded=False):
-            gh_slugs = load_discovered_slugs(ats="greenhouse", profile=slug)
-            lv_slugs = load_discovered_slugs(ats="lever", profile=slug)
+            gh_slugs  = load_discovered_slugs(ats="greenhouse", profile=slug)
+            lv_slugs  = load_discovered_slugs(ats="lever",      profile=slug)
+            ash_slugs = load_discovered_slugs(ats="ashby",      profile=slug)
+            wl_slugs  = load_discovered_slugs(ats="workable",   profile=slug)
             _render_summary_list(
                 [
                     ("Greenhouse cache", len(gh_slugs)),
-                    ("Lever cache", len(lv_slugs)),
+                    ("Lever cache",      len(lv_slugs)),
+                    ("Ashby cache",      len(ash_slugs)),
+                    ("Workable cache",   len(wl_slugs)),
                 ]
             )
 
@@ -2671,7 +2688,7 @@ def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str,
             with panel("Source configuration", subtitle="Enabled source coverage for future runs"):
                 source_lines: list[str] = []
                 for source_name, source_cfg in raw_config.get("sources", {}).items():
-                    if source_name in {"greenhouse", "lever"}:
+                    if source_name in {"greenhouse", "lever", "ashby", "workable"}:
                         companies = source_cfg.get("companies", [])
                         source_lines.append(
                             f"{source_name.title()}: {'Enabled' if source_cfg.get('enabled', True) else 'Off'} ({len(companies)} companies)"
@@ -2698,9 +2715,12 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
     editable["preferences"].setdefault("location", {})
     editable["preferences"].setdefault("compensation", {})
     editable.setdefault("sources", {})
-    editable["sources"].setdefault("greenhouse", {"enabled": True, "companies": []})
-    editable["sources"].setdefault("lever", {"enabled": True, "companies": []})
-    editable["sources"].setdefault("hn", {"enabled": False})
+    editable["sources"].setdefault("greenhouse", {"enabled": True,  "companies": []})
+    editable["sources"].setdefault("lever",      {"enabled": True,  "companies": []})
+    editable["sources"].setdefault("hn",         {"enabled": False})
+    editable["sources"].setdefault("ashby",      {"enabled": False, "companies": []})
+    editable["sources"].setdefault("workable",   {"enabled": False, "companies": []})
+    editable["sources"].setdefault("himalayas",  {"enabled": False})
     with section_shell("Settings", SECTION_COPY["Settings"]):
         location_defaults = editable["preferences"]["location"].get("preferred_locations", [])
         location_options = sorted({*LOCATION_PICKER_OPTIONS, *location_defaults})
@@ -2746,9 +2766,21 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                     "Lever",
                     value=bool(editable["sources"]["lever"].get("enabled", True)),
                 )
+                ash_enabled = st.checkbox(
+                    "Ashby",
+                    value=bool(editable["sources"]["ashby"].get("enabled", False)),
+                )
+                wl_enabled = st.checkbox(
+                    "Workable",
+                    value=bool(editable["sources"]["workable"].get("enabled", False)),
+                )
                 hn_enabled = st.checkbox(
                     "HN Who's Hiring",
                     value=bool(editable["sources"]["hn"].get("enabled", False)),
+                )
+                him_enabled = st.checkbox(
+                    "Himalayas (remote-only)",
+                    value=bool(editable["sources"]["himalayas"].get("enabled", False)),
                 )
 
         with st.expander("Matching rules", expanded=False):
@@ -2756,13 +2788,17 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
             titles_default = editable["preferences"].get("titles", [])
             skills_default = editable["preferences"].get("desired_skills", [])
             hard_no_default = editable["preferences"].get("hard_no_keywords", [])
-            gh_companies_default = editable["sources"]["greenhouse"].get("companies", [])
-            lv_companies_default = editable["sources"]["lever"].get("companies", [])
-            titles_text = "\n".join(titles_default)
-            skills_text = "\n".join(skills_default)
-            hard_no_text = "\n".join(hard_no_default)
-            gh_companies = "\n".join(gh_companies_default)
-            lv_companies = "\n".join(lv_companies_default)
+            gh_companies_default  = editable["sources"]["greenhouse"].get("companies", [])
+            lv_companies_default  = editable["sources"]["lever"].get("companies", [])
+            ash_companies_default = editable["sources"]["ashby"].get("companies", [])
+            wl_companies_default  = editable["sources"]["workable"].get("companies", [])
+            titles_text   = "\n".join(titles_default)
+            skills_text   = "\n".join(skills_default)
+            hard_no_text  = "\n".join(hard_no_default)
+            gh_companies  = "\n".join(gh_companies_default)
+            lv_companies  = "\n".join(lv_companies_default)
+            ash_companies = "\n".join(ash_companies_default)
+            wl_companies  = "\n".join(wl_companies_default)
             edit_matching_rules = st.toggle(
                 "Edit matching rules",
                 key=f"edit_matching_rules_{slug}",
@@ -2782,12 +2818,14 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
             if not edit_matching_rules:
                 _render_summary_list(
                     [
-                        ("Target titles", len(titles_default)),
-                        ("Desired skills", len(skills_default)),
-                        ("Hard-no keywords", len(hard_no_default)),
-                        (compensation_label, compensation_summary),
+                        ("Target titles",       len(titles_default)),
+                        ("Desired skills",       len(skills_default)),
+                        ("Hard-no keywords",     len(hard_no_default)),
+                        (compensation_label,     compensation_summary),
                         ("Greenhouse companies", len(gh_companies_default)),
-                        ("Lever companies", len(lv_companies_default)),
+                        ("Lever companies",      len(lv_companies_default)),
+                        ("Ashby companies",      len(ash_companies_default)),
+                        ("Workable companies",   len(wl_companies_default)),
                     ]
                 )
                 st.caption("Target titles")
@@ -2826,8 +2864,10 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 else:
                     minimum_salary = st.number_input("Minimum salary", min_value=0, step=5000, value=salary_value, help="Used as a soft scoring preference, not a hard filter.")
                     monthly_stipend = None
-                gh_companies = st.text_area("Greenhouse companies", value=gh_companies, height=140, help="One company slug or name per line.")
-                lv_companies = st.text_area("Lever companies", value=lv_companies, height=140, help="One company slug or name per line.")
+                gh_companies  = st.text_area("Greenhouse companies",  value=gh_companies,  height=140, help="One company slug per line.")
+                lv_companies  = st.text_area("Lever companies",        value=lv_companies,  height=140, help="One company slug per line.")
+                ash_companies = st.text_area("Ashby companies",        value=ash_companies, height=140, help="One company slug per line.")
+                wl_companies  = st.text_area("Workable companies",     value=wl_companies,  height=140, help="One company slug per line.")
 
         submitted = st.button(
             "Save settings",
@@ -2857,14 +2897,19 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                     editable["preferences"]["compensation"]["monthly_stipend"] = parsed_monthly_stipend
             else:
                 editable["preferences"]["compensation"] = {"min_salary": int(minimum_salary or 0)}
-            editable["sources"]["greenhouse"]["enabled"] = gh_enabled
+            editable["sources"]["greenhouse"]["enabled"]  = gh_enabled
             editable["sources"]["greenhouse"]["companies"] = _lines_to_list(gh_companies)
-            editable["sources"]["lever"]["enabled"] = lv_enabled
-            editable["sources"]["lever"]["companies"] = _lines_to_list(lv_companies)
-            editable["sources"]["hn"]["enabled"] = hn_enabled
+            editable["sources"]["lever"]["enabled"]       = lv_enabled
+            editable["sources"]["lever"]["companies"]     = _lines_to_list(lv_companies)
+            editable["sources"]["ashby"]["enabled"]       = ash_enabled
+            editable["sources"]["ashby"]["companies"]     = _lines_to_list(ash_companies)
+            editable["sources"]["workable"]["enabled"]    = wl_enabled
+            editable["sources"]["workable"]["companies"]  = _lines_to_list(wl_companies)
+            editable["sources"]["hn"]["enabled"]          = hn_enabled
+            editable["sources"]["himalayas"]["enabled"]   = him_enabled
 
-            if not any((gh_enabled, lv_enabled, hn_enabled)):
-                callout("error", "At least one source is required", "Enable Greenhouse, Lever, or HN Who's Hiring before saving.")
+            if not any((gh_enabled, lv_enabled, ash_enabled, wl_enabled, hn_enabled, him_enabled)):
+                callout("error", "At least one source is required", "Enable at least one source before saving.")
                 return
 
             _write_profile_config(slug, editable)

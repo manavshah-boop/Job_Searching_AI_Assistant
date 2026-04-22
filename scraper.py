@@ -14,7 +14,7 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from loguru import logger
 from db import Job, clear_discovered_slugs, init_db, insert_job, load_config, make_id
@@ -278,6 +278,40 @@ def _configured_max_job_age_days(config: Dict[str, Any]) -> int:
         return 30
 
 
+def _is_iso_timestamp_older_than(timestamp: Optional[str], max_age: timedelta) -> bool:
+    """Return True only when a parseable ISO timestamp is older than max_age."""
+    if not timestamp:
+        return False
+
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError, TypeError):
+        return False
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return datetime.now(tz=timezone.utc) - parsed.astimezone(timezone.utc) > max_age
+
+
+def _build_raw_text(
+    *,
+    title: str,
+    company: str,
+    location: str,
+    url: str,
+    description: str,
+    max_chars: int = 2000,
+) -> str:
+    raw_text = f"""Title: {title}
+Company: {company}
+Location: {location}
+URL: {url}
+
+Description:
+{description}""".strip()
+    return extract_job_context(raw_text, max_chars=max_chars)
+
+
 def passes_filters(
     text: str,
     title: str,
@@ -305,9 +339,13 @@ def passes_filters(
     text_lower = text.lower()
 
     # ------------------------------------------------------------------
-    # 1. Title blocklist (both sources; for HN also scan full text)
+    # 1. Title blocklist (structured sources check title only; HN scans full text)
     # ------------------------------------------------------------------
-    check_text = title_lower if source in ("greenhouse", "lever") else title_lower + " " + text_lower
+    check_text = (
+        title_lower
+        if source in ("greenhouse", "lever", "ashby", "workable", "himalayas")
+        else title_lower + " " + text_lower
+    )
     for blocked in title_blocklist:
         if re.search(r'\b' + re.escape(blocked) + r'\b', check_text):
             if debug:
@@ -371,7 +409,7 @@ def passes_filters(
     # ------------------------------------------------------------------
     # 5. US location filter
     # ------------------------------------------------------------------
-    if source in ("greenhouse", "lever"):
+    if source in ("greenhouse", "lever", "ashby", "workable", "himalayas"):
         # Use structured location field + comprehensive US detector
         if not _is_us_location(location):
             if debug:
@@ -869,10 +907,490 @@ Thread: {thread_title}
     }
 
 
+ASHBY_API_BASE = "https://api.ashbyhq.com/posting-api/job-board"
+
+
+def _ashby_slug_variants(company_slug: str) -> List[str]:
+    """Try the configured Ashby board name first, then common normalized variants."""
+    variants = []
+    for slug in (company_slug, company_slug.strip(), company_slug.strip().lower()):
+        if slug and slug not in variants:
+            variants.append(slug)
+    return variants
+
+
+def _ashby_location(posting: Dict[str, Any]) -> str:
+    location = posting.get("location") or posting.get("locationName")
+    if location:
+        return str(location)
+
+    secondary = posting.get("secondaryLocations") or []
+    secondary_names = [
+        str(item.get("location"))
+        for item in secondary
+        if isinstance(item, dict) and item.get("location")
+    ]
+    if secondary_names:
+        return " | ".join(secondary_names)
+
+    return "Unknown"
+
+
+def _ashby_description(posting: Dict[str, Any]) -> str:
+    description_plain = posting.get("descriptionPlain")
+    if description_plain:
+        return str(description_plain)
+    return strip_html(posting.get("descriptionHtml", "") or "")
+
+
+def _fetch_ashby_board(
+    client: httpx.Client,
+    company_slug: str,
+) -> tuple[Optional[httpx.Response], str, Optional[str]]:
+    """Fetch an Ashby board, trying exact and normalized slug variants."""
+    last_response = None
+    last_error = None
+
+    for slug_variant in _ashby_slug_variants(company_slug):
+        try:
+            response = client.get(f"{ASHBY_API_BASE}/{slug_variant}")
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+            continue
+
+        if response.status_code == 200:
+            return response, slug_variant, None
+        last_response = response
+
+    return last_response, company_slug, last_error
+
+
+def _insert_ashby_job(
+    *,
+    job_id: str,
+    title: str,
+    company: str,
+    location: str,
+    url: str,
+    raw_text: str,
+    profile: Optional[str],
+    filter_reason: str = "",
+) -> bool:
+    scrape_qualified = 0 if filter_reason else 1
+    return insert_job(Job(
+        id=job_id,
+        title=title,
+        company=company,
+        location=location,
+        url=url,
+        raw_text=raw_text,
+        source="ashby",
+        scrape_qualified=scrape_qualified,
+        scrape_filter_reason=filter_reason,
+    ), profile=profile)
+
+
+def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Scrape all configured Ashby companies.
+    Returns dict with: {companies_checked, new_jobs_saved, jobs_scraped, jobs_filtered, errors}
+    """
+    init_db(profile=profile)
+
+    companies = slugs if slugs is not None else []
+    preferences = config.get('preferences', {})
+    profile_info = config.get('profile', {})
+
+    preferred_titles = profile_info.get('titles') or preferences.get('titles', [])
+    hard_no_keywords = preferences.get('hard_no_keywords', [])
+    max_job_age_days = _configured_max_job_age_days(config)
+
+    companies_checked = 0
+    new_jobs_saved = 0
+    jobs_scraped = 0
+    jobs_filtered = 0
+    errors = []
+
+    logger.info("Scraping %s Ashby companies...", len(companies))
+    logger.info("Looking for: %s", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+
+    max_age = timedelta(days=max_job_age_days)
+
+    for company_slug in companies:
+        companies_checked += 1
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response, resolved_slug, fetch_error = _fetch_ashby_board(client, company_slug)
+
+            if response is None or response.status_code != 200:
+                status_code = response.status_code if response is not None else (fetch_error or "no response")
+                errors.append(f"[!] {company_slug}: HTTP {status_code}")
+                continue
+
+            data = response.json()
+            postings = data.get("jobs", data.get("jobPostings", []))
+            company_new_count = 0
+
+            for posting in postings:
+                if posting.get("isListed") is False:
+                    continue
+
+                published_at = posting.get("publishedAt") or posting.get("publishedDate")
+                if _is_iso_timestamp_older_than(published_at, max_age):
+                    continue
+
+                title = posting.get("title", "")
+                location = _ashby_location(posting)
+                job_url = posting.get("jobUrl", "")
+
+                if not title_matches(title, preferred_titles):
+                    continue
+
+                description_clean = _ashby_description(posting)
+                raw_text = _build_raw_text(
+                    title=title,
+                    company=resolved_slug.upper(),
+                    location=location,
+                    url=job_url,
+                    description=description_clean,
+                )
+                full_text = title + " " + description_clean
+                jobs_scraped += 1
+
+                if contains_hard_no_keyword(full_text, hard_no_keywords):
+                    jobs_filtered += 1
+                    continue
+
+                job_id = make_id("ashby", str(posting.get("id") or job_url))
+                passed, filter_reason = passes_filters(full_text, title, location, config, source="ashby", debug=True)
+                if not passed:
+                    jobs_filtered += 1
+                    _insert_ashby_job(
+                        job_id=job_id,
+                        title=title,
+                        company=resolved_slug,
+                        location=location,
+                        url=job_url,
+                        raw_text=raw_text,
+                        profile=profile,
+                        filter_reason=filter_reason,
+                    )
+                    continue
+
+                if _insert_ashby_job(
+                    job_id=job_id,
+                    title=title,
+                    company=resolved_slug,
+                    location=location,
+                    url=job_url,
+                    raw_text=raw_text,
+                    profile=profile,
+                ):
+                    new_jobs_saved += 1
+                    company_new_count += 1
+
+            status = "[+]" if company_new_count > 0 else "[-]"
+            logger.info("%s %s -> %d new jobs", status, company_slug, company_new_count)
+
+        except Exception as e:
+            errors.append(f"[!] {company_slug}: {str(e)}")
+            logger.error("%s %s -> ERROR: %s", "[!]", company_slug, str(e))
+
+    logger.info("Ashby companies checked: %d", companies_checked)
+    logger.info("New jobs saved: %d", new_jobs_saved)
+    if errors:
+        logger.warning("Errors (%d):", len(errors))
+        for error in errors:
+            logger.warning(error)
+
+    return {
+        'companies_checked': companies_checked,
+        'new_jobs_saved': new_jobs_saved,
+        'jobs_scraped': jobs_scraped,
+        'jobs_filtered': jobs_filtered,
+        'errors': errors,
+    }
+
+
+WORKABLE_API_BASE = "https://apply.workable.com/api/v3/accounts"
+
+
+def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Scrape all configured Workable companies.
+    Returns dict with: {companies_checked, new_jobs_saved, jobs_scraped, jobs_filtered, errors}
+    """
+    init_db(profile=profile)
+
+    companies = slugs if slugs is not None else []
+    preferences = config.get('preferences', {})
+
+    preferred_titles = preferences.get('titles', [])
+    hard_no_keywords = preferences.get('hard_no_keywords', [])
+    max_job_age_days = _configured_max_job_age_days(config)
+    max_age = timedelta(days=max_job_age_days)
+
+    companies_checked = 0
+    new_jobs_saved = 0
+    jobs_scraped = 0
+    jobs_filtered = 0
+    errors = []
+
+    logger.info("Scraping %s Workable companies...", len(companies))
+    logger.info("Looking for: %s", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+
+    for slug in companies:
+        companies_checked += 1
+        try:
+            url = f"{WORKABLE_API_BASE}/{slug}/jobs"
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url)
+
+            if response.status_code != 200:
+                errors.append(f"[!] {slug}: HTTP {response.status_code}")
+                continue
+
+            data = response.json()
+            postings = data.get("results", [])
+            if not isinstance(postings, list):
+                errors.append(f"[!] {slug}: unexpected response (not a list)")
+                continue
+
+            company_new_count = 0
+
+            for posting in postings:
+                # Date filter
+                created_at = posting.get("created_at")
+                if created_at:
+                    try:
+                        from datetime import timezone
+                        created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                        if datetime.now(tz=timezone.utc) - created_dt > max_age:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                title = posting.get("title", "")
+                location_data = posting.get("location", {})
+                telecommuting = posting.get("telecommuting", location_data.get("telecommuting", False))
+                city = location_data.get("city", "")
+                country = location_data.get("country", "")
+
+                # Derive effective location string; telecommuting=true -> Remote
+                if telecommuting:
+                    location = "Remote"
+                elif city and country:
+                    location = f"{city}, {country}"
+                elif city:
+                    location = city
+                elif country:
+                    location = country
+                else:
+                    location = "Unknown"
+
+                job_url = posting.get("url", "")
+
+                if not title_matches(title, preferred_titles):
+                    continue
+
+                description = posting.get("description", "") or ""
+                description_clean = strip_html(description)
+
+                workplace_note = "\nWorkplace: Remote" if telecommuting else ""
+                raw_text = f"""Title: {title}
+Company: {slug.upper()}
+Location: {location}{workplace_note}
+URL: {job_url}
+
+Description:
+{description_clean}""".strip()
+
+                raw_text = extract_job_context(raw_text, max_chars=2000)
+
+                full_text = title + " " + description_clean
+                jobs_scraped += 1
+
+                if contains_hard_no_keyword(full_text, hard_no_keywords):
+                    jobs_filtered += 1
+                    continue
+
+                job_id = make_id("workable", str(posting.get("id", "")))
+                passed, filter_reason = passes_filters(full_text, title, location, config, source="workable", debug=True)
+                if not passed:
+                    jobs_filtered += 1
+                    insert_job(Job(
+                        id=job_id, title=title, company=slug,
+                        location=location, url=job_url, raw_text=raw_text,
+                        source="workable", scrape_qualified=0,
+                        scrape_filter_reason=filter_reason,
+                    ), profile=profile)
+                    continue
+
+                if insert_job(Job(
+                    id=job_id, title=title, company=slug,
+                    location=location, url=job_url, raw_text=raw_text,
+                    source="workable",
+                ), profile=profile):
+                    new_jobs_saved += 1
+                    company_new_count += 1
+
+            status = "[+]" if company_new_count > 0 else "[-]"
+            logger.info("%s %s -> %d new jobs", status, slug, company_new_count)
+
+        except Exception as e:
+            errors.append(f"[!] {slug}: {str(e)}")
+            logger.error("%s %s -> ERROR: %s", "[!]", slug, str(e))
+
+    logger.info("Workable companies checked: %d", companies_checked)
+    logger.info("New jobs saved: %d", new_jobs_saved)
+    if errors:
+        logger.warning("Errors (%d):", len(errors))
+        for error in errors:
+            logger.warning(error)
+
+    return {
+        'companies_checked': companies_checked,
+        'new_jobs_saved': new_jobs_saved,
+        'jobs_scraped': jobs_scraped,
+        'jobs_filtered': jobs_filtered,
+        'errors': errors,
+    }
+
+
+HIMALAYAS_API_URL = "https://himalayas.app/jobs/api"
+
+
+def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Scrape Himalayas remote job feed (no company list — feed-based like HN).
+    Returns dict with: {thread_found, new_jobs_saved, jobs_scraped, jobs_filtered, errors}
+    """
+    init_db(profile=profile)
+
+    preferences = config.get('preferences', {})
+
+    preferred_titles = preferences.get('titles', [])
+    hard_no_keywords = preferences.get('hard_no_keywords', [])
+    max_job_age_days = _configured_max_job_age_days(config)
+    max_age = timedelta(days=max_job_age_days)
+
+    new_jobs_saved = 0
+    jobs_scraped = 0
+    jobs_filtered = 0
+    errors = []
+
+    logger.info("Scraping Himalayas remote jobs...")
+    logger.info("Looking for: %s", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(HIMALAYAS_API_URL)
+
+        if response.status_code != 200:
+            errors.append(f"[!] Himalayas: HTTP {response.status_code}")
+            return {
+                'thread_found': False,
+                'new_jobs_saved': 0,
+                'jobs_scraped': 0,
+                'jobs_filtered': 0,
+                'errors': errors,
+            }
+
+        data = response.json()
+        postings = data.get("jobs", [])
+        logger.info("Himalayas: %d jobs returned", len(postings))
+
+        for posting in postings:
+            # Date filter
+            pub_date = posting.get("pubDate")
+            if pub_date:
+                try:
+                    from datetime import timezone
+                    pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+                    if datetime.now(tz=timezone.utc) - pub_dt > max_age:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            title = posting.get("title", "")
+            company_info = posting.get("company", {})
+            company_name = (
+                company_info.get("name", "Unknown")
+                if isinstance(company_info, dict)
+                else str(company_info)
+            )
+            location = posting.get("location", "Remote") or "Remote"
+            job_url = posting.get("url", "")
+
+            if not title_matches(title, preferred_titles):
+                jobs_filtered += 1
+                continue
+
+            description = posting.get("description", "") or ""
+            description_clean = strip_html(description)
+
+            raw_text = f"""Title: {title}
+Company: {company_name}
+Location: {location}
+URL: {job_url}
+
+Description:
+{description_clean}""".strip()
+
+            raw_text = extract_job_context(raw_text, max_chars=2000)
+
+            full_text = title + " " + description_clean
+            jobs_scraped += 1
+
+            if contains_hard_no_keyword(full_text, hard_no_keywords):
+                jobs_filtered += 1
+                continue
+
+            job_id = make_id("himalayas", str(posting.get("id", job_url)))
+            passed, filter_reason = passes_filters(full_text, title, location, config, source="himalayas", debug=True)
+            if not passed:
+                jobs_filtered += 1
+                insert_job(Job(
+                    id=job_id, title=title, company=company_name,
+                    location=location, url=job_url, raw_text=raw_text,
+                    source="himalayas", scrape_qualified=0,
+                    scrape_filter_reason=filter_reason,
+                ), profile=profile)
+                continue
+
+            if insert_job(Job(
+                id=job_id, title=title, company=company_name,
+                location=location, url=job_url, raw_text=raw_text,
+                source="himalayas",
+            ), profile=profile):
+                new_jobs_saved += 1
+
+    except Exception as e:
+        errors.append(f"[!] Himalayas: {str(e)}")
+        logger.error("Himalayas scraping error: %s", e)
+
+    logger.info("New Himalayas jobs saved: %d", new_jobs_saved)
+    if errors:
+        logger.warning("Errors (%d):", len(errors))
+        for error in errors:
+            logger.warning(error)
+
+    return {
+        'thread_found': len(errors) == 0,
+        'new_jobs_saved': new_jobs_saved,
+        'jobs_scraped': jobs_scraped,
+        'jobs_filtered': jobs_filtered,
+        'errors': errors,
+    }
+
+
 if __name__ == "__main__":
     if "--refresh-slugs" in sys.argv:
-        clear_discovered_slugs()  # clears both greenhouse and lever tables
-        print("Slug cache cleared (greenhouse + lever) — TheirStack will re-discover on next run.")
+        clear_discovered_slugs()  # clears all ATS slug cache tables
+        print("Slug cache cleared — re-populate by running the pipeline.")
 
     config = load_config()
     print("Choose scraper:")

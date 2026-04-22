@@ -1,73 +1,96 @@
 import dashboard
+from progress_tracker import ProgressTracker
+from worker import run_pipeline
 
 
 def test_run_pipeline_passes_profile_to_all_profile_scoped_calls(monkeypatch):
     calls = []
+    config = {
+        "sources": {
+            "greenhouse": {"enabled": True, "companies": ["gh-co"]},
+            "lever": {"enabled": True, "companies": ["lv-co"]},
+            "hn": {"enabled": True},
+            "ashby": {"enabled": True, "companies": ["ash-co"]},
+            "workable": {"enabled": True, "companies": ["wl-co"]},
+            "himalayas": {"enabled": True},
+        }
+    }
 
+    import config as config_module
+    import db
+    import scraper
+    import scorer
+    import theirstack
+
+    monkeypatch.setattr(config_module, "load_config", lambda profile=None: config)
+    monkeypatch.setattr(db, "init_db", lambda profile=None: calls.append(("init_db", profile)))
+    monkeypatch.setattr(db, "start_run", lambda profile=None, source=None: calls.append(("start_run", profile, source)) or 7)
+    monkeypatch.setattr(db, "finish_run", lambda run_id, **kwargs: calls.append(("finish_run", run_id, kwargs.get("profile"))))
+    monkeypatch.setattr(run_pipeline, "_write_progress", lambda profile, tracker: None)
     monkeypatch.setattr(
-        dashboard,
+        theirstack,
         "get_or_discover_slugs",
         lambda config, profile=None: calls.append(("slugs", profile)) or {
             "greenhouse": ["gh-co"],
             "lever": ["lv-co"],
+            "ashby": ["ash-co"],
+            "workable": ["wl-co"],
         },
     )
     monkeypatch.setattr(
-        dashboard,
+        scraper,
         "scrape_greenhouse",
-        lambda config, slugs=None, profile=None: calls.append(("greenhouse", tuple(slugs or ()), profile)) or {
-            "new_jobs_saved": 2,
-        },
+        lambda config, slugs=None, profile=None: calls.append(("greenhouse", tuple(slugs or ()), profile)) or {"new_jobs_saved": 2},
     )
     monkeypatch.setattr(
-        dashboard,
+        scraper,
         "scrape_lever",
-        lambda config, slugs=None, profile=None: calls.append(("lever", tuple(slugs or ()), profile)) or {
-            "new_jobs_saved": 3,
-        },
+        lambda config, slugs=None, profile=None: calls.append(("lever", tuple(slugs or ()), profile)) or {"new_jobs_saved": 3},
     )
     monkeypatch.setattr(
-        dashboard,
+        scraper,
         "scrape_hn",
-        lambda config, profile=None: calls.append(("hn", profile)) or {
-            "new_jobs_saved": 4,
-        },
+        lambda config, profile=None: calls.append(("hn", profile)) or {"new_jobs_saved": 4},
     )
     monkeypatch.setattr(
-        dashboard,
+        scraper,
+        "scrape_ashby",
+        lambda config, slugs=None, profile=None: calls.append(("ashby", tuple(slugs or ()), profile)) or {"new_jobs_saved": 5},
+    )
+    monkeypatch.setattr(
+        scraper,
+        "scrape_workable",
+        lambda config, slugs=None, profile=None: calls.append(("workable", tuple(slugs or ()), profile)) or {"new_jobs_saved": 6},
+    )
+    monkeypatch.setattr(
+        scraper,
+        "scrape_himalayas",
+        lambda config, profile=None: calls.append(("himalayas", profile)) or {"new_jobs_saved": 7},
+    )
+    monkeypatch.setattr(
+        scorer,
         "score_all_jobs",
-        lambda config, yes=False, profile=None: calls.append(("score", yes, profile)) or [
+        lambda config, yes=False, profile=None, on_job_scored=None: calls.append(("score", yes, profile)) or [
             {"fit_score": 80},
             {"fit_score": 0},
         ],
     )
-    monkeypatch.setattr(dashboard.st, "write", lambda *args, **kwargs: None)
-    monkeypatch.setattr(dashboard.st, "warning", lambda *args, **kwargs: None)
 
-    config = {
-        "sources": {
-            "greenhouse": {"enabled": True},
-            "lever": {"enabled": True},
-            "hn": {"enabled": True},
-        }
-    }
+    result = run_pipeline._run("default", ProgressTracker())
 
-    result = dashboard._run_pipeline(config, slug="default")
-
-    assert result == {
-        "total_new": 9,
-        "jobs_scraped": 0,
-        "jobs_filtered": 0,
-        "jobs_saved": 9,
-        "scored_count": 1,
-        "avg_fit": 80.0,
-    }
+    assert result == 1
     assert calls == [
+        ("init_db", "default"),
+        ("start_run", "default", "worker"),
         ("slugs", "default"),
         ("greenhouse", ("gh-co",), "default"),
         ("lever", ("lv-co",), "default"),
         ("hn", "default"),
+        ("ashby", ("ash-co",), "default"),
+        ("workable", ("wl-co",), "default"),
+        ("himalayas", "default"),
         ("score", True, "default"),
+        ("finish_run", 7, "default"),
     ]
 
 

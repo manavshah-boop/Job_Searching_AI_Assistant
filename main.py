@@ -26,7 +26,7 @@ load_dotenv()
 
 from db import count_jobs, init_db, load_config, rescore_reset, set_active_profile, start_run, finish_run
 from db import get_top_jobs
-from scraper import scrape_greenhouse, scrape_hn, scrape_lever
+from scraper import scrape_ashby, scrape_greenhouse, scrape_himalayas, scrape_hn, scrape_lever, scrape_workable
 from scorer import RateLimitReached, print_results, score_all_jobs
 from theirstack import get_or_discover_slugs
 from logging_config import configure_logging
@@ -92,22 +92,23 @@ def _print_banner(config: dict) -> None:
     model    = config["llm"]["model"].get(provider, "unknown")
     sources  = config.get("sources", {})
 
-    gh_enabled  = sources.get("greenhouse", {}).get("enabled", True)
-    lv_enabled  = sources.get("lever",      {}).get("enabled", True)
-    hn_enabled  = sources.get("hn",         {}).get("enabled", True)
-
-    gh_mark = "\u2713" if gh_enabled else "\u2717"
-    lv_mark = "\u2713" if lv_enabled else "\u2717"
-    hn_mark = "\u2713" if hn_enabled else "\u2717"
+    enabled_names = []
+    for key, label, default in [
+        ("greenhouse", "Greenhouse", True),
+        ("lever",      "Lever",      True),
+        ("hn",         "HN",         False),
+        ("ashby",      "Ashby",      False),
+        ("workable",   "Workable",   False),
+        ("himalayas",  "Himalayas",  False),
+    ]:
+        if sources.get(key, {}).get("enabled", default):
+            enabled_names.append(label)
 
     stats = count_jobs()
 
     logger.info("Job Agent")
     logger.info(f"Provider: {provider} ({model})")
-    logger.info(
-        f"Sources: Greenhouse {'yes' if gh_enabled else 'no'}  "
-        f"Lever {'yes' if lv_enabled else 'no'}  HN {'yes' if hn_enabled else 'no'}"
-    )
+    logger.info("Sources: %s", "  ".join(enabled_names) if enabled_names else "none")
     logger.info(f"DB: {stats['total']} jobs total, {stats['scored']} scored")
 
 
@@ -115,11 +116,14 @@ def _run_scrapers(config: dict, profile: str | None = None) -> dict:
     """Run all enabled scrapers. Returns combined stats."""
     sources = config.get("sources", {})
 
-    gh_enabled = sources.get("greenhouse", {}).get("enabled", True)
-    lv_enabled = sources.get("lever",      {}).get("enabled", True)
-    hn_enabled = sources.get("hn",         {}).get("enabled", True)
+    gh_enabled  = sources.get("greenhouse", {}).get("enabled", True)
+    lv_enabled  = sources.get("lever",      {}).get("enabled", True)
+    hn_enabled  = sources.get("hn",         {}).get("enabled", False)
+    ash_enabled = sources.get("ashby",      {}).get("enabled", False)
+    wl_enabled  = sources.get("workable",   {}).get("enabled", False)
+    him_enabled = sources.get("himalayas",  {}).get("enabled", False)
 
-    if not any([gh_enabled, lv_enabled, hn_enabled]):
+    if not any([gh_enabled, lv_enabled, hn_enabled, ash_enabled, wl_enabled, him_enabled]):
         logger.error("No sources are enabled in config.yaml. Nothing to scrape.")
         raise ValueError("No sources are enabled in config.yaml. Nothing to scrape.")
 
@@ -128,8 +132,8 @@ def _run_scrapers(config: dict, profile: str | None = None) -> dict:
     total_filtered = 0
     total_saved = 0
 
-    # Resolve slugs once for Greenhouse + Lever (includes TheirStack discovery)
-    if gh_enabled or lv_enabled:
+    # Resolve slugs once for all company-list ATS sources
+    if gh_enabled or lv_enabled or ash_enabled or wl_enabled:
         slug_map = get_or_discover_slugs(config, profile=profile)
 
     if gh_enabled:
@@ -146,8 +150,29 @@ def _run_scrapers(config: dict, profile: str | None = None) -> dict:
         total_filtered += result.get("jobs_filtered", 0)
         total_saved += result.get("new_jobs_saved", 0)
 
+    if ash_enabled:
+        result = scrape_ashby(config, slugs=slug_map["ashby"], profile=profile)
+        total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
+
+    if wl_enabled:
+        result = scrape_workable(config, slugs=slug_map["workable"], profile=profile)
+        total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
+
     if hn_enabled:
         result = scrape_hn(config, profile=profile)
+        total_new += result.get("new_jobs_saved", 0)
+        total_scraped += result.get("jobs_scraped", 0)
+        total_filtered += result.get("jobs_filtered", 0)
+        total_saved += result.get("new_jobs_saved", 0)
+
+    if him_enabled:
+        result = scrape_himalayas(config, profile=profile)
         total_new += result.get("new_jobs_saved", 0)
         total_scraped += result.get("jobs_scraped", 0)
         total_filtered += result.get("jobs_filtered", 0)

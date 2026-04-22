@@ -1,77 +1,19 @@
 """
-theirstack.py — Dynamic company discovery via TheirStack API.
+theirstack.py — Slug resolution utilities for Greenhouse, Lever, Ashby, and Workable.
 
-Discovers companies that use Greenhouse/Lever/Ashby, resolves their
-Greenhouse board slugs, and caches results in the DB so slug resolution
-(the slow part) only runs once per company.
-
-Only runs when THEIRSTACK_API_KEY is set — the scraper works fine without it
-using the priority list from config.yaml.
+Resolves ATS board slugs from company name/domain, and caches results in the DB.
+get_or_discover_slugs() merges the priority list from config.yaml with the DB cache —
+no external discovery calls are made.
 """
 
-import os
 import re
 import time
 from typing import Optional
 
 import httpx
-from dotenv import load_dotenv
 from loguru import logger
 
-load_dotenv()
-
-from db import load_discovered_slugs, save_discovered_slug
-
-
-def fetch_companies(config: dict) -> list:
-    """
-    Fetches companies from TheirStack that use Greenhouse/Lever/Ashby,
-    filtered to US-based, tech-adjacent, and reasonable size.
-    Returns list of {name, domain, country_code, employee_count, industry}
-    """
-    api_key = os.environ.get("THEIRSTACK_API_KEY")
-    if not api_key:
-        logger.debug("No THEIRSTACK_API_KEY found, skipping discovery")
-        return []
-
-    payload = {
-        "company_technology_slug_or": ["greenhouse", "lever", "ashby"],
-        "company_country_code_or": ["US"],
-        "min_employee_count": 10,
-        "max_employee_count": 5000,
-        "industry_or": [
-            "Technology, Information and Internet",
-            "Software Development",
-            "IT Services and IT Consulting",
-            "Computer and Network Security",
-            "Artificial Intelligence",
-            "Financial Services",
-            "Internet Marketplace Platforms",
-        ],
-        "order_by": [{"desc": True, "field": "num_jobs_last_30_days"}],
-        "limit": 25,  # free plan cap; upgrade for more
-        "page": 0,
-    }
-
-    try:
-        resp = httpx.post(
-            "https://api.theirstack.com/v1/companies/search",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-    except Exception as e:
-        logger.warning(f"TheirStack request failed: {e}")
-        return []
-
-    if resp.status_code != 200:
-        logger.warning(f"TheirStack API error: {resp.status_code} — {resp.text[:200]}")
-        return []
-
-    return resp.json().get("data", [])
+from db import load_discovered_slugs
 
 
 def _generate_slug_candidates(name: str, domain: str) -> list:
@@ -156,62 +98,109 @@ def resolve_lever_slug(company: dict) -> Optional[str]:
     return None
 
 
+def resolve_ashby_slug(company: dict) -> Optional[str]:
+    """
+    Attempts to find a valid Ashby board slug for a company.
+    Returns the first valid slug, or None if none work.
+    """
+    name = company.get("name", "")
+    domain = company.get("domain", "")
+    candidates = _generate_slug_candidates(name, domain)
+
+    for slug in candidates:
+        try:
+            resp = httpx.get(
+                f"https://api.ashbyhq.com/posting-api/job-board/{slug}",
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("jobs") is not None or data.get("jobPostings") is not None:
+                    return slug
+        except Exception:
+            continue
+        time.sleep(0.2)  # be polite
+
+    return None
+
+
+def resolve_workable_slug(company: dict) -> Optional[str]:
+    """
+    Attempts to find a valid Workable posting slug for a company.
+    """
+    name = company.get("name", "")
+    domain = company.get("domain", "")
+    candidates = _generate_slug_candidates(name, domain)
+
+    for slug in candidates:
+        try:
+            resp = httpx.get(
+                f"https://apply.workable.com/api/v3/accounts/{slug}/jobs",
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("results") is not None:
+                    return slug
+        except Exception:
+            continue
+        time.sleep(0.2)  # be polite
+
+    return None
+
+
 def get_or_discover_slugs(config: dict, profile: Optional[str] = None) -> dict:
     """
     Returns slug lists per ATS:
       {
           "greenhouse": [...slugs...],
           "lever":      [...slugs...],
+          "ashby":      [...slugs...],
+          "workable":   [...slugs...],
       }
 
-    Each list is: priority (from config) + DB cache + newly discovered from TheirStack.
-    Newly discovered slugs are saved to DB so resolution only runs once per company.
+    Each list is: priority (from config) + DB cache.
+    No external discovery calls are made.
     """
+    sources = config.get("sources", {})
+
     # Priority lists from config
-    gh_priority = (
-        config.get("sources", {}).get("greenhouse", {}).get("companies", [])
-    )
-    lv_priority = (
-        config.get("sources", {}).get("lever", {}).get("companies", [])
-    )
+    gh_priority    = sources.get("greenhouse", {}).get("companies", [])
+    lv_priority    = sources.get("lever",      {}).get("companies", [])
+    ashby_priority = sources.get("ashby",      {}).get("companies", [])
+    wl_priority    = sources.get("workable",   {}).get("companies", [])
 
     # Load cached slugs from DB
-    gh_cached = load_discovered_slugs(ats="greenhouse", profile=profile)
-    lv_cached = load_discovered_slugs(ats="lever", profile=profile)
+    gh_cached    = load_discovered_slugs(ats="greenhouse", profile=profile)
+    lv_cached    = load_discovered_slugs(ats="lever",      profile=profile)
+    ashby_cached = load_discovered_slugs(ats="ashby",      profile=profile)
+    wl_cached    = load_discovered_slugs(ats="workable",   profile=profile)
 
-    # Discover new slugs via TheirStack if key is set
-    gh_new: list = []
-    lv_new: list = []
-    if os.environ.get("THEIRSTACK_API_KEY"):
-        companies = fetch_companies(config)
-        logger.info("[theirstack] %d companies returned, resolving slugs...", len(companies))
-        for company in companies:
-            name = company.get("name", "")
-
-            gh_slug = resolve_greenhouse_slug(company)
-            if gh_slug and gh_slug not in gh_priority and gh_slug not in gh_cached:
-                gh_new.append(gh_slug)
-                save_discovered_slug(gh_slug, name, ats="greenhouse", profile=profile)
-                logger.info("  + [GH] %s -> %s", name, gh_slug)
-
-            lv_slug = resolve_lever_slug(company)
-            if lv_slug and lv_slug not in lv_priority and lv_slug not in lv_cached:
-                lv_new.append(lv_slug)
-                save_discovered_slug(lv_slug, name, ats="lever", profile=profile)
-                logger.info("  + [LV] %s -> %s", name, lv_slug)
-
-            if not gh_slug and not lv_slug:
-                logger.warning("  x %s -> no slug found (GH or LV)", name)
-
-    gh_all = gh_priority + [s for s in gh_cached if s not in gh_priority] + gh_new
-    lv_all = lv_priority + [s for s in lv_cached if s not in lv_priority] + lv_new
+    gh_all    = gh_priority    + [s for s in gh_cached    if s not in gh_priority]
+    lv_all    = lv_priority    + [s for s in lv_cached    if s not in lv_priority]
+    ashby_all = ashby_priority + [s for s in ashby_cached if s not in ashby_priority]
+    wl_all    = wl_priority    + [s for s in wl_cached    if s not in wl_priority]
 
     logger.info(
-        "[greenhouse] %d companies (%d priority, %d cached, %d new)",
-        len(gh_all), len(gh_priority), len(gh_cached), len(gh_new)
+        "[greenhouse] %d companies (%d priority, %d cached)",
+        len(gh_all), len(gh_priority), len(gh_cached),
     )
     logger.info(
-        "[lever] %d companies (%d priority, %d cached, %d new)",
-        len(lv_all), len(lv_priority), len(lv_cached), len(lv_new)
+        "[lever] %d companies (%d priority, %d cached)",
+        len(lv_all), len(lv_priority), len(lv_cached),
     )
-    return {"greenhouse": gh_all, "lever": lv_all}
+    logger.info(
+        "[ashby] %d companies (%d priority, %d cached)",
+        len(ashby_all), len(ashby_priority), len(ashby_cached),
+    )
+    logger.info(
+        "[workable] %d companies (%d priority, %d cached)",
+        len(wl_all), len(wl_priority), len(wl_cached),
+    )
+
+    return {
+        "greenhouse": gh_all,
+        "lever":      lv_all,
+        "ashby":      ashby_all,
+        "workable":   wl_all,
+    }
