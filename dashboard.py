@@ -71,6 +71,7 @@ from ui_shell import (
     toolbar,
 )
 from ui_theme import PAGE_TITLE, apply_page_scaffold
+from vector_store import query_similar_jobs, vector_store_enabled, vector_top_k_chunks, vector_top_k_jobs
 
 load_dotenv()
 
@@ -253,11 +254,27 @@ def _cached_recent_runs(slug: str) -> list[dict[str, Any]]:
     return get_recent_runs(limit=20, profile=slug)
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_vector_search(
+    slug: str,
+    query: str,
+    top_k_chunks: int,
+    top_k_jobs: int,
+) -> list:
+    return query_similar_jobs(
+        slug,
+        query,
+        top_k_chunks=top_k_chunks,
+        top_k_jobs=top_k_jobs,
+    )
+
+
 def invalidate_dashboard_caches() -> None:
     _cached_list_profiles.clear()
     _cached_fetch_job_summaries.clear()
     _cached_fetch_job_detail.clear()
     _cached_recent_runs.clear()
+    _cached_vector_search.clear()
 
 
 def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
@@ -347,6 +364,52 @@ def build_jobs_filter_chips(
     if include_full_text:
         chips.append("Full text search: On")
     return chips
+
+
+def _render_semantic_search_results(slug: str, config: dict[str, Any]) -> None:
+    if not vector_store_enabled(config):
+        st.caption("Semantic retrieval is disabled for this profile.")
+        return
+
+    query_key = f"semantic_query_{slug}"
+    run_key = f"semantic_run_{slug}"
+    results_key = f"semantic_results_{slug}"
+
+    search_cols = st.columns([1.8, 0.6], gap="medium")
+    search_cols[0].text_input(
+        "Semantic search",
+        key=query_key,
+        placeholder="backend AI platform role with Python and AWS",
+        help="Search embedded job chunks semantically instead of keyword matching only.",
+    )
+    run_search = search_cols[1].button("Search", key=run_key, use_container_width=True)
+
+    if run_search:
+        query = st.session_state.get(query_key, "").strip()
+        if query:
+            st.session_state[results_key] = _cached_vector_search(
+                slug,
+                query,
+                vector_top_k_chunks(config),
+                vector_top_k_jobs(config),
+            )
+        else:
+            st.session_state[results_key] = []
+
+    results = st.session_state.get(results_key, [])
+    if not results:
+        st.caption("Run a semantic query to see top retrieved jobs and the sections that matched.")
+        return
+
+    for index, result in enumerate(results[:5], start=1):
+        similarity_pct = round(result.aggregate_score * 100)
+        matched = ", ".join(result.matched_chunks) or "none"
+        subtitle = f"{result.company} · {result.source} · Similarity {similarity_pct}%"
+        with panel(f"{index}. {result.title}", subtitle=subtitle):
+            st.caption(f"Matched sections: {matched}")
+            st.write(result.retrieval_reason)
+            if result.url:
+                st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")
 
 
 def _job_filter_state_keys(slug: str) -> dict[str, str]:
@@ -2254,6 +2317,7 @@ def _render_overview_tab(
 
 
 def _render_jobs_tab(
+    config: dict[str, Any],
     records: list[dict[str, Any]],
     slug: str,
     *,
@@ -2279,6 +2343,9 @@ def _render_jobs_tab(
             if clicked == "start_discovery_jobs_empty":
                 _queue_pipeline_run(slug)
             return
+
+        with panel("Semantic search", subtitle="Proof that retrieval works: search embedded job sections directly"):
+            _render_semantic_search_results(slug, config)
 
         source_options = sorted({record["source_label"] for record in records})
         status_options = sorted({record["status_label"] for record in records})
@@ -3073,7 +3140,7 @@ def _render_profile_dashboard(slug: str) -> None:
         if section == "Overview":
             _render_overview_tab(slug, config, raw_config, records, runs, metrics)
         elif section == "Jobs":
-            _render_jobs_tab(records, slug, scrape_rejected_records=scrape_rejected_records)
+            _render_jobs_tab(config, records, slug, scrape_rejected_records=scrape_rejected_records)
         elif section == "Activity":
             _render_activity_tab(slug, runs, metrics, raw_config, config)
         elif section == "Profile":

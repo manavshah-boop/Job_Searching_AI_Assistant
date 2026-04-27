@@ -317,6 +317,10 @@ def _run(profile: str, tracker) -> int:
             embedded=embedding_result.get("jobs_embedded", 0),
             total=embedding_result.get("jobs_total", 0),
             chunks=embedding_result.get("chunks_embedded", 0),
+            chunks_indexed=embedding_result.get("vector_index", {}).get("chunks_indexed", 0),
+            jobs_indexed=embedding_result.get("vector_index", {}).get("jobs_indexed", 0),
+            vector_index_status=embedding_result.get("vector_index", {}).get("status", "disabled"),
+            vector_index_error=embedding_result.get("vector_index", {}).get("error", ""),
         )
     else:
         tracker.set_stage_metrics(Stage.EMBEDDING, skipped=True)

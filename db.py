@@ -452,6 +452,66 @@ def get_job_embeddings(
     return result
 
 
+def get_embedding_index_rows(
+    model_name: str,
+    profile: Optional[str] = None,
+    job_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return SQLite-backed embedding rows joined with job and score metadata.
+
+    This is the canonical source for rebuilding or refreshing the vector index.
+    """
+    init_db(profile=profile)
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.row_factory = sqlite3.Row
+
+    sql = """
+        SELECT
+            ? AS profile,
+            e.job_id,
+            e.model_name,
+            e.chunk_key,
+            e.chunk_order,
+            e.chunk_text,
+            e.embedding,
+            e.dimensions,
+            e.created_at,
+            j.title,
+            j.company,
+            j.source,
+            j.url,
+            j.status,
+            s.scored_at,
+            s.fit_score,
+            s.ats_score
+        FROM job_embeddings e
+        JOIN jobs j ON j.id = e.job_id
+        LEFT JOIN scores s ON s.job_id = e.job_id
+        WHERE e.model_name = ?
+    """
+    params: list[Any] = [profile or "", model_name]
+
+    if job_ids:
+        placeholders = ",".join("?" for _ in job_ids)
+        sql += f" AND e.job_id IN ({placeholders})"
+        params.extend(job_ids)
+
+    sql += " ORDER BY e.job_id ASC, e.chunk_order ASC, e.chunk_key ASC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["embedding"] = json.loads(item["embedding"])
+        except json.JSONDecodeError:
+            item["embedding"] = []
+        result.append(item)
+    return result
+
+
 def clear_job_embeddings(
     profile: Optional[str] = None,
     model_name: Optional[str] = None,
