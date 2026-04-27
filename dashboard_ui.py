@@ -37,6 +37,7 @@ def render_pipeline_stages(tracker: ProgressTracker) -> None:
         (Stage.FETCHING, "Job Board Fetch"),
         (Stage.SCRAPING, "Job Scraping"),
         (Stage.SCORING, "Scoring & Filtering"),
+        (Stage.EMBEDDING, "Semantic Embeddings"),
         (Stage.FINALIZING, "Results Finalization"),
     ]
 

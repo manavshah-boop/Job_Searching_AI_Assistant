@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 # Re-export load_config so every file imports from one place.
 from config import load_config  # noqa: F401
@@ -75,6 +75,27 @@ def _migrate_db(db_path: Path) -> None:
     """
     conn = sqlite3.connect(db_path)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scores (
+            job_id            TEXT PRIMARY KEY REFERENCES jobs(id),
+            fit_score         INTEGER,
+            role_fit          INTEGER,
+            stack_match       INTEGER,
+            seniority         INTEGER,
+            location          INTEGER,
+            growth            INTEGER,
+            compensation      INTEGER,
+            reasons           TEXT,
+            flags             TEXT,
+            skill_misses      TEXT,
+            one_liner         TEXT,
+            ats_score         INTEGER,
+            disqualified      INTEGER DEFAULT 0,
+            disqualify_reason TEXT DEFAULT '',
+            scored_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     for col, col_type in [
         ("score_attempts", "INTEGER DEFAULT 0"),
         ("score_error",    "TEXT"),
@@ -104,25 +125,6 @@ def _migrate_db(db_path: Path) -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS scores (
-            job_id       TEXT PRIMARY KEY REFERENCES jobs(id),
-            fit_score    INTEGER,
-            role_fit     INTEGER,
-            stack_match  INTEGER,
-            seniority    INTEGER,
-            location     INTEGER,
-            growth       INTEGER,
-            compensation INTEGER,
-            reasons      TEXT,
-            flags        TEXT,
-            skill_misses TEXT,
-            one_liner    TEXT,
-            ats_score    INTEGER,
-            scored_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scrape_runs (
             run_id        TEXT PRIMARY KEY,
@@ -138,6 +140,27 @@ def _migrate_db(db_path: Path) -> None:
             errors        TEXT DEFAULT '[]',
             status        TEXT DEFAULT 'running'
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS job_embeddings (
+            job_id       TEXT NOT NULL REFERENCES jobs(id),
+            model_name   TEXT NOT NULL,
+            chunk_key    TEXT NOT NULL,
+            chunk_order  INTEGER DEFAULT 0,
+            chunk_text   TEXT NOT NULL,
+            embedding    TEXT NOT NULL,
+            dimensions   INTEGER NOT NULL,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, model_name, chunk_key)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_embeddings_model_job
+        ON job_embeddings (model_name, job_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_embeddings_job
+        ON job_embeddings (job_id)
     """)
     conn.commit()
     conn.close()
@@ -309,6 +332,143 @@ def get_unscored(profile: Optional[str] = None) -> list:
     return [_row_to_job(r) for r in rows]
 
 
+def get_scored_jobs_for_embedding(
+    model_name: str,
+    profile: Optional[str] = None,
+    limit: Optional[int] = None,
+    force: bool = False,
+) -> list[Job]:
+    """
+    Return scrape-qualified jobs that completed scoring and need embeddings.
+
+    When force=False, only jobs with no embeddings for the given model are returned.
+    When force=True, all scrape-qualified scored jobs are returned for refresh runs.
+    """
+    init_db(profile=profile)
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.row_factory = sqlite3.Row
+
+    sql = """
+        SELECT j.*
+        FROM jobs j
+        JOIN scores s ON s.job_id = j.id
+        WHERE j.scrape_qualified = 1
+    """
+    params: list[Any] = []
+
+    if not force:
+        sql += """
+          AND NOT EXISTS (
+              SELECT 1
+              FROM job_embeddings e
+              WHERE e.job_id = j.id
+                AND e.model_name = ?
+          )
+        """
+        params.append(model_name)
+
+    sql += " ORDER BY j.created_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [_row_to_job(r) for r in rows]
+
+
+def replace_job_embeddings(
+    job_id: str,
+    model_name: str,
+    rows: Sequence[Dict[str, Any]],
+    profile: Optional[str] = None,
+) -> None:
+    """
+    Replace all embeddings for one job/model pair in a single transaction.
+
+    Each row should contain: chunk_key, chunk_order, chunk_text, embedding, dimensions.
+    """
+    conn = sqlite3.connect(get_db_path(profile))
+    try:
+        conn.execute(
+            "DELETE FROM job_embeddings WHERE job_id = ? AND model_name = ?",
+            (job_id, model_name),
+        )
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO job_embeddings
+                    (job_id, model_name, chunk_key, chunk_order, chunk_text, embedding, dimensions)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        job_id,
+                        model_name,
+                        row["chunk_key"],
+                        row["chunk_order"],
+                        row["chunk_text"],
+                        row["embedding"],
+                        row["dimensions"],
+                    )
+                    for row in rows
+                ],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_job_embeddings(
+    job_id: str,
+    profile: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch persisted embeddings for a job, ordered by chunk_order."""
+    init_db(profile=profile)
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.row_factory = sqlite3.Row
+    sql = """
+        SELECT job_id, model_name, chunk_key, chunk_order, chunk_text, embedding, dimensions, created_at
+        FROM job_embeddings
+        WHERE job_id = ?
+    """
+    params: list[Any] = [job_id]
+    if model_name:
+        sql += " AND model_name = ?"
+        params.append(model_name)
+    sql += " ORDER BY chunk_order ASC, chunk_key ASC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["embedding"] = json.loads(item["embedding"])
+        except json.JSONDecodeError:
+            item["embedding"] = []
+        result.append(item)
+    return result
+
+
+def clear_job_embeddings(
+    profile: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> None:
+    """Delete persisted embeddings, optionally scoped to a single model."""
+    init_db(profile=profile)
+    conn = sqlite3.connect(get_db_path(profile))
+    try:
+        if model_name:
+            conn.execute("DELETE FROM job_embeddings WHERE model_name = ?", (model_name,))
+        else:
+            conn.execute("DELETE FROM job_embeddings")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_top_jobs(min_score: int = 60, profile: Optional[str] = None) -> list:
     """
     Scored jobs above threshold, sorted best first.
@@ -365,11 +525,13 @@ def get_all_jobs(profile: Optional[str] = None) -> list:
 
 def count_jobs(profile: Optional[str] = None) -> dict:
     """Quick stats — useful for end-of-run summary."""
+    init_db(profile=profile)
     conn = sqlite3.connect(get_db_path(profile))
     total  = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     scored = conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0]
+    embedded = conn.execute("SELECT COUNT(DISTINCT job_id) FROM job_embeddings").fetchone()[0]
     conn.close()
-    return {"total": total, "scored": scored}
+    return {"total": total, "scored": scored, "embedded": embedded}
 
 
 # ── Discovered slugs (TheirStack cache) ──────────────────────────────────────

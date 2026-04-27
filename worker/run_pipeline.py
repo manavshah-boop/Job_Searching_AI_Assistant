@@ -144,6 +144,7 @@ def _run(profile: str, tracker) -> int:
     """
     from config import load_config
     from db import finish_run, init_db, start_run
+    from embedder import embed_jobs, embeddings_enabled
     from progress_tracker import ActivityType, Stage
     from scraper import scrape_ashby, scrape_greenhouse, scrape_himalayas, scrape_hn, scrape_lever, scrape_workable
     from scorer import RateLimitReached, score_all_jobs
@@ -293,6 +294,35 @@ def _run(profile: str, tracker) -> int:
     )
     tracker.complete_stage(Stage.SCORING)
     tracker.set_stage_metrics(Stage.SCORING, scored=len(scored_ok))
+    _write_progress(profile, tracker)
+
+    # ── EMBEDDING ─────────────────────────────────────────────────────────────
+    tracker.start_stage(Stage.EMBEDDING)
+    _write_progress(profile, tracker)
+
+    if embeddings_enabled(config):
+        def _on_job_embedded(i: int, total: int, job, chunk_count: int) -> None:
+            tracker.set_stage_metrics(Stage.EMBEDDING, embedded=i, total=total, last_chunks=chunk_count)
+            if i % 5 == 0:
+                _write_progress(profile, tracker)
+
+        embedding_result = embed_jobs(
+            config,
+            profile=profile,
+            force=False,
+            on_job_embedded=_on_job_embedded,
+        )
+        tracker.set_stage_metrics(
+            Stage.EMBEDDING,
+            embedded=embedding_result.get("jobs_embedded", 0),
+            total=embedding_result.get("jobs_total", 0),
+            chunks=embedding_result.get("chunks_embedded", 0),
+        )
+    else:
+        tracker.set_stage_metrics(Stage.EMBEDDING, skipped=True)
+
+    tracker.complete_stage(Stage.EMBEDDING)
+    _write_progress(profile, tracker)
 
     # ── FINALIZING ────────────────────────────────────────────────────────────
     tracker.start_stage(Stage.FINALIZING)

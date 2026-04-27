@@ -17,6 +17,7 @@ class Stage(Enum):
     FETCHING = "🏢 Fetching job boards"
     SCRAPING = "📥 Scraping jobs"
     SCORING = "🧠 Scoring and filtering jobs"
+    EMBEDDING = "🧩 Generating job embeddings"
     FINALIZING = "📊 Finalizing and saving results"
 
 

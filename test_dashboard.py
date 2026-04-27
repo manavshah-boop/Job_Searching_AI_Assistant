@@ -18,6 +18,7 @@ def test_run_pipeline_passes_profile_to_all_profile_scoped_calls(monkeypatch):
 
     import config as config_module
     import db
+    import embedder
     import scraper
     import scorer
     import theirstack
@@ -75,6 +76,16 @@ def test_run_pipeline_passes_profile_to_all_profile_scoped_calls(monkeypatch):
             {"fit_score": 0},
         ],
     )
+    monkeypatch.setattr(embedder, "embeddings_enabled", lambda config: True)
+    monkeypatch.setattr(
+        embedder,
+        "embed_jobs",
+        lambda config, profile=None, force=False, on_job_embedded=None: calls.append(("embed", profile, force)) or {
+            "jobs_embedded": 1,
+            "jobs_total": 1,
+            "chunks_embedded": 3,
+        },
+    )
 
     result = run_pipeline._run("default", ProgressTracker())
 
@@ -90,6 +101,7 @@ def test_run_pipeline_passes_profile_to_all_profile_scoped_calls(monkeypatch):
         ("workable", ("wl-co",), "default"),
         ("himalayas", "default"),
         ("score", True, "default"),
+        ("embed", "default", False),
         ("finish_run", 7, "default"),
     ]
 
