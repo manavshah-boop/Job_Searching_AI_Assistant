@@ -21,6 +21,7 @@ from db import (
     get_scored_jobs_for_embedding,
     replace_job_embeddings,
 )
+from profile_intent import CANONICAL_SECTION_ALIASES, CANONICAL_TO_CHUNK_KEY, map_header_to_canonical
 
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_BATCH_SIZE = 8
@@ -34,28 +35,23 @@ _SECTION_ORDER = [
     "benefits",
 ]
 
+# Built from the canonical alias map so both header classification paths stay in sync.
+# canonical sections that don't have a direct chunk_key equivalent fold into the
+# existing five-key set via CANONICAL_TO_CHUNK_KEY.
 _SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     "summary": (
-        "about the role", "role overview", "role summary", "position overview",
-        "about us", "what you'll do", "what you will do", "overview", "summary",
+        *CANONICAL_SECTION_ALIASES["summary"],
+        *CANONICAL_SECTION_ALIASES["company"],
     ),
-    "responsibilities": (
-        "responsibilities", "what you'll do", "what you will do", "you will",
-        "in this role", "day to day", "day-to-day", "what you'll own",
-    ),
+    "responsibilities": CANONICAL_SECTION_ALIASES["responsibilities"],
     "requirements": (
-        "requirements", "qualifications", "must have", "minimum qualifications",
-        "basic qualifications", "what we're looking for", "you have",
-        "experience with", "preferred qualifications", "skills",
+        *CANONICAL_SECTION_ALIASES["requirements"],
+        *CANONICAL_SECTION_ALIASES["preferred_qualifications"],
+        *CANONICAL_SECTION_ALIASES["tools_and_skills"],
+        *CANONICAL_SECTION_ALIASES["logistics"],
     ),
-    "compensation": (
-        "compensation", "salary", "pay range", "salary range", "base pay",
-        "base salary", "hourly rate", "ote", "equity",
-    ),
-    "benefits": (
-        "benefits", "perks", "what we offer", "why you'll love", "healthcare",
-        "medical", "pto", "401k",
-    ),
+    "compensation": CANONICAL_SECTION_ALIASES["compensation"],
+    "benefits": CANONICAL_SECTION_ALIASES["benefits"],
 }
 
 _HEADER_PREFIX_RE = re.compile(r"^(?:[-*]\s+)?([A-Za-z][A-Za-z0-9 &/'()-]{1,80}):?\s*$")
@@ -134,10 +130,9 @@ def _looks_like_header(text: str) -> bool:
 
 
 def _classify_header(text: str) -> Optional[str]:
-    header = text.strip().rstrip(":").lower()
-    for section, keywords in _SECTION_KEYWORDS.items():
-        if any(keyword in header for keyword in keywords):
-            return section
+    canonical = map_header_to_canonical(text)
+    if canonical is not None:
+        return CANONICAL_TO_CHUNK_KEY.get(canonical, canonical)
     return None
 
 

@@ -495,19 +495,26 @@ def _render_semantic_search_results(slug: str, config: dict[str, Any]) -> None:
             matched = ", ".join(result.matched_sections) or "none"
             subtitle = f"{result.company} · {result.source} · Final score {score_pct}%"
             reason = result.match_reason
-            evidence = getattr(result, "evidence_snippets", [])
+            evidence_snippets = getattr(result, "evidence_snippets", [])
+            ev = getattr(result, "evidence", None)
         else:
             score_pct = round(result.aggregate_score * 100)
             matched = ", ".join(result.matched_chunks) or "none"
             subtitle = f"{result.company} · {result.source} · Similarity {score_pct}%"
             reason = result.retrieval_reason
-            evidence = []
+            evidence_snippets = []
+            ev = None
         with panel(f"{index}. {result.title}", subtitle=subtitle):
             st.caption(f"Matched sections: {matched}")
             st.write(reason)
-            for snippet in evidence[:2]:
+            if ev is not None:
+                if ev.positive:
+                    st.caption("**Positive signals:** " + " · ".join(ev.positive))
+                if ev.concerns:
+                    st.caption("**Concerns:** " + " · ".join(ev.concerns))
+            for snippet in evidence_snippets[:2]:
                 if snippet:
-                    st.caption(snippet)
+                    st.caption(f"_{snippet}_")
             if result.url:
                 st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")
 

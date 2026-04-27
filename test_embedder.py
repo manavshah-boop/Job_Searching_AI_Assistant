@@ -8,6 +8,10 @@ from pathlib import Path
 import db
 from db import Job, get_job_embeddings, get_scored_jobs_for_embedding, init_db, insert_job, save_score
 from embedder import embed_jobs, embed_texts, semantic_chunk_job
+from profile_intent import (
+    CANONICAL_TO_CHUNK_KEY,
+    map_header_to_canonical,
+)
 
 
 class _FakeVector(list):
@@ -190,3 +194,87 @@ def test_embed_jobs_skips_vector_index_when_disabled(monkeypatch):
     assert result["vector_index"]["chunks_indexed"] == 0
 
     shutil.rmtree(root)
+
+
+# ── Canonical section alias tests ────────────────────────────────────────────
+
+
+def test_canonical_section_alias_requirements_variants():
+    assert map_header_to_canonical("What You Bring") == "requirements"
+    assert map_header_to_canonical("Minimum Qualifications") == "requirements"
+    assert map_header_to_canonical("Basic Qualifications:") == "requirements"
+    assert map_header_to_canonical("required skills") == "requirements"
+
+
+def test_canonical_section_alias_responsibilities_variants():
+    assert map_header_to_canonical("What You'll Do") == "responsibilities"
+    assert map_header_to_canonical("Day to Day") == "responsibilities"
+    assert map_header_to_canonical("In This Role") == "responsibilities"
+    assert map_header_to_canonical("Key Responsibilities") == "responsibilities"
+
+
+def test_canonical_section_alias_preferred_qualifications():
+    assert map_header_to_canonical("Nice to Have") == "preferred_qualifications"
+    assert map_header_to_canonical("Bonus Points") == "preferred_qualifications"
+    assert map_header_to_canonical("Preferred Qualifications") == "preferred_qualifications"
+
+
+def test_canonical_section_alias_tools_and_skills():
+    assert map_header_to_canonical("Tech Stack") == "tools_and_skills"
+    assert map_header_to_canonical("Technologies") == "tools_and_skills"
+    assert map_header_to_canonical("Tools and Technologies") == "tools_and_skills"
+
+
+def test_canonical_section_alias_company():
+    assert map_header_to_canonical("About Us") == "company"
+    assert map_header_to_canonical("About the Company") == "company"
+
+
+def test_canonical_section_alias_logistics():
+    assert map_header_to_canonical("Work Authorization") == "logistics"
+    assert map_header_to_canonical("Visa Sponsorship") == "logistics"
+
+
+def test_canonical_section_alias_unknown_headers_fall_back():
+    assert map_header_to_canonical("Foobar Totally Unknown Section") is None
+    assert map_header_to_canonical("") is None
+    assert map_header_to_canonical("XYZ123") is None
+
+
+def test_canonical_to_chunk_key_preferred_qualifications_maps_to_requirements():
+    assert CANONICAL_TO_CHUNK_KEY["preferred_qualifications"] == "requirements"
+    assert CANONICAL_TO_CHUNK_KEY["tools_and_skills"] == "requirements"
+    assert CANONICAL_TO_CHUNK_KEY["logistics"] == "requirements"
+
+
+def test_canonical_to_chunk_key_company_maps_to_summary():
+    assert CANONICAL_TO_CHUNK_KEY["company"] == "summary"
+
+
+def test_chunker_handles_nonstandard_header_gracefully():
+    job = Job(
+        id="job-nonstandard",
+        title="Analyst",
+        company="Corp",
+        location="Remote",
+        url="https://example.com",
+        raw_text=(
+            "Title: Analyst\nCompany: Corp\nLocation: Remote\nURL: https://example.com\n\n"
+            "Description:\n"
+            "What You Bring:\n"
+            "- 2 years of Excel and financial modeling\n\n"
+            "Bonus Points:\n"
+            "- CFA Level I candidate\n\n"
+            "Tech Stack:\n"
+            "- SQL, Python, Tableau\n"
+        ),
+        source="greenhouse",
+    )
+
+    chunks = semantic_chunk_job(job)
+
+    chunk_keys = [c.chunk_key for c in chunks]
+    # All non-standard headers must produce valid chunk keys (no crash)
+    valid_keys = {"summary", "responsibilities", "requirements", "compensation", "benefits"}
+    for key in chunk_keys:
+        assert key in valid_keys
