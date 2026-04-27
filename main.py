@@ -33,6 +33,11 @@ from scorer import RateLimitReached, print_results, score_all_jobs
 from theirstack import get_or_discover_slugs
 from logging_config import configure_logging
 from loguru import logger
+from reranker import (
+    reranking_enabled,
+    reranking_top_k_final,
+    semantic_match_jobs,
+)
 from vector_store import (
     clear_vector_index,
     query_similar_jobs,
@@ -66,6 +71,10 @@ def parse_args() -> argparse.Namespace:
                       help="Generate embeddings for scored jobs in DB, skip scraping/scoring")
     mode.add_argument("--vector-search", type=str, metavar="QUERY",
                       help="Semantic search over embedded job chunks, skip scraping/scoring")
+    mode.add_argument("--semantic-search", type=str, metavar="QUERY",
+                      help="Profile-aware semantic search, optionally reranked with a cross-encoder")
+    mode.add_argument("--semantic-match", action="store_true",
+                      help="Run profile-aware matching against indexed jobs, skip scraping/scoring")
     mode.add_argument("--rebuild-vector-index", action="store_true",
                       help="Rebuild the ChromaDB vector index from SQLite embeddings")
     mode.add_argument("--clear-vector-index", action="store_true",
@@ -79,6 +88,10 @@ def parse_args() -> argparse.Namespace:
                         help="Skip all confirmation prompts (non-interactive / cron)")
     parser.add_argument("--min-score", type=int, default=None, metavar="N",
                         help="Override min_display_score from config for this run")
+    parser.add_argument("--rerank", action="store_true",
+                        help="Use the cross-encoder reranker for semantic search")
+    parser.add_argument("--top-k", type=int, default=None, metavar="N",
+                        help="Override the number of semantic results to print")
     parser.add_argument("--profile",   type=str, default=None, metavar="NAME",
                         help="Load config from profiles/<NAME>/config.yaml (Step 7)")
     parser.add_argument("--debug",     action="store_true",
@@ -225,6 +238,32 @@ def _print_vector_results(results, query: str) -> None:
         print()
 
 
+def _print_reranked_results(results, query_label: str) -> None:
+    if not results:
+        logger.info("No semantic matches found for {}.", query_label)
+        return
+
+    print(f"\n{'=' * 72}")
+    print(f"  SEMANTIC MATCH RESULTS ({len(results)} jobs)")
+    print(f"{'=' * 72}\n")
+
+    for result in results:
+        final_pct = round(result.final_score * 100)
+        vector_pct = round(result.vector_score * 100)
+        rerank_pct = round(result.rerank_score * 100)
+        matched = ", ".join(result.matched_sections) or "none"
+        print(f"• {result.title} — {result.company}")
+        print(f"  Final: {final_pct}%  |  Vector: {vector_pct}%  |  Rerank: {rerank_pct}%")
+        print(f"  Matched sections: {matched}")
+        print(f"  Why: {result.match_reason}")
+        for snippet in result.evidence_snippets[:2]:
+            if snippet:
+                print(f"  Evidence: {snippet}")
+        if result.url:
+            print(f"  {result.url}")
+        print()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -293,9 +332,44 @@ def main() -> None:
             args.profile or "default",
             args.vector_search,
             top_k_chunks=vector_top_k_chunks(config),
-            top_k_jobs=vector_top_k_jobs(config),
+            top_k_jobs=args.top_k or vector_top_k_jobs(config),
         )
         _print_vector_results(results, args.vector_search)
+        return
+
+    if args.semantic_search:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; semantic search is unavailable.")
+            return
+        if args.rerank:
+            results = semantic_match_jobs(
+                args.profile or "default",
+                config,
+                user_query=args.semantic_search,
+            )
+            limit = args.top_k or reranking_top_k_final(config)
+            _print_reranked_results(results[:limit], f"query '{args.semantic_search}'")
+        else:
+            results = query_similar_jobs(
+                args.profile or "default",
+                args.semantic_search,
+                top_k_chunks=vector_top_k_chunks(config),
+                top_k_jobs=args.top_k or vector_top_k_jobs(config),
+            )
+            _print_vector_results(results, args.semantic_search)
+        return
+
+    if args.semantic_match:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; semantic matching is unavailable.")
+            return
+        results = semantic_match_jobs(args.profile or "default", config, user_query=None)
+        limit = args.top_k or reranking_top_k_final(config)
+        if not reranking_enabled(config):
+            logger.info("Reranking is disabled in config; falling back to vector-only semantic matching.")
+        _print_reranked_results(results[:limit], "the active profile")
         return
 
     # Validate API key before starting any work if scoring will run
@@ -303,6 +377,8 @@ def main() -> None:
         args.scrape_only
         or args.embed_only
         or args.vector_search
+        or args.semantic_search
+        or args.semantic_match
         or args.rebuild_vector_index
         or args.clear_vector_index
     )

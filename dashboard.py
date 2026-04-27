@@ -56,6 +56,7 @@ from dashboard_ui import (
 from logging_config import configure_logging
 from onboarding import render_onboarding, sanitize_slug
 from progress_tracker import ProgressTracker
+from reranker import build_profile_match_query, reranking_enabled, semantic_match_jobs
 from scorer import score_all_jobs
 from ui_shell import (
     badge,
@@ -269,12 +270,22 @@ def _cached_vector_search(
     )
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_semantic_match(
+    slug: str,
+    config: dict[str, Any],
+    query: str | None,
+) -> list:
+    return semantic_match_jobs(slug, config, user_query=query)
+
+
 def invalidate_dashboard_caches() -> None:
     _cached_list_profiles.clear()
     _cached_fetch_job_summaries.clear()
     _cached_fetch_job_detail.clear()
     _cached_recent_runs.clear()
     _cached_vector_search.clear()
+    _cached_semantic_match.clear()
 
 
 def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
@@ -408,6 +419,95 @@ def _render_semantic_search_results(slug: str, config: dict[str, Any]) -> None:
         with panel(f"{index}. {result.title}", subtitle=subtitle):
             st.caption(f"Matched sections: {matched}")
             st.write(result.retrieval_reason)
+            if result.url:
+                st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")
+
+
+def _render_semantic_search_results(slug: str, config: dict[str, Any]) -> None:
+    if not vector_store_enabled(config):
+        st.caption("Semantic retrieval is disabled for this profile.")
+        return
+
+    query_key = f"semantic_query_{slug}"
+    run_key = f"semantic_run_{slug}"
+    results_key = f"semantic_results_{slug}"
+    mode_key = f"semantic_rerank_{slug}"
+    meta_key = f"semantic_meta_{slug}"
+
+    search_cols = st.columns([1.8, 0.7], gap="medium")
+    search_cols[0].text_input(
+        "Semantic query",
+        key=query_key,
+        placeholder="Optional: backend AI platform role with Python and AWS",
+        help="Leave blank to run a profile-aware match, or add a query to steer the search.",
+    )
+    search_cols[0].checkbox(
+        "Use cross-encoder reranking",
+        key=mode_key,
+        value=reranking_enabled(config),
+        help="Add a profile-aware precision pass after vector retrieval.",
+    )
+    run_search = search_cols[1].button("Run semantic match", key=run_key, use_container_width=True)
+
+    if run_search:
+        query = st.session_state.get(query_key, "").strip()
+        use_reranker = bool(st.session_state.get(mode_key, reranking_enabled(config)))
+        if use_reranker:
+            st.session_state[results_key] = _cached_semantic_match(slug, config, query or None)
+            st.session_state[meta_key] = {
+                "mode": "reranked" if reranking_enabled(config) else "vector-fallback",
+                "query_label": query or build_profile_match_query(config),
+            }
+        elif query:
+            st.session_state[results_key] = _cached_vector_search(
+                slug,
+                query,
+                vector_top_k_chunks(config),
+                vector_top_k_jobs(config),
+            )
+            st.session_state[meta_key] = {"mode": "vector", "query_label": query}
+        else:
+            match_query = build_profile_match_query(config)
+            st.session_state[results_key] = _cached_vector_search(
+                slug,
+                match_query,
+                vector_top_k_chunks(config),
+                vector_top_k_jobs(config),
+            )
+            st.session_state[meta_key] = {"mode": "vector", "query_label": match_query}
+
+    results = st.session_state.get(results_key, [])
+    if not results:
+        st.caption("Run a semantic match to compare your profile and optional query against embedded job sections.")
+        return
+
+    meta = st.session_state.get(meta_key, {"mode": "vector"})
+    if meta.get("mode") == "vector-fallback":
+        st.caption("Cross-encoder reranking is disabled in config, so this panel is showing vector-ranked fallback results.")
+    elif meta.get("mode") == "vector":
+        st.caption("Showing vector-ranked semantic retrieval results.")
+    else:
+        st.caption("Showing profile-aware reranked semantic matches.")
+
+    for index, result in enumerate(results[:5], start=1):
+        if hasattr(result, "final_score"):
+            score_pct = round(result.final_score * 100)
+            matched = ", ".join(result.matched_sections) or "none"
+            subtitle = f"{result.company} · {result.source} · Final score {score_pct}%"
+            reason = result.match_reason
+            evidence = getattr(result, "evidence_snippets", [])
+        else:
+            score_pct = round(result.aggregate_score * 100)
+            matched = ", ".join(result.matched_chunks) or "none"
+            subtitle = f"{result.company} · {result.source} · Similarity {score_pct}%"
+            reason = result.retrieval_reason
+            evidence = []
+        with panel(f"{index}. {result.title}", subtitle=subtitle):
+            st.caption(f"Matched sections: {matched}")
+            st.write(reason)
+            for snippet in evidence[:2]:
+                if snippet:
+                    st.caption(snippet)
             if result.url:
                 st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")
 
