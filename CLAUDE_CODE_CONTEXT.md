@@ -29,6 +29,7 @@ isolated profiles, deployed to GCP.
 | 11 | ✅ | Out-of-process dashboard pipeline (subprocess + lockfile + progress JSON) |
 | 12 | ✅ | Filter disqualified jobs from UI; "Filtered out" summary in Activity tab |
 | 13 | ✅ | Scrape-filter rejection persistence: scrape_qualified/scrape_filter_reason columns, auditable dashboard toggle |
+| 17+20 | ✅ | Semantic job embeddings: `embedder.py`, `job_embeddings` table, embedding pipeline stage, `--embed-only` |
 
 ---
 
@@ -41,6 +42,7 @@ job-agent/
 ├── config.py                # load_config() with PyPDF2 resume extraction
 ├── scraper.py               # Greenhouse + Lever + HN + Ashby + Workable + Himalayas scrapers
 ├── scorer.py                # LLM pipeline, RateLimiter, instructor integration
+├── embedder.py              # Semantic chunking + sentence-transformers batch embeddings
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
@@ -55,6 +57,7 @@ job-agent/
 ├── ui_shell.py              # toolbar(), panel(), callout(), badge(), etc.
 ├── ui_theme.py              # PAGE_TITLE, apply_page_scaffold()
 ├── test_scorer_recovery.py  # 10 unit tests for llm_utils recovery layer
+├── test_embedder.py         # Chunking, embedding batch shape, DB round-trip
 ├── worker/
 │   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
 ├── profiles/
@@ -182,6 +185,7 @@ ProgressTracker.from_dict(data)  # reconstructs from dict
 ```
 
 Stage values (enum) are stored by `.value` string (e.g. "🔍 Discovering companies").
+Current ordered stages: `DISCOVERING -> FETCHING -> SCRAPING -> SCORING -> EMBEDDING -> FINALIZING`.
 
 ---
 
@@ -270,6 +274,15 @@ error states — only `disqualified=1` and `scrape_qualified=0` hide jobs.
 - `config["_active_profile"]` must be set before any LLM call so DB writes
   scope to the correct profile
 
+## embedder.py key points
+
+- Public entrypoint: `embed_jobs(config, profile=None, force=False, on_job_embedded=None) -> dict`
+- Uses heuristic semantic chunking, not an LLM call
+- `semantic_chunk_job(job)` emits a small named set of chunks in this order:
+  `summary`, `responsibilities`, `requirements`, `compensation`, `benefits`
+- Sentence-transformers model loads lazily once per process and is cached in-module
+- Worker pipeline runs embeddings after scoring; CLI supports standalone refresh via `python main.py --embed-only`
+
 ## candidate_profile.py key points
 
 - Uses `safe_structured_call` for structured output (same recovery as scorer)
@@ -315,8 +328,11 @@ Key functions (all accept `profile=None`):
 - `insert_job(job, profile=None) -> bool`
 - `save_score(job_id, ..., disqualified=0, disqualify_reason="", profile=None)`
 - `get_unscored(profile=None) -> list[Job]` — jobs with score IS NULL, score_attempts < 3, AND scrape_qualified = 1
+- `get_scored_jobs_for_embedding(model_name, profile=None, limit=None, force=False) -> list[Job]` — scrape-qualified jobs with score rows, optionally only the unembedded subset for one model
+- `replace_job_embeddings(job_id, model_name, rows, profile=None)` — atomic delete+bulk-insert for one job/model pair
+- `get_job_embeddings(job_id, profile=None, model_name=None) -> list[dict]`
 - `get_top_jobs(min_score, profile=None) -> list`
-- `count_jobs(profile=None) -> dict` — {total, scored} (includes disqualified in total)
+- `count_jobs(profile=None) -> dict` — `{total, scored, embedded}` (includes disqualified in total)
 - `rescore_reset(profile=None)` — clears scores, resets score_attempts to 0
 - `update_job_status(job_id, status, profile=None)`
 - `save_discovered_slug(slug, company_name, ats, profile=None)` — valid ats: greenhouse, lever, ashby, workable
@@ -367,6 +383,26 @@ CREATE TABLE scores (
     scored_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 ```
+
+### Job embeddings table (with migrations)
+
+```sql
+CREATE TABLE job_embeddings (
+    job_id      TEXT NOT NULL REFERENCES jobs(id),
+    model_name  TEXT NOT NULL,
+    chunk_key   TEXT NOT NULL,   -- summary | responsibilities | requirements | compensation | benefits
+    chunk_order INTEGER DEFAULT 0,
+    chunk_text  TEXT NOT NULL,   -- section text with title/company/location context
+    embedding   TEXT NOT NULL,   -- compact JSON array of floats
+    dimensions  INTEGER NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (job_id, model_name, chunk_key)
+)
+```
+
+Supporting indexes:
+- `idx_job_embeddings_model_job(model_name, job_id)` for "what still needs embeddings?" scans
+- `idx_job_embeddings_job(job_id)` for job detail / retrieval lookups
 
 ### config.yaml structure
 
@@ -437,6 +473,11 @@ scoring:
     location:     0.10
     growth:       0.10
     compensation: 0.05
+
+embeddings:
+  enabled: true
+  model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 8
 ```
 
 Internship profiles use this compensation shape instead:

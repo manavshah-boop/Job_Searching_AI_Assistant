@@ -28,3 +28,7 @@ instructor>=1.3.0
 
 # step 9 — structured logging
 loguru>=0.7.0
+
+# step 17+20 — semantic job embeddings
+sentence-transformers~=3.2.1
+torch~=2.5.1

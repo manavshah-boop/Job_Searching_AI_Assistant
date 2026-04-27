@@ -5,6 +5,7 @@ Usage:
   python main.py                  # full run: scrape + score + display
   python main.py --scrape-only    # scrape and save to DB, skip scoring
   python main.py --score-only     # score unscored jobs in DB, skip scraping
+  python main.py --embed-only     # regenerate embeddings for scored jobs only
   python main.py --show           # print current top jobs, no scraping/scoring
   python main.py --rescore        # clear scores and re-score everything
   python main.py --yes            # skip all confirmation prompts
@@ -26,6 +27,7 @@ load_dotenv()
 
 from db import count_jobs, init_db, load_config, rescore_reset, set_active_profile, start_run, finish_run
 from db import get_top_jobs
+from embedder import embed_jobs, embeddings_enabled
 from scraper import scrape_ashby, scrape_greenhouse, scrape_himalayas, scrape_hn, scrape_lever, scrape_workable
 from scorer import RateLimitReached, print_results, score_all_jobs
 from theirstack import get_or_discover_slugs
@@ -52,6 +54,8 @@ def parse_args() -> argparse.Namespace:
                       help="Scrape and save to DB, skip scoring")
     mode.add_argument("--score-only",  action="store_true",
                       help="Score unscored jobs in DB, skip scraping")
+    mode.add_argument("--embed-only",  action="store_true",
+                      help="Generate embeddings for scored jobs in DB, skip scraping/scoring")
     mode.add_argument("--show",        action="store_true",
                       help="Print current top jobs from DB, no scraping or scoring")
 
@@ -109,7 +113,7 @@ def _print_banner(config: dict) -> None:
     logger.info("Job Agent")
     logger.info(f"Provider: {provider} ({model})")
     logger.info("Sources: %s", "  ".join(enabled_names) if enabled_names else "none")
-    logger.info(f"DB: {stats['total']} jobs total, {stats['scored']} scored")
+    logger.info(f"DB: {stats['total']} jobs total, {stats['scored']} scored, {stats.get('embedded', 0)} embedded")
 
 
 def _run_scrapers(config: dict, profile: str | None = None) -> dict:
@@ -224,7 +228,7 @@ def main() -> None:
         return
 
     # Validate API key before starting any work if scoring will run
-    will_score = not args.scrape_only
+    will_score = not (args.scrape_only or args.embed_only)
     if will_score:
         _check_api_key(provider, args.profile)
 
@@ -233,12 +237,17 @@ def main() -> None:
     run_id = start_run(profile=args.profile, source="cli")
     scrape_stats = {"total_new": 0, "jobs_scraped": 0, "jobs_filtered": 0, "jobs_saved": 0}
     score_results = []
+    scored_this_run = []
+    embed_stats = {"jobs_embedded": 0, "jobs_total": 0, "chunks_embedded": 0}
     avg_fit = 0.0
     final_status = "complete"
     final_errors: list[str] = []
 
     # --rescore: clear scores table before scoring
     if args.rescore:
+        if args.embed_only:
+            logger.error("--rescore cannot be combined with --embed-only.")
+            sys.exit(1)
         if not args.score_only and not args.yes:
             try:
                 confirm = input("--rescore will delete all existing scores. Continue? [y/n]: ").strip().lower()
@@ -252,22 +261,39 @@ def main() -> None:
 
     try:
         # ── Scrape ──────────────────────────────────────────────────────────
-        if not args.score_only:
+        if not args.score_only and not args.embed_only:
             scrape_stats = _run_scrapers(config, profile=args.profile)
 
         # ── Score ────────────────────────────────────────────────────────────
-        if not args.scrape_only:
+        if not args.scrape_only and not args.embed_only:
             score_results = score_all_jobs(config, yes=args.yes, profile=args.profile)
             if score_results:
                 print_results(score_results, config)
+
+        # ── Embed ──────────────────────────────────────────────────────────
+        should_embed = args.embed_only or (not args.scrape_only and not args.embed_only)
+        if should_embed:
+            if embeddings_enabled(config):
+                embed_stats = embed_jobs(
+                    config,
+                    profile=args.profile,
+                    force=args.embed_only,
+                )
+            else:
+                logger.info("Embeddings disabled in config; skipping embedding stage.")
 
         # ── Final summary ──────────────────────────────────────────────────
         final_stats = count_jobs(profile=args.profile)
         scored_this_run = [r for r in score_results if r.get("fit_score", 0) > 0]
 
         logger.info("Run complete")
-        logger.info("DB: %d jobs total, %d scored", final_stats['total'], final_stats['scored'])
-        if not args.score_only:
+        logger.info(
+            "DB: %d jobs total, %d scored, %d embedded",
+            final_stats['total'],
+            final_stats['scored'],
+            final_stats.get('embedded', 0),
+        )
+        if not args.score_only and not args.embed_only:
             logger.info("New jobs this run: %d", scrape_stats.get('total_new', 0))
         if scored_this_run:
             avg_fit = sum(r["fit_score"] for r in scored_this_run) / len(scored_this_run)
@@ -275,6 +301,12 @@ def main() -> None:
             logger.info("Scored this run: %d", len(scored_this_run))
             logger.info("Avg fit score: %.0f", avg_fit)
             logger.info("Avg ATS score: %.0f", avg_ats)
+        if embed_stats.get("jobs_total", 0):
+            logger.info(
+                "Embedded this run: %d jobs, %d chunks",
+                embed_stats.get("jobs_embedded", 0),
+                embed_stats.get("chunks_embedded", 0),
+            )
         logger.info("%s", "─" * 44)
 
     except KeyboardInterrupt:
