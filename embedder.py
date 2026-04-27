@@ -265,6 +265,7 @@ def embed_jobs(
 
     jobs_embedded = 0
     chunks_embedded = 0
+    embedded_job_ids: list[str] = []
 
     for start in range(0, len(jobs), job_batch_size):
         batch_jobs = jobs[start:start + job_batch_size]
@@ -297,11 +298,60 @@ def embed_jobs(
             replace_job_embeddings(job.id, model_name, payload, profile=profile)
             jobs_embedded += 1
             chunks_embedded += len(payload)
+            embedded_job_ids.append(job.id)
             if on_job_embedded is not None:
                 try:
                     on_job_embedded(jobs_embedded, len(jobs), job, len(payload))
                 except Exception:
                     pass
+
+    vector_index_result = {
+        "enabled": False,
+        "status": "skipped",
+        "chunks_indexed": 0,
+        "jobs_indexed": 0,
+        "error": "",
+    }
+    try:
+        from vector_store import index_embedded_jobs, vector_store_enabled
+
+        if vector_store_enabled(config):
+            indexed = index_embedded_jobs(
+                profile or "default",
+                model_name,
+                force=force,
+                job_ids=embedded_job_ids,
+            )
+            vector_index_result = {
+                "enabled": True,
+                "status": "indexed",
+                "chunks_indexed": indexed.get("chunks_indexed", 0),
+                "jobs_indexed": indexed.get("jobs_indexed", 0),
+                "collection_name": indexed.get("collection_name", ""),
+                "persist_directory": indexed.get("persist_directory", ""),
+                "error": "",
+            }
+        else:
+            vector_index_result = {
+                "enabled": False,
+                "status": "disabled",
+                "chunks_indexed": 0,
+                "jobs_indexed": 0,
+                "error": "",
+            }
+    except Exception as exc:
+        logger.exception("embedder | vector indexing failed")
+        from vector_store import vector_store_strict
+
+        if vector_store_strict(config):
+            raise
+        vector_index_result = {
+            "enabled": True,
+            "status": "failed",
+            "chunks_indexed": 0,
+            "jobs_indexed": 0,
+            "error": str(exc),
+        }
 
     logger.info(
         "embedder | stored {} chunks across {} jobs with {}",
@@ -315,4 +365,5 @@ def embed_jobs(
         "jobs_total": len(jobs),
         "chunks_embedded": chunks_embedded,
         "model_name": model_name,
+        "vector_index": vector_index_result,
     }

@@ -30,6 +30,7 @@ isolated profiles, deployed to GCP.
 | 12 | ✅ | Filter disqualified jobs from UI; "Filtered out" summary in Activity tab |
 | 13 | ✅ | Scrape-filter rejection persistence: scrape_qualified/scrape_filter_reason columns, auditable dashboard toggle |
 | 17+20 | ✅ | Semantic job embeddings: `embedder.py`, `job_embeddings` table, embedding pipeline stage, `--embed-only` |
+| 18 | ✅ | ChromaDB vector retrieval: `vector_store.py`, persistent profile-scoped ANN index, `--vector-search`, `--rebuild-vector-index`, `--clear-vector-index` |
 
 ---
 
@@ -43,6 +44,7 @@ job-agent/
 ├── scraper.py               # Greenhouse + Lever + HN + Ashby + Workable + Himalayas scrapers
 ├── scorer.py                # LLM pipeline, RateLimiter, instructor integration
 ├── embedder.py              # Semantic chunking + sentence-transformers batch embeddings
+├── vector_store.py          # ChromaDB wrapper: profile-scoped indexing + semantic retrieval
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
@@ -58,6 +60,7 @@ job-agent/
 ├── ui_theme.py              # PAGE_TITLE, apply_page_scaffold()
 ├── test_scorer_recovery.py  # 10 unit tests for llm_utils recovery layer
 ├── test_embedder.py         # Chunking, embedding batch shape, DB round-trip
+├── test_vector_store.py     # Chroma indexing, idempotent upserts, rebuild/query tests
 ├── worker/
 │   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
 ├── profiles/
@@ -186,6 +189,7 @@ ProgressTracker.from_dict(data)  # reconstructs from dict
 
 Stage values (enum) are stored by `.value` string (e.g. "🔍 Discovering companies").
 Current ordered stages: `DISCOVERING -> FETCHING -> SCRAPING -> SCORING -> EMBEDDING -> FINALIZING`.
+Vector indexing is reported as metrics inside the `EMBEDDING` stage rather than as a separate stage.
 
 ---
 
@@ -282,6 +286,7 @@ error states — only `disqualified=1` and `scrape_qualified=0` hide jobs.
   `summary`, `responsibilities`, `requirements`, `compensation`, `benefits`
 - Sentence-transformers model loads lazily once per process and is cached in-module
 - Worker pipeline runs embeddings after scoring; CLI supports standalone refresh via `python main.py --embed-only`
+- When `embeddings.vector_store.enabled` is true, the embedder indexes freshly stored SQLite embeddings into ChromaDB without recomputing vectors
 
 ## candidate_profile.py key points
 
@@ -331,6 +336,7 @@ Key functions (all accept `profile=None`):
 - `get_scored_jobs_for_embedding(model_name, profile=None, limit=None, force=False) -> list[Job]` — scrape-qualified jobs with score rows, optionally only the unembedded subset for one model
 - `replace_job_embeddings(job_id, model_name, rows, profile=None)` — atomic delete+bulk-insert for one job/model pair
 - `get_job_embeddings(job_id, profile=None, model_name=None) -> list[dict]`
+- `get_embedding_index_rows(model_name, profile=None, job_ids=None) -> list[dict]` — SQLite-backed embedding rows joined with job and score metadata for Chroma indexing/rebuilds
 - `get_top_jobs(min_score, profile=None) -> list`
 - `count_jobs(profile=None) -> dict` — `{total, scored, embedded}` (includes disqualified in total)
 - `rescore_reset(profile=None)` — clears scores, resets score_attempts to 0
@@ -403,6 +409,89 @@ CREATE TABLE job_embeddings (
 Supporting indexes:
 - `idx_job_embeddings_model_job(model_name, job_id)` for "what still needs embeddings?" scans
 - `idx_job_embeddings_job(job_id)` for job detail / retrieval lookups
+
+### vector_store.py
+
+Purpose:
+- Wraps all ChromaDB usage behind one project-specific module
+- Keeps SQLite as the source of truth while treating ChromaDB as a rebuildable ANN index
+- Owns stable IDs, metadata validation, index rebuilds, and semantic retrieval aggregation
+
+Public API:
+- `get_chroma_client(profile)`
+- `get_job_collection(profile)`
+- `vector_store_enabled(config) -> bool`
+- `upsert_job_embeddings(profile, model_name, rows) -> dict`
+- `index_embedded_jobs(profile, model_name, force=False) -> dict`
+- `query_similar_chunks(profile, query, top_k_chunks=50, filters=None) -> list[VectorChunkResult]`
+- `query_similar_jobs(profile, query, top_k_chunks=50, top_k_jobs=30, filters=None) -> list[VectorJobResult]`
+- `rebuild_vector_index(profile, model_name=None) -> dict`
+- `clear_vector_index(profile) -> None`
+
+Storage path:
+- Default persist directory: `profiles/{profile}/chroma/`
+- One collection per profile: `job_chunks`
+
+Stable vector IDs:
+- Format: `{job_id}:{chunk_key}:{embedding_model_slug}`
+- Deterministic and idempotent across reruns
+
+Collection metadata:
+- `embedding_model`
+- `embedding_dimensions`
+- `distance_metric`
+- `created_by = job_search_ai_assistant`
+
+Stored Chroma metadata fields:
+- `profile`
+- `job_id`
+- `chunk_key`
+- `chunk_order`
+- `title`
+- `company`
+- `source`
+- `url`
+- `model_name`
+- `dimensions`
+- `scored_at`
+- `fit_score`
+- `ats_score`
+- `status`
+- `created_at`
+
+Document field:
+- The semantic chunk text only. Raw `jobs.raw_text` is not duplicated into Chroma metadata.
+
+Indexing flow:
+- `score_all_jobs()`
+- `embed_jobs()`
+- semantic chunks + normalized sentence-transformer vectors stored in SQLite `job_embeddings`
+- `vector_store.index_embedded_jobs()` reads those stored vectors back from SQLite and upserts them into ChromaDB
+
+Query flow:
+- `query_similar_chunks()` embeds the query with the same sentence-transformers model
+- Chroma returns nearest chunk candidates
+- `query_similar_jobs()` aggregates chunk hits into ranked job candidates using transparent section weights
+- Ranking formula: `best * 0.75 + top3_avg * 0.20 + coverage_bonus * 0.05`
+- Default section weights: `requirements 1.10`, `responsibilities 1.05`, `summary 1.00`, `compensation 0.90`, `benefits 0.80`
+- Compensation/benefits weights are relaxed upward only when the query explicitly asks about pay/perks
+
+Rebuild behavior:
+- `clear_vector_index(profile)` deletes the Chroma collection/files for that profile
+- `rebuild_vector_index(profile)` recreates the index from SQLite `job_embeddings`
+- If the collection metadata does not match the active embedding model/dimensions, the collection is recreated automatically
+
+Why Chroma is rebuildable and not source of truth:
+- SQLite keeps durable job rows, score rows, run history, and chunk embeddings
+- Chroma only accelerates retrieval over those persisted chunk vectors
+- If Chroma is missing or corrupted, it can be rebuilt from SQLite without touching scraping or scoring state
+
+### Retrieval Architecture
+
+- SQLite: durable job, score, run, and embedding records
+- ChromaDB: ANN retrieval index over chunk embeddings
+- Cross encoder: planned next step for reranking top vector candidates
+- LLM scorer: expensive final evaluator, not used for every retrieved job
 
 ### config.yaml structure
 
@@ -478,6 +567,14 @@ embeddings:
   enabled: true
   model: sentence-transformers/all-MiniLM-L6-v2
   batch_size: 8
+  vector_store:
+    enabled: true
+    provider: chromadb
+    persist_directory: null
+    collection_name: job_chunks
+    top_k_chunks: 50
+    top_k_jobs: 30
+    strict: false
 ```
 
 Internship profiles use this compensation shape instead:

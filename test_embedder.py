@@ -140,3 +140,53 @@ def test_embed_jobs_persists_and_reads_back_embeddings(monkeypatch):
     assert pending == []
 
     shutil.rmtree(root)
+
+
+def test_embed_jobs_skips_vector_index_when_disabled(monkeypatch):
+    root = Path(".tmp_streamlit_test") / "embedder_vector_disabled"
+    if root.exists():
+        shutil.rmtree(root)
+    profiles_dir = root / "profiles"
+    monkeypatch.setattr(db, "_PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr("embedder._load_sentence_transformer", lambda model_name: _FakeModel())
+    monkeypatch.setattr(
+        "vector_store.index_embedded_jobs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not index")),
+    )
+
+    profile = "embedder_disabled"
+    init_db(profile=profile)
+    job = _sample_job()
+    assert insert_job(job, profile=profile) is True
+    save_score(
+        job_id=job.id,
+        fit_score=78,
+        role_fit=8,
+        stack_match=8,
+        seniority=7,
+        loc_score=10,
+        growth=6,
+        compensation=8,
+        reasons='["strong python fit"]',
+        flags="[]",
+        skill_misses="[]",
+        one_liner="Strong backend match",
+        ats_score=75,
+        profile=profile,
+    )
+
+    config = {
+        "embeddings": {
+            "enabled": True,
+            "model": "sentence-transformers/all-MiniLM-L6-v2",
+            "batch_size": 2,
+            "vector_store": {"enabled": False},
+        }
+    }
+
+    result = embed_jobs(config, profile=profile, force=False)
+
+    assert result["vector_index"]["status"] == "disabled"
+    assert result["vector_index"]["chunks_indexed"] == 0
+
+    shutil.rmtree(root)

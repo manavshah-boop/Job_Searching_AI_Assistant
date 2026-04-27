@@ -33,6 +33,14 @@ from scorer import RateLimitReached, print_results, score_all_jobs
 from theirstack import get_or_discover_slugs
 from logging_config import configure_logging
 from loguru import logger
+from vector_store import (
+    clear_vector_index,
+    query_similar_jobs,
+    rebuild_vector_index,
+    vector_store_enabled,
+    vector_top_k_chunks,
+    vector_top_k_jobs,
+)
 
 
 # Map provider name -> expected environment variable
@@ -56,6 +64,12 @@ def parse_args() -> argparse.Namespace:
                       help="Score unscored jobs in DB, skip scraping")
     mode.add_argument("--embed-only",  action="store_true",
                       help="Generate embeddings for scored jobs in DB, skip scraping/scoring")
+    mode.add_argument("--vector-search", type=str, metavar="QUERY",
+                      help="Semantic search over embedded job chunks, skip scraping/scoring")
+    mode.add_argument("--rebuild-vector-index", action="store_true",
+                      help="Rebuild the ChromaDB vector index from SQLite embeddings")
+    mode.add_argument("--clear-vector-index", action="store_true",
+                      help="Delete the profile-scoped ChromaDB vector index")
     mode.add_argument("--show",        action="store_true",
                       help="Print current top jobs from DB, no scraping or scoring")
 
@@ -112,7 +126,7 @@ def _print_banner(config: dict) -> None:
 
     logger.info("Job Agent")
     logger.info(f"Provider: {provider} ({model})")
-    logger.info("Sources: %s", "  ".join(enabled_names) if enabled_names else "none")
+    logger.info("Sources: {}", "  ".join(enabled_names) if enabled_names else "none")
     logger.info(f"DB: {stats['total']} jobs total, {stats['scored']} scored, {stats.get('embedded', 0)} embedded")
 
 
@@ -190,6 +204,27 @@ def _run_scrapers(config: dict, profile: str | None = None) -> dict:
     }
 
 
+def _print_vector_results(results, query: str) -> None:
+    if not results:
+        logger.info("No semantic matches found for query: {}", query)
+        return
+
+    print(f"\n{'=' * 68}")
+    print(f"  VECTOR SEARCH RESULTS ({len(results)} jobs)")
+    print(f"{'=' * 68}\n")
+
+    for result in results:
+        similarity_pct = round(result.aggregate_score * 100)
+        matched = ", ".join(result.matched_chunks) or "none"
+        print(f"• {result.title} — {result.company}")
+        print(f"  Similarity: {similarity_pct}%  |  Best chunk: {round(result.best_similarity * 100)}%")
+        print(f"  Matched sections: {matched}")
+        print(f"  Why: {result.retrieval_reason}")
+        if result.url:
+            print(f"  {result.url}")
+        print()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -227,8 +262,50 @@ def main() -> None:
             print_results(results, config)
         return
 
+    if args.clear_vector_index:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; nothing to clear.")
+            return
+        clear_vector_index(args.profile or "default")
+        logger.info("Cleared vector index for profile '{}'.", args.profile or "default")
+        return
+
+    if args.rebuild_vector_index:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; nothing to rebuild.")
+            return
+        result = rebuild_vector_index(args.profile or "default")
+        logger.info(
+            "Rebuilt vector index: {} chunks across {} jobs",
+            result.get("chunks_indexed", 0),
+            result.get("jobs_indexed", 0),
+        )
+        return
+
+    if args.vector_search:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; semantic search is unavailable.")
+            return
+        results = query_similar_jobs(
+            args.profile or "default",
+            args.vector_search,
+            top_k_chunks=vector_top_k_chunks(config),
+            top_k_jobs=vector_top_k_jobs(config),
+        )
+        _print_vector_results(results, args.vector_search)
+        return
+
     # Validate API key before starting any work if scoring will run
-    will_score = not (args.scrape_only or args.embed_only)
+    will_score = not (
+        args.scrape_only
+        or args.embed_only
+        or args.vector_search
+        or args.rebuild_vector_index
+        or args.clear_vector_index
+    )
     if will_score:
         _check_api_key(provider, args.profile)
 
@@ -307,7 +384,16 @@ def main() -> None:
                 embed_stats.get("jobs_embedded", 0),
                 embed_stats.get("chunks_embedded", 0),
             )
-        logger.info("%s", "─" * 44)
+        vector_summary = embed_stats.get("vector_index", {})
+        if vector_summary.get("enabled"):
+            logger.info(
+                "Indexed this run: {} chunks across {} jobs",
+                vector_summary.get("chunks_indexed", 0),
+                vector_summary.get("jobs_indexed", 0),
+            )
+            if vector_summary.get("status") == "failed" and vector_summary.get("error"):
+                logger.warning("Vector indexing error: {}", vector_summary["error"])
+        logger.info("{}", "─" * 44)
 
     except KeyboardInterrupt:
         final_status = "failed"
@@ -320,7 +406,7 @@ def main() -> None:
     except Exception as e:
         final_status = "failed"
         final_errors = [str(e)]
-        logger.error("Pipeline crashed: %s", e)
+        logger.error("Pipeline crashed: {}", e)
         stats = count_jobs(profile=args.profile)
         logger.info("DB state: %d jobs total, %d scored", stats['total'], stats['scored'])
         raise
