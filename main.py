@@ -256,6 +256,11 @@ def _print_reranked_results(results, query_label: str) -> None:
         print(f"  Final: {final_pct}%  |  Vector: {vector_pct}%  |  Rerank: {rerank_pct}%")
         print(f"  Matched sections: {matched}")
         print(f"  Why: {result.match_reason}")
+        ev = getattr(result, "evidence", None)
+        if ev is not None and ev.positive:
+            print(f"  Positive: {' · '.join(ev.positive)}")
+        if ev is not None and ev.concerns:
+            print(f"  Concerns: {' · '.join(ev.concerns)}")
         for snippet in result.evidence_snippets[:2]:
             if snippet:
                 print(f"  Evidence: {snippet}")

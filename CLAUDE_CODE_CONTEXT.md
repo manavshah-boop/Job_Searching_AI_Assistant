@@ -14,7 +14,8 @@ isolated profiles, deployed to GCP.
 - Simple infra — SQLite, profile-isolated DBs
 - No overengineering — if it works for two people, it's done
 
-| 21 | âœ… | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
+| 21 | ✅ | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
+| 22 | ✅ | Role-agnostic profile intent + evidence matching: `profile_intent.py`, `ProfileIntent`, canonical section taxonomy, role-family section weights, `MatchEvidence` with positive/negative signals |
 
 ---
 
@@ -22,7 +23,7 @@ isolated profiles, deployed to GCP.
 
 | Step | Status | Description |
 |---|---|---|
-| 1-5 | ✅ | Skeleton, scrapers, LLM scorer, main.py |
+| 1-5  | ✅ | Skeleton, scrapers, LLM scorer, main.py |
 | 6 | ✅ | Profile system + Streamlit onboarding |
 | 7 | ✅ | Streamlit dashboard with sidebar, 5-section nav |
 | 8 | ✅ | Pydantic models + instructor structured output |
@@ -33,6 +34,92 @@ isolated profiles, deployed to GCP.
 | 13 | ✅ | Scrape-filter rejection persistence: scrape_qualified/scrape_filter_reason columns, auditable dashboard toggle |
 | 17+20 | ✅ | Semantic job embeddings: `embedder.py`, `job_embeddings` table, embedding pipeline stage, `--embed-only` |
 | 18 | ✅ | ChromaDB vector retrieval: `vector_store.py`, persistent profile-scoped ANN index, `--vector-search`, `--rebuild-vector-index`, `--clear-vector-index` |
+
+---
+
+## Step 22 — Role-agnostic profile intent and evidence-based matching
+
+### profile_intent.py
+
+New module that converts a config dict into a `ProfileIntent` dataclass. This removes the assumption that users are always searching for software engineering roles.
+
+**ProfileIntent fields:** `profile_name`, `role_family`, `target_roles`, `seniority`, `years_experience`, `industries`, `domain_skills`, `tools`, `credentials`, `education`, `locations`, `remote_ok`, `compensation`, `dealbreakers`, `nice_to_haves`, `job_type`, `raw_keywords`
+
+**Supported role families:**
+`software_engineering`, `data_analytics`, `finance`, `product_management`, `operations`, `sales`, `marketing`, `design`, `internship`, `general`
+
+Unknown role families fall back to `general`. Add `role_family: finance` to `profile.role_family` in config to override inference.
+
+**Role family inference:** signal matching over titles + skills + bio/resume text. Explicit config key `profile.role_family` always wins.
+
+**Public API:**
+- `normalize_profile_intent(config) -> ProfileIntent` — main entry point
+- `get_role_family_section_weights(role_family) -> dict[str, float]` — chunk-key weights per family
+- `map_header_to_canonical(text) -> str | None` — maps a JD header to canonical section name
+
+### Canonical section taxonomy
+
+`CANONICAL_SECTION_ALIASES` maps canonical labels to lists of header phrases found in real job postings.
+
+Canonical sections: `summary`, `company`, `responsibilities`, `requirements`, `preferred_qualifications`, `tools_and_skills`, `logistics`, `compensation`, `benefits`
+
+`CANONICAL_TO_CHUNK_KEY` maps canonical labels to the five chunk_key values used in SQLite/Chroma:
+- `preferred_qualifications` → `requirements`
+- `tools_and_skills` → `requirements`
+- `logistics` → `requirements`
+- `company` → `summary`
+- `unknown` → `summary`
+
+Existing `chunk_key` values and DB schema are unchanged. The canonical taxonomy is used in `embedder._classify_header` for better header detection.
+
+### Role-family section weights
+
+`profile_intent.get_role_family_section_weights(role_family)` returns a `dict[chunk_key -> float]`. These replace the static `SECTION_WEIGHTS` dict in reranker.py per-job when the candidate's role family is known.
+
+Examples:
+- `software_engineering`: requirements=1.20, responsibilities=1.15, summary=1.00, compensation=0.90, benefits=0.80
+- `finance`: requirements=1.20, responsibilities=1.15, compensation=0.95 (slightly higher than software)
+- `internship`: responsibilities=1.15, compensation=1.10 (compensation matters more)
+- `sales`: responsibilities=1.20, compensation=1.00 (both high signal for sales roles)
+
+### MatchEvidence
+
+New dataclass in `reranker.py`:
+
+```python
+@dataclass
+class MatchEvidence:
+    positive: list[str]       # title match, skills present, remote match, etc.
+    concerns: list[str]       # seniority mismatch, clearance, missing credential, etc.
+    matched_keywords: list[str]
+    missing_or_unclear: list[str]
+```
+
+`RerankedJobResult` now includes an `evidence: MatchEvidence` field. Evidence is deterministic — no LLM.
+
+**Positive signals:** title keyword overlap, skills/tools found in chunk text, location/remote match, industry match.
+
+**Concern signals:** senior/staff/lead in job title for entry/mid profiles, clearance requirements, no-sponsorship language, credential requirements (CPA, CFA, PMP, MBA, clearance, degree) not listed in the profile, unpaid internship when `paid_only` preference is set.
+
+### build_profile_match_query
+
+Now delegates to `normalize_profile_intent(config)` so the generated query is always role-agnostic.
+
+Finance example: `"Candidate seeking full-time Financial Analyst, FP&A Analyst roles. Experience: 2 years. Skills: financial modeling, budgeting, Excel, SQL. Preferences: remote or New York, NY, compensation $80,000+. Avoid: Senior/Director/VP roles."`
+
+Marketing example: `"Candidate seeking full-time Growth Marketing Manager, Lifecycle Marketing roles. Skills: SEO, email campaigns, Google Analytics, HubSpot. Preferences: remote-friendly. Avoid: Director/VP/Head of roles."`
+
+### Dashboard (semantic match panel)
+
+Now shows:
+- Final score, matched sections, match reason (unchanged)
+- **Positive signals** line (e.g. "Title match: Backend Engineer · Skills present: Python, SQL, AWS · Remote-friendly posting")
+- **Concerns** line when present (e.g. "Seniority concern: posting appears senior-level · Clearance requirement detected")
+- Evidence snippets as italic captions
+
+### CLI (--semantic-match and --semantic-search --rerank)
+
+Now prints `Positive: ...` and `Concerns: ...` lines below the match reason for each result.
 
 ---
 
@@ -48,6 +135,7 @@ job-agent/
 ├── embedder.py              # Semantic chunking + sentence-transformers batch embeddings
 ├── vector_store.py          # ChromaDB wrapper: profile-scoped indexing + semantic retrieval
 ├── reranker.py              # Cross-encoder reranking over vector-retrieved job chunks
+├── profile_intent.py        # ProfileIntent normalization, canonical section taxonomy, role-family weights
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
@@ -62,9 +150,10 @@ job-agent/
 ├── ui_shell.py              # toolbar(), panel(), callout(), badge(), etc.
 ├── ui_theme.py              # PAGE_TITLE, apply_page_scaffold()
 ├── test_scorer_recovery.py  # 10 unit tests for llm_utils recovery layer
-├── test_embedder.py         # Chunking, embedding batch shape, DB round-trip
+├── test_embedder.py         # Chunking, embedding batch shape, DB round-trip, canonical alias tests
 ├── test_vector_store.py     # Chroma indexing, idempotent upserts, rebuild/query tests
-├── test_reranker.py         # Profile-aware query building and reranking aggregation tests
+├── test_reranker.py         # Profile-aware query building, role-family weights, evidence tests
+├── test_profile_intent.py   # Role family inference, ProfileIntent normalization, canonical taxonomy
 ├── worker/
 │   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
 ├── profiles/

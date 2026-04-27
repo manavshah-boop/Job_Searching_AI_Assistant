@@ -18,6 +18,12 @@ from typing import Any, Iterable, Optional, Sequence
 
 from loguru import logger
 
+from profile_intent import (
+    CREDENTIAL_REQUIREMENT_PATTERNS,
+    ProfileIntent,
+    get_role_family_section_weights,
+    normalize_profile_intent,
+)
 from vector_store import (
     VectorChunkResult,
     VectorJobResult,
@@ -44,6 +50,7 @@ SECTION_PRIORITY = {
     "benefits": 1,
 }
 
+# Base section weights (role-family aware weights from profile_intent override these per job).
 SECTION_WEIGHTS = {
     "requirements": 1.15,
     "responsibilities": 1.10,
@@ -100,6 +107,11 @@ STOPWORDS = {
     "with",
 }
 
+_SENIOR_TITLE_SIGNALS = (
+    "senior", "sr.", "staff", "principal", "lead", "director",
+    "vp ", "head of", "manager", "executive",
+)
+
 _MODEL_CACHE: dict[str, Any] = {}
 
 
@@ -120,6 +132,15 @@ class RerankedChunkResult:
 
 
 @dataclass
+class MatchEvidence:
+    """Deterministic positive and negative signals extracted from reranked job chunks."""
+    positive: list[str] = field(default_factory=list)
+    concerns: list[str] = field(default_factory=list)
+    matched_keywords: list[str] = field(default_factory=list)
+    missing_or_unclear: list[str] = field(default_factory=list)
+
+
+@dataclass
 class RerankedJobResult:
     job_id: str
     title: str
@@ -134,6 +155,7 @@ class RerankedJobResult:
     best_chunk_key: str = ""
     match_reason: str = ""
     evidence_snippets: list[str] = field(default_factory=list)
+    evidence: MatchEvidence = field(default_factory=MatchEvidence)
 
 
 @dataclass
@@ -246,98 +268,57 @@ def _dedupe_preserve_order(values: Iterable[str]) -> list[str]:
     return result
 
 
-def _looks_like_tech_skill(skill: str) -> bool:
-    text = skill.lower()
-    tokens = ("python", "sql", "aws", "api", "react", "fastapi", "docker", "kubernetes", "redis", "postgres")
-    return any(token in text for token in tokens) or len(skill.split()) <= 3
-
-
-def _extract_candidate_skills(config: dict[str, Any]) -> list[str]:
-    prefs = config.get("preferences", {})
-    profile_cfg = config.get("profile", {})
-    desired_skills = _dedupe_preserve_order(prefs.get("desired_skills", []))
-    resume_text = f"{profile_cfg.get('resume', '')}\n{profile_cfg.get('bio', '')}".lower()
-
-    preferred = [skill for skill in desired_skills if skill.lower() in resume_text]
-    technical = [skill for skill in desired_skills if _looks_like_tech_skill(skill)]
-    merged = _dedupe_preserve_order(preferred + technical + desired_skills)
-    return merged[:8]
-
-
-def _build_preference_summary(config: dict[str, Any]) -> list[str]:
-    prefs = config.get("preferences", {})
-    location = prefs.get("location", {})
-    compensation = prefs.get("compensation", {})
-    profile_cfg = config.get("profile", {})
-    parts: list[str] = []
-
-    preferred_locations = _dedupe_preserve_order(location.get("preferred_locations", []))
-    if location.get("remote_ok", True) and preferred_locations:
-        parts.append(f"remote or {', '.join(preferred_locations[:3])}")
-    elif location.get("remote_ok", True):
-        parts.append("remote-friendly")
-    elif preferred_locations:
-        parts.append(", ".join(preferred_locations[:3]))
-
-    job_type = str(profile_cfg.get("job_type", "fulltime")).strip().lower()
-    if job_type == "internship":
-        parts.append("internship roles")
-        pay_pref = str(compensation.get("intern_pay_preference", "")).strip().lower()
-        if pay_pref == "paid_only":
-            stipend = compensation.get("monthly_stipend")
-            if stipend not in (None, "", 0):
-                parts.append(f"paid internships around ${int(stipend):,}/mo or higher")
-            else:
-                parts.append("paid internships only")
-    else:
-        parts.append("full-time roles")
-        min_salary = compensation.get("min_salary")
-        if min_salary not in (None, "", 0):
-            parts.append(f"compensation around ${int(min_salary):,}+")
-
-    return parts
-
-
-def _build_avoid_summary(config: dict[str, Any]) -> list[str]:
-    prefs = config.get("preferences", {})
-    filters = prefs.get("filters", {})
-    avoid: list[str] = []
-
-    if filters.get("title_blocklist"):
-        blocked = [str(item).strip() for item in filters.get("title_blocklist", []) if str(item).strip()]
-        if blocked:
-            avoid.append(f"{'/'.join(blocked[:4])} roles")
-
-    hard_no = [str(item).strip() for item in prefs.get("hard_no_keywords", []) if str(item).strip()]
-    for phrase in hard_no[:4]:
-        simplified = phrase.replace("required", "").strip()
-        if simplified:
-            avoid.append(simplified)
-    return _dedupe_preserve_order(avoid)[:4]
-
-
 def build_profile_match_query(config: dict[str, Any], user_query: str | None = None) -> str:
-    prefs = config.get("preferences", {})
-    titles = _dedupe_preserve_order(prefs.get("titles", []))[:4]
-    yoe = prefs.get("yoe", 0)
-    job_type = str(config.get("profile", {}).get("job_type", "fulltime")).strip().lower()
-    skills = _extract_candidate_skills(config)
-    preference_parts = _build_preference_summary(config)
-    avoid_parts = _build_avoid_summary(config)
+    """Build a concise, role-agnostic match query from the candidate's ProfileIntent."""
+    intent = normalize_profile_intent(config)
 
     segments: list[str] = []
     if include_profile_context(config):
-        role_label = "internship" if job_type == "internship" else "full-time"
-        role_text = ", ".join(titles) if titles else "software engineering"
+        role_label = "internship" if intent.job_type == "internship" else "full-time"
+        role_text = ", ".join(intent.target_roles[:4]) if intent.target_roles else "relevant"
         segments.append(f"Candidate seeking {role_label} {role_text} roles.")
-        if yoe:
-            segments.append(f"Experience: {yoe} years.")
-        if skills:
-            segments.append(f"Strong skills: {', '.join(skills)}.")
+
+        if intent.years_experience:
+            segments.append(f"Experience: {intent.years_experience:.0f} years.")
+
+        all_skills = _dedupe_preserve_order(intent.domain_skills + intent.tools)[:8]
+        if all_skills:
+            segments.append(f"Skills: {', '.join(all_skills)}.")
+
+        if intent.credentials:
+            segments.append(f"Credentials: {', '.join(intent.credentials[:3])}.")
+
+        preference_parts: list[str] = []
+        if intent.remote_ok and intent.locations:
+            preference_parts.append(f"remote or {', '.join(intent.locations[:2])}")
+        elif intent.remote_ok:
+            preference_parts.append("remote-friendly")
+        elif intent.locations:
+            preference_parts.append(", ".join(intent.locations[:2]))
+
+        if intent.job_type == "internship":
+            pay_pref = intent.compensation.get("intern_pay_preference", "")
+            if pay_pref == "paid_only":
+                stipend = intent.compensation.get("monthly_stipend")
+                if stipend:
+                    preference_parts.append(f"paid internships ${int(stipend):,}/mo+")
+                else:
+                    preference_parts.append("paid internships only")
+        else:
+            min_salary = intent.compensation.get("min_salary")
+            if min_salary:
+                preference_parts.append(f"compensation ${int(min_salary):,}+")
+
         if preference_parts:
             segments.append(f"Preferences: {', '.join(preference_parts)}.")
-        if avoid_parts:
-            segments.append(f"Avoid: {', '.join(avoid_parts)}.")
+
+        if intent.dealbreakers:
+            avoid_parts = _dedupe_preserve_order(
+                [db.replace("required", "").strip() for db in intent.dealbreakers[:4]]
+            )
+            avoid_parts = [p for p in avoid_parts if p]
+            if avoid_parts:
+                segments.append(f"Avoid: {', '.join(avoid_parts[:4])}.")
 
     if include_query_context(config) and user_query and user_query.strip():
         segments.append(f"User intent: {user_query.strip()}.")
@@ -346,18 +327,15 @@ def build_profile_match_query(config: dict[str, Any], user_query: str | None = N
 
 
 def _build_vector_recall_query(config: dict[str, Any]) -> str:
-    prefs = config.get("preferences", {})
-    titles = _dedupe_preserve_order(prefs.get("titles", []))[:4]
-    skills = _extract_candidate_skills(config)[:8]
-    locations = _dedupe_preserve_order(prefs.get("location", {}).get("preferred_locations", []))[:2]
+    """Build a compact token-based query for initial ANN recall."""
+    intent = normalize_profile_intent(config)
     tokens: list[str] = []
-    tokens.extend(titles)
-    tokens.extend(skills)
-    if config.get("preferences", {}).get("location", {}).get("remote_ok", True):
+    tokens.extend(intent.target_roles[:4])
+    tokens.extend((intent.domain_skills + intent.tools)[:8])
+    if intent.remote_ok:
         tokens.append("remote")
-    tokens.extend(locations)
-    job_type = str(config.get("profile", {}).get("job_type", "fulltime")).strip().lower()
-    if job_type == "internship":
+    tokens.extend(intent.locations[:2])
+    if intent.job_type == "internship":
         tokens.append("internship")
     else:
         tokens.append("full-time")
@@ -372,12 +350,13 @@ def _detect_match_intent(match_query: str) -> MatchIntent:
     )
 
 
-def _section_weight(chunk_key: str, intent: MatchIntent) -> float:
+def _section_weight(chunk_key: str, intent: MatchIntent, role_family: str = "general") -> float:
     if chunk_key == "compensation" and intent.compensation:
         return 1.05
     if chunk_key == "benefits" and (intent.compensation or intent.benefits):
         return 1.00
-    return SECTION_WEIGHTS.get(chunk_key, 1.0)
+    family_weights = get_role_family_section_weights(role_family)
+    return family_weights.get(chunk_key, SECTION_WEIGHTS.get(chunk_key, 1.0))
 
 
 def _section_priority(chunk_key: str, intent: MatchIntent) -> int:
@@ -493,6 +472,7 @@ def rerank_chunks(
         return []
 
     intent = _detect_match_intent(match_query)
+    role_family = normalize_profile_intent(config).role_family
     max_chunk_chars = reranking_max_chunk_chars(config)
     model = get_cross_encoder(config)
     pairs = [(match_query, _prepare_chunk_text(chunk, max_chunk_chars)) for chunk in chunk_results]
@@ -515,7 +495,7 @@ def rerank_chunks(
     for chunk, raw_score in zip(chunk_results, raw_scores):
         raw_value = float(raw_score)
         normalized = _sigmoid(raw_value)
-        weighted = min(1.0, normalized * _section_weight(chunk.chunk_key, intent))
+        weighted = min(1.0, normalized * _section_weight(chunk.chunk_key, intent, role_family))
         reranked.append(
             RerankedChunkResult(
                 job_id=chunk.job_id,
@@ -560,7 +540,7 @@ def _extract_evidence_terms(match_query: str, chunks: Sequence[RerankedChunkResu
     for term in _query_terms(match_query):
         if term.lower() in combined and term.lower() not in {value.lower() for value in matches}:
             matches.append(term)
-        if len(matches) >= 3:
+        if len(matches) >= 5:
             break
     return matches
 
@@ -579,19 +559,120 @@ def _snippet_for_chunk(chunk_text: str, terms: Sequence[str], max_chars: int = 1
     return f"{snippet}..." if len(text) > max_chars else snippet
 
 
-def _match_reason(section_scores: dict[str, float], evidence_terms: Sequence[str]) -> str:
-    strong_sections = [key for key in ("requirements", "responsibilities", "summary") if section_scores.get(key, 0.0) >= 0.55]
+def _extract_match_evidence(
+    intent: ProfileIntent,
+    job_title: str,
+    chunks: Sequence[RerankedChunkResult],
+    evidence_terms: Sequence[str],
+) -> MatchEvidence:
+    """Extract deterministic positive and negative signals from reranked chunks."""
+    combined = " ".join(chunk.chunk_text.lower() for chunk in chunks)
+    job_title_lower = job_title.lower()
+
+    positive: list[str] = []
+    concerns: list[str] = []
+    matched_keywords: list[str] = list(evidence_terms[:8])
+    missing_or_unclear: list[str] = []
+
+    # Role title match
+    for target_role in intent.target_roles[:3]:
+        role_words = [w.lower() for w in target_role.split() if len(w) > 2]
+        if role_words and any(w in job_title_lower for w in role_words):
+            positive.append(f"Title match: {target_role}")
+            break
+
+    # Skill/tool match in chunk text
+    all_skills = _dedupe_preserve_order(intent.domain_skills + intent.tools)[:12]
+    found_skills = [s for s in all_skills if s.lower() in combined]
+    if found_skills:
+        positive.append(f"Skills present: {', '.join(found_skills[:5])}")
+        for s in found_skills[:5]:
+            if s.lower() not in {k.lower() for k in matched_keywords}:
+                matched_keywords.append(s)
+
+    # Location / remote match
+    if intent.remote_ok and "remote" in combined:
+        positive.append("Remote-friendly posting")
+    else:
+        for loc in intent.locations[:2]:
+            if loc.lower() in combined:
+                positive.append(f"Location match: {loc}")
+                break
+
+    # Industry match
+    for industry in intent.industries[:2]:
+        if industry.lower() in combined:
+            positive.append(f"Industry match: {industry}")
+            break
+
+    # Seniority mismatch check
+    if intent.seniority in ("entry", "mid", "intern"):
+        for signal in _SENIOR_TITLE_SIGNALS:
+            if signal in job_title_lower:
+                concerns.append(f"Seniority concern: posting appears {signal.strip()}-level")
+                break
+
+    # Security clearance requirement
+    clearance_patterns = ("security clearance", "secret clearance", "top secret", "ts/sci", "clearance required")
+    if any(pat in combined for pat in clearance_patterns):
+        concerns.append("Clearance requirement detected")
+
+    # Work authorization / no sponsorship
+    no_sponsor_patterns = ("no sponsorship", "no visa", "must be authorized", "us citizen only")
+    if any(pat in combined for pat in no_sponsor_patterns):
+        concerns.append("Work authorization requirement detected")
+
+    # Credential requirements not in profile
+    for cred_label, patterns in CREDENTIAL_REQUIREMENT_PATTERNS.items():
+        if any(pat in combined for pat in patterns):
+            profile_has = any(cred_label.lower() in c.lower() for c in intent.credentials)
+            if not profile_has:
+                concerns.append(f"Credential may be required: {cred_label}")
+                missing_or_unclear.append(cred_label)
+
+    # Unpaid internship check
+    if intent.job_type == "internship":
+        pay_pref = intent.compensation.get("intern_pay_preference", "no_preference")
+        if pay_pref == "paid_only" and "unpaid" in combined:
+            concerns.append("Posting may be unpaid (profile requires paid internship)")
+
+    # Location mismatch for non-remote profiles
+    if not intent.remote_ok and intent.locations:
+        onsite_signals = ("must be located", "must reside", "in-office", "no remote")
+        if any(sig in combined for sig in onsite_signals):
+            if not any(loc.lower() in combined for loc in intent.locations):
+                concerns.append("Location may not match profile preferences")
+
+    return MatchEvidence(
+        positive=positive[:5],
+        concerns=concerns[:5],
+        matched_keywords=_dedupe_preserve_order(matched_keywords)[:8],
+        missing_or_unclear=missing_or_unclear[:4],
+    )
+
+
+def _match_reason(
+    section_scores: dict[str, float],
+    evidence_terms: Sequence[str],
+    intent: Optional[ProfileIntent] = None,
+) -> str:
+    strong_sections = [
+        key for key in ("requirements", "responsibilities", "summary")
+        if section_scores.get(key, 0.0) >= 0.55
+    ]
     if not strong_sections:
         return "Moderate semantic match from supporting job sections."
 
-    if len(strong_sections) == 1:
-        base = f"Strong match in {strong_sections[0]}"
-    else:
-        base = f"Strong match in {strong_sections[0]} and {strong_sections[1]}"
+    terms_str = ", ".join(evidence_terms[:4]) if evidence_terms else ""
 
-    if evidence_terms:
-        return f"{base} for {', '.join(evidence_terms)}."
-    return f"{base}."
+    if len(strong_sections) >= 2:
+        section_label = f"{strong_sections[0]} and {strong_sections[1]}"
+    else:
+        section_label = strong_sections[0]
+
+    if terms_str:
+        return f"Strong {section_label} match for {terms_str}."
+    return f"Strong match in {section_label}."
 
 
 def _fallback_from_vector_results(vector_job_results: Sequence[VectorJobResult]) -> list[RerankedJobResult]:
@@ -616,6 +697,7 @@ def _fallback_from_vector_results(vector_job_results: Sequence[VectorJobResult])
                 best_chunk_key=job.matched_chunks[0] if job.matched_chunks else "",
                 match_reason=job.retrieval_reason,
                 evidence_snippets=[],
+                evidence=MatchEvidence(),
             )
         )
     return results
@@ -632,6 +714,8 @@ def rerank_jobs(
 
     if not reranking_enabled(config):
         return _fallback_from_vector_results(vector_job_results)
+
+    profile_intent = normalize_profile_intent(config)
 
     selected_chunks: list[VectorChunkResult] = []
     for job in vector_job_results:
@@ -653,7 +737,6 @@ def rerank_jobs(
         chunks_by_job.setdefault(chunk.job_id, []).append(chunk)
 
     ranked_jobs: list[RerankedJobResult] = []
-    top_ids: list[str] = []
     for vector_job in vector_job_results:
         job_chunks = chunks_by_job.get(vector_job.job_id, [])
         if not job_chunks:
@@ -667,6 +750,7 @@ def rerank_jobs(
         final_score = min(1.0, rerank_score + vector_job.aggregate_score * 0.05)
         evidence_terms = _extract_evidence_terms(match_query, ordered)
         evidence_snippets = [_snippet_for_chunk(chunk.chunk_text, evidence_terms) for chunk in ordered[:2]]
+        evidence = _extract_match_evidence(profile_intent, vector_job.title, ordered, evidence_terms)
         ranked_jobs.append(
             RerankedJobResult(
                 job_id=vector_job.job_id,
@@ -680,8 +764,9 @@ def rerank_jobs(
                 matched_sections=[chunk.chunk_key for chunk in ordered[:4]],
                 section_scores={key: round(value, 4) for key, value in section_scores.items()},
                 best_chunk_key=ordered[0].chunk_key,
-                match_reason=_match_reason(section_scores, evidence_terms),
+                match_reason=_match_reason(section_scores, evidence_terms, profile_intent),
                 evidence_snippets=evidence_snippets,
+                evidence=evidence,
             )
         )
 
