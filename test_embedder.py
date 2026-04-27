@@ -196,6 +196,51 @@ def test_embed_jobs_skips_vector_index_when_disabled(monkeypatch):
     shutil.rmtree(root)
 
 
+def test_embed_jobs_chunks_each_job_once(monkeypatch):
+    root = Path(".tmp_streamlit_test") / "embedder_chunk_cache"
+    if root.exists():
+        shutil.rmtree(root)
+    profiles_dir = root / "profiles"
+    monkeypatch.setattr(db, "_PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr("embedder._load_sentence_transformer", lambda model_name: _FakeModel())
+
+    profile = "embedder_cache"
+    init_db(profile=profile)
+    job = _sample_job()
+    assert insert_job(job, profile=profile) is True
+    save_score(
+        job_id=job.id,
+        fit_score=78,
+        role_fit=8,
+        stack_match=8,
+        seniority=7,
+        loc_score=10,
+        growth=6,
+        compensation=8,
+        reasons='["strong python fit"]',
+        flags="[]",
+        skill_misses="[]",
+        one_liner="Strong backend match",
+        ats_score=75,
+        profile=profile,
+    )
+
+    original = semantic_chunk_job
+    calls = []
+
+    def _counting_chunker(job_obj, max_chunk_chars=1400):
+        calls.append(job_obj.id)
+        return original(job_obj, max_chunk_chars=max_chunk_chars)
+
+    monkeypatch.setattr("embedder.semantic_chunk_job", _counting_chunker)
+
+    embed_jobs({"embeddings": {"enabled": True, "model": "sentence-transformers/all-MiniLM-L6-v2"}}, profile=profile)
+
+    assert calls == [job.id]
+
+    shutil.rmtree(root)
+
+
 # ── Canonical section alias tests ────────────────────────────────────────────
 
 

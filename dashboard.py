@@ -47,6 +47,7 @@ from db import (
     start_run,
     update_job_status,
 )
+from dashboard_semantic import clear_semantic_panel_caches, render_semantic_match_panel
 from dashboard_ui import (
     render_activity_feed,
     render_pipeline_stages,
@@ -56,7 +57,6 @@ from dashboard_ui import (
 from logging_config import configure_logging
 from onboarding import render_onboarding, sanitize_slug
 from progress_tracker import ProgressTracker
-from reranker import build_profile_match_query, reranking_enabled, semantic_match_jobs
 from scorer import score_all_jobs
 from ui_shell import (
     badge,
@@ -72,7 +72,6 @@ from ui_shell import (
     toolbar,
 )
 from ui_theme import PAGE_TITLE, apply_page_scaffold
-from vector_store import query_similar_jobs, vector_store_enabled, vector_top_k_chunks, vector_top_k_jobs
 
 load_dotenv()
 
@@ -255,37 +254,12 @@ def _cached_recent_runs(slug: str) -> list[dict[str, Any]]:
     return get_recent_runs(limit=20, profile=slug)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
-def _cached_vector_search(
-    slug: str,
-    query: str,
-    top_k_chunks: int,
-    top_k_jobs: int,
-) -> list:
-    return query_similar_jobs(
-        slug,
-        query,
-        top_k_chunks=top_k_chunks,
-        top_k_jobs=top_k_jobs,
-    )
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def _cached_semantic_match(
-    slug: str,
-    config: dict[str, Any],
-    query: str | None,
-) -> list:
-    return semantic_match_jobs(slug, config, user_query=query)
-
-
 def invalidate_dashboard_caches() -> None:
     _cached_list_profiles.clear()
     _cached_fetch_job_summaries.clear()
     _cached_fetch_job_detail.clear()
     _cached_recent_runs.clear()
-    _cached_vector_search.clear()
-    _cached_semantic_match.clear()
+    clear_semantic_panel_caches()
 
 
 def build_jobs_table_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
@@ -2452,7 +2426,7 @@ def _render_jobs_tab(
             return
 
         with panel("Semantic search", subtitle="Proof that retrieval works: search embedded job sections directly"):
-            _render_semantic_search_results(slug, config)
+            render_semantic_match_panel(slug, config)
 
         source_options = sorted({record["source_label"] for record in records})
         status_options = sorted({record["status_label"] for record in records})

@@ -824,3 +824,105 @@ Resolution order: `{KEY}_{PROFILE_UPPER}` → `{KEY}` (fallback).
   happens in `_render_profile_dashboard()` before passing records downstream
 - Old disqualified rows (pre-migration) are caught by the flags fallback in
   `_deserialize_job_record()` — no data migration needed
+# Step 23A addendum
+
+## Architecture cleanup snapshot
+
+### Design note
+
+There is intentionally **no API layer** in this project. The local architecture is:
+- CLI via `main.py`
+- background worker via `worker/run_pipeline.py`
+- Streamlit UI via `dashboard.py`
+
+### High-level architecture
+
+```text
+profile config
+  -> profile_intent.py
+  -> scraper.py
+  -> db.py
+  -> scorer.py
+  -> embedder.py
+  -> vector_store.py
+  -> reranker.py
+  -> main.py / worker/run_pipeline.py / dashboard.py
+```
+
+```text
+CLI or worker
+  -> pipeline.py
+      -> scraper.py
+      -> scorer.py
+      -> embedder.py
+          -> db.py
+          -> vector_store.py
+```
+
+### Module ownership map
+
+- `pipeline.py` â€” orchestration only
+- `db.py` â€” persistence only
+- `profile_intent.py` â€” profile normalization only
+- `embedder.py` â€” chunking + embedding only
+- `vector_store.py` â€” vector indexing + retrieval only
+- `reranker.py` â€” reranking + evidence only
+- `dashboard.py` â€” dashboard shell, navigation, profile views
+- `dashboard_semantic.py` â€” semantic match panel UI only
+- `main.py` â€” CLI parsing and command routing only
+- `worker/run_pipeline.py` â€” lockfile, status/progress JSON, worker entrypoint only
+
+### pipeline.py responsibilities
+
+`pipeline.py` is the single source of truth for scrape -> score -> embed orchestration.
+
+Public API:
+- `run_scrapers(config, profile) -> ScrapeStats`
+- `run_scoring(config, profile, yes=False, on_job_scored=None) -> ScoreStats`
+- `run_embedding(config, profile, force=False, on_job_embedded=None) -> EmbedStats`
+- `run_full_pipeline(config, profile, options, progress_tracker=None) -> PipelineResult`
+
+Typed boundary objects:
+- `ScrapeStats`
+- `ScoreStats`
+- `EmbedStats`
+- `PipelineOptions`
+- `PipelineResult`
+
+### CLI vs worker responsibilities
+
+- `main.py`
+  - parse CLI args
+  - load config
+  - select profile
+  - validate mode
+  - call `pipeline.py` or retrieval/reranking services
+  - print terminal output
+
+- `worker/run_pipeline.py`
+  - manage `.worker_running`
+  - write `.run_progress.json`
+  - write `.last_run`
+  - initialize `ProgressTracker`
+  - call `pipeline.run_full_pipeline(...)`
+
+### Graceful degradation behavior
+
+- embeddings disabled â€” skip the embedding stage cleanly
+- vector store disabled â€” keep SQLite embeddings and skip Chroma-dependent features cleanly
+- Chroma indexing failure â€” logged and surfaced in embedding summary; strict mode can still raise
+- reranking disabled â€” semantic matching falls back to vector-ranked results
+- retrieval/reranking CLI failure â€” `main.py` logs the issue and falls back to SQLite-ranked results
+- per-job LLM failures â€” `scorer.py` records `score_error` and continues the batch
+- weak or missing resume extraction â€” structured profile generation falls back instead of crashing the run
+
+### Change surface rule
+
+- change scoring logic -> `scorer.py`
+- change embedding model or chunking -> `embedder.py`
+- change retrieval or vector indexing -> `vector_store.py`
+- change reranking or evidence rules -> `reranker.py`
+- change profile normalization -> `profile_intent.py`
+- change stage ordering -> `pipeline.py`
+
+If one of those changes requires edits across multiple orchestration layers, the architecture has drifted.

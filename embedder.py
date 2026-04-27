@@ -264,9 +264,10 @@ def embed_jobs(
 
     for start in range(0, len(jobs), job_batch_size):
         batch_jobs = jobs[start:start + job_batch_size]
+        chunks_by_job_id = {job.id: semantic_chunk_job(job) for job in batch_jobs}
         batch_chunks: list[tuple[Job, JobChunk]] = []
         for job in batch_jobs:
-            batch_chunks.extend((job, chunk) for chunk in semantic_chunk_job(job))
+            batch_chunks.extend((job, chunk) for chunk in chunks_by_job_id[job.id])
 
         vectors = embed_texts(
             (chunk.chunk_text for _, chunk in batch_chunks),
@@ -275,7 +276,7 @@ def embed_jobs(
 
         cursor = 0
         for job in batch_jobs:
-            job_chunks = semantic_chunk_job(job)
+            job_chunks = chunks_by_job_id[job.id]
             count = len(job_chunks)
             job_vectors = vectors[cursor:cursor + count]
             cursor += count
