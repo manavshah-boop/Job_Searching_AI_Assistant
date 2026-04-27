@@ -39,6 +39,7 @@ from db import (
     count_jobs,
     finish_run,
     get_db_path,
+    get_job_with_score,
     get_recent_runs,
     init_db,
     load_discovered_slugs,
@@ -55,7 +56,9 @@ from dashboard_ui import (
     render_source_progress,
 )
 from logging_config import configure_logging
+from match_explainer import build_match_explanation
 from onboarding import render_onboarding, sanitize_slug
+from profile_intent import normalize_profile_intent
 from progress_tracker import ProgressTracker
 from scorer import score_all_jobs
 from ui_shell import (
@@ -945,52 +948,7 @@ def _fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
 
 
 def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
-    init_db(profile=slug)
-    conn = sqlite3.connect(get_db_path(slug))
-    conn.row_factory = sqlite3.Row
-    try:
-        row = conn.execute(
-            """
-            SELECT
-                j.id,
-                j.title,
-                j.company,
-                j.location,
-                j.url,
-                j.raw_text,
-                j.source,
-                j.score_attempts,
-                j.score_error,
-                j.status,
-                j.created_at,
-                j.scrape_qualified,
-                j.scrape_filter_reason,
-                s.fit_score,
-                s.ats_score,
-                s.reasons,
-                s.flags,
-                s.skill_misses,
-                s.one_liner,
-                s.role_fit,
-                s.stack_match,
-                s.seniority,
-                s.location AS score_location,
-                s.growth,
-                s.compensation,
-                s.scored_at,
-                s.disqualified,
-                s.disqualify_reason
-            FROM jobs j
-            LEFT JOIN scores s ON j.id = s.job_id
-            WHERE j.id = ?
-            """,
-            (job_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return _deserialize_job_record(row)
-    finally:
-        conn.close()
+    return get_job_with_score(job_id, profile=slug)
 
 
 def _search_job_ids_by_raw_text(slug: str, query: str) -> set[str]:
@@ -2263,6 +2221,28 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
         )
         if clicked == "open_posting_detail":
             return
+
+    if record.get("fit_score") is not None:
+        profile_intent = normalize_profile_intent(load_config(profile=slug))
+        explanation = build_match_explanation(record, record, None, profile_intent)
+        with panel("Factor-wise explanation", subtitle="Deterministic reasoning built from stored score evidence"):
+            st.caption(f"Recommended action: {explanation.recommended_action}")
+            st.write(explanation.summary)
+            if explanation.strengths:
+                st.write("Top strengths")
+                for factor in explanation.strengths[:3]:
+                    details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
+                    st.write(f"- {factor.name}: {factor.explanation}{details}")
+            if explanation.concerns:
+                st.write("Top concerns")
+                for factor in explanation.concerns[:3]:
+                    details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
+                    st.write(f"- {factor.name}: {factor.explanation}{details}")
+            elif explanation.unknowns:
+                st.write("Needs more information")
+                for factor in explanation.unknowns[:2]:
+                    details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
+                    st.write(f"- {factor.name}: {factor.explanation}{details}")
 
     dims = {key: value for key, value in record["dimension_scores"].items() if value is not None}
     if dims:

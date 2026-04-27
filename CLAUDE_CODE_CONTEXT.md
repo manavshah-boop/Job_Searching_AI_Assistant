@@ -16,6 +16,7 @@ isolated profiles, deployed to GCP.
 
 | 21 | ✅ | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
 | 22 | ✅ | Role-agnostic profile intent + evidence matching: `profile_intent.py`, `ProfileIntent`, canonical section taxonomy, role-family section weights, `MatchEvidence` with positive/negative signals |
+| 23B | ✅ | Factor-wise match explanations: `match_explainer.py`, deterministic strengths/concerns/unknowns, recommended actions in dashboard + CLI semantic views |
 
 ---
 
@@ -34,6 +35,7 @@ isolated profiles, deployed to GCP.
 | 13 | ✅ | Scrape-filter rejection persistence: scrape_qualified/scrape_filter_reason columns, auditable dashboard toggle |
 | 17+20 | ✅ | Semantic job embeddings: `embedder.py`, `job_embeddings` table, embedding pipeline stage, `--embed-only` |
 | 18 | ✅ | ChromaDB vector retrieval: `vector_store.py`, persistent profile-scoped ANN index, `--vector-search`, `--rebuild-vector-index`, `--clear-vector-index` |
+| 23B | ✅ | Factor-wise explanation layer over score dimensions and semantic/reranker evidence |
 
 ---
 
@@ -123,6 +125,63 @@ Now prints `Positive: ...` and `Concerns: ...` lines below the match reason for 
 
 ---
 
+## Step 23B - Factor-wise match explanation system
+
+### match_explainer.py
+
+New reusable module that converts stored score data and semantic evidence into deterministic explanation objects. No LLM calls are made in this layer.
+
+Dataclasses:
+- `FactorExplanation` - `name`, `status`, `score`, `evidence`, `explanation`
+- `MatchExplanation` - job identity, semantic/rerank/LLM/ATS scores, `recommended_action`, `summary`, grouped strengths/concerns/unknowns, matched sections, evidence snippets
+
+Public API:
+- `build_match_explanation(job_record, score_record, reranked_result, profile_intent) -> MatchExplanation`
+- `explain_score_dimensions(score_record) -> list[FactorExplanation]`
+- `explain_semantic_evidence(reranked_result, profile_intent) -> list[FactorExplanation]`
+- `explain_concerns(reranked_result, profile_intent) -> list[FactorExplanation]`
+- `summarize_match(explanation) -> str`
+- `recommend_action(explanation) -> str`
+
+Factor categories:
+- Role fit
+- Skills/tools match
+- Responsibilities match
+- Requirements match
+- Seniority fit
+- Location/remote fit
+- Compensation fit
+- Growth/company fit
+- ATS/resume keyword fit
+- Credentials/certifications
+- Dealbreakers/concerns
+
+Recommended action labels:
+- `Apply Soon`
+- `Strong Match`
+- `Worth Reviewing`
+- `Needs More Info`
+- `Maybe`
+- `Skip`
+
+`db.py` now exposes `get_job_with_score(job_id, profile=None) -> dict | None`, which returns a normalized joined record with parsed `reasons`, `flags`, `skill_misses`, `dimension_scores`, and disqualification metadata.
+
+Dashboard usage:
+- `dashboard_semantic.py` shows explanation cards for reranked semantic results with recommended action, summary, strengths, concerns, and expandable details.
+- `dashboard.py` shows a factor-wise explanation in the Jobs detail pane when stored score data exists.
+
+CLI usage:
+- `python main.py --profile <name> --semantic-match`
+- `python main.py --profile <name> --semantic-search "..." --rerank`
+
+These commands now print recommended action, final score, stored LLM fit score when available, top strengths, top concerns or missing-info items, and the posting URL.
+
+How explanation sources combine:
+1. Stored LLM scoring output from SQLite: fit score, ATS score, dimension scores, reasons, flags, skill misses.
+2. Semantic/reranker evidence: matched sections, rerank/vector scores, positive signals, concerns, matched keywords, evidence snippets.
+
+No prompts, score formulas, scraping behavior, or vector indexing behavior were changed.
+
 ## Actual file structure
 
 ```
@@ -136,6 +195,7 @@ job-agent/
 ├── vector_store.py          # ChromaDB wrapper: profile-scoped indexing + semantic retrieval
 ├── reranker.py              # Cross-encoder reranking over vector-retrieved job chunks
 ├── profile_intent.py        # ProfileIntent normalization, canonical section taxonomy, role-family weights
+├── match_explainer.py       # Deterministic factor-wise strengths, concerns, summaries, and action labels
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
@@ -154,6 +214,7 @@ job-agent/
 ├── test_vector_store.py     # Chroma indexing, idempotent upserts, rebuild/query tests
 ├── test_reranker.py         # Profile-aware query building, role-family weights, evidence tests
 ├── test_profile_intent.py   # Role family inference, ProfileIntent normalization, canonical taxonomy
+├── test_match_explainer.py  # Deterministic explanation coverage across role families and missing-data cases
 ├── worker/
 │   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
 ├── profiles/
