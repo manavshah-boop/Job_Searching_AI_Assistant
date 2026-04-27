@@ -14,6 +14,8 @@ isolated profiles, deployed to GCP.
 - Simple infra — SQLite, profile-isolated DBs
 - No overengineering — if it works for two people, it's done
 
+| 21 | âœ… | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
+
 ---
 
 ## Current status
@@ -45,6 +47,7 @@ job-agent/
 ├── scorer.py                # LLM pipeline, RateLimiter, instructor integration
 ├── embedder.py              # Semantic chunking + sentence-transformers batch embeddings
 ├── vector_store.py          # ChromaDB wrapper: profile-scoped indexing + semantic retrieval
+├── reranker.py              # Cross-encoder reranking over vector-retrieved job chunks
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
@@ -61,6 +64,7 @@ job-agent/
 ├── test_scorer_recovery.py  # 10 unit tests for llm_utils recovery layer
 ├── test_embedder.py         # Chunking, embedding batch shape, DB round-trip
 ├── test_vector_store.py     # Chroma indexing, idempotent upserts, rebuild/query tests
+├── test_reranker.py         # Profile-aware query building and reranking aggregation tests
 ├── worker/
 │   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
 ├── profiles/
@@ -486,11 +490,93 @@ Why Chroma is rebuildable and not source of truth:
 - Chroma only accelerates retrieval over those persisted chunk vectors
 - If Chroma is missing or corrupted, it can be rebuilt from SQLite without touching scraping or scoring state
 
+### reranker.py
+
+Purpose:
+- Adds a reusable profile-aware precision layer after vector retrieval
+- Compares a compact candidate/profile match query against the most important job chunks
+- Keeps vector retrieval and reranking concerns separate so later steps can reuse reranked candidates for selective LLM scoring
+
+Public API:
+- `reranking_enabled(config) -> bool`
+- `reranking_model_name(config) -> str`
+- `get_cross_encoder(config)`
+- `build_profile_match_query(config, user_query=None) -> str`
+- `select_chunks_for_reranking(job_result, chunk_results, max_chunks_per_job, *, match_query=None) -> list[VectorChunkResult]`
+- `rerank_chunks(match_query, chunk_results, config) -> list[RerankedChunkResult]`
+- `rerank_jobs(match_query, vector_job_results, chunk_results, config) -> list[RerankedJobResult]`
+- `semantic_match_jobs(profile, config, user_query=None) -> list[RerankedJobResult]`
+- `select_jobs_for_llm_scoring(reranked_results, threshold, top_k) -> list[str]`
+
+Profile-aware match query:
+- Built deterministically from config, not from an LLM call
+- Includes target titles, YOE, strongest desired/resume-backed skills, location preferences, remote preference, compensation preference, job type, and optional user query
+- Stays concise so it fits the cross-encoder context budget cleanly
+
+Section-aware chunk selection:
+- Selects only a small set of high-signal chunks per job before reranking
+- Prioritizes `requirements`, `responsibilities`, then `summary`
+- Includes `compensation` when the query/profile signals salary or stipend intent
+- Includes `benefits` only for explicit perks/benefits intent or when benefits is already a strong retrieved hit
+
+Cross-encoder scoring:
+- Uses `sentence-transformers` `CrossEncoder`
+- Default model: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+- Loaded lazily once per process and cached by model name
+- Scored in batches on CPU: `(match_query, truncated_chunk_text)`
+- Raw scores are preserved; display/aggregation uses `sigmoid(raw_score)` normalization
+
+Job-level aggregation formula:
+- Section weights:
+  - `requirements: 1.15`
+  - `responsibilities: 1.10`
+  - `summary: 1.00`
+  - `compensation: 0.90` normally, `1.05` for compensation intent
+  - `benefits: 0.80` normally, `1.00` for benefits/compensation intent
+- Job rerank score:
+  - `best_weighted_chunk * 0.55`
+  - `top3_weighted_average * 0.30`
+  - `required_section_coverage_bonus * 0.10`
+- Final score:
+  - `rerank_score + vector_score * 0.05`
+- Coverage bonus rewards strong `requirements + responsibilities` support, with a smaller summary bonus
+
+Query flow:
+- `semantic_match_jobs()` builds the profile-aware query
+- Runs vector retrieval for broad recall through `vector_store.py`
+- Selects high-signal chunks per job
+- Reranks those chunks with the cross-encoder
+- Aggregates reranked evidence back to unique job-level results with match reasons and evidence snippets
+
+Fallback behavior:
+- If reranking is disabled, `semantic_match_jobs()` returns vector-ranked fallback results in the same job-result shape
+- Existing vector-only search remains available via `vector_store.query_similar_jobs()`
+
+CLI commands:
+- `python main.py --profile manav --semantic-match`
+- `python main.py --profile manav --semantic-search "backend AI platform role with Python and AWS" --rerank`
+- `python main.py --profile manav --semantic-search "backend AI platform role with Python and AWS"`
+- `python main.py --profile manav --vector-search "backend AI platform role"`
+
+Dashboard usage:
+- Jobs tab semantic panel now supports:
+  - optional free-text query
+  - "Use cross-encoder reranking" toggle
+  - profile-aware matching when the query is left blank
+- Falls back cleanly to vector-only results when reranking is disabled
+
+Future LLM-reduction path:
+- Intended next architecture:
+  - vector recall
+  - cross-encoder precision
+  - selective LLM scoring only for top reranked job IDs
+- `select_jobs_for_llm_scoring()` is the bridge for that next step
+
 ### Retrieval Architecture
 
 - SQLite: durable job, score, run, and embedding records
 - ChromaDB: ANN retrieval index over chunk embeddings
-- Cross encoder: planned next step for reranking top vector candidates
+- Cross encoder: profile-aware reranking over top vector candidates
 - LLM scorer: expensive final evaluator, not used for every retrieved job
 
 ### config.yaml structure
@@ -575,6 +661,18 @@ embeddings:
     top_k_chunks: 50
     top_k_jobs: 30
     strict: false
+
+reranking:
+  enabled: true
+  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  batch_size: 16
+  top_k_vector_chunks: 80
+  top_k_vector_jobs: 40
+  top_k_final: 15
+  max_chunks_per_job: 4
+  max_chunk_chars: 900
+  include_profile_context: true
+  include_query_context: true
 ```
 
 Internship profiles use this compensation shape instead:
