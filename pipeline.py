@@ -7,6 +7,7 @@ It coordinates specialized modules but does not own their implementation.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -25,6 +26,7 @@ from scraper import (
 )
 from scorer import score_all_jobs
 from theirstack import get_or_discover_slugs
+from tracking import safe_log_pipeline_result
 
 
 @dataclass
@@ -78,6 +80,8 @@ class PipelineResult:
     score: ScoreStats
     embed: EmbedStats
     final_db_stats: dict[str, int]
+    duration_seconds: float = 0.0
+    stage_latencies: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -282,6 +286,7 @@ def run_full_pipeline(
     options: PipelineOptions,
     progress_tracker: Optional[ProgressTracker] = None,
 ) -> PipelineResult:
+    started = time.perf_counter()
     run_id = start_run(profile=profile, source=options.run_source)
     scrape_stats = ScrapeStats()
     score_stats = ScoreStats()
@@ -289,6 +294,9 @@ def run_full_pipeline(
     errors: list[str] = []
     status = "complete"
     active_stage: Stage | None = None
+    stage_latencies: dict[str, float] = {}
+    pipeline_error: Exception | None = None
+    pipeline_error_tb = None
 
     logger.info(
         "pipeline | start profile={} source={} scrape={} score={} embed={} force_embed={} rescore={}",
@@ -307,12 +315,14 @@ def run_full_pipeline(
             rescore_reset(profile=profile)
 
         if options.scrape:
+            scrape_started = time.perf_counter()
             scrape_stats = run_scrapers(
                 config,
                 profile,
                 progress_tracker=progress_tracker,
                 on_progress=options.on_progress,
             )
+            stage_latencies["scrape"] = round(time.perf_counter() - scrape_started, 4)
 
         if options.score:
             active_stage = Stage.SCORING
@@ -327,12 +337,14 @@ def run_full_pipeline(
                 if options.on_job_scored is not None:
                     options.on_job_scored(i, total, result)
 
+            score_started = time.perf_counter()
             score_stats = run_scoring(
                 config,
                 profile,
                 yes=options.yes,
                 on_job_scored=_wrapped_on_job_scored if (progress_tracker or options.on_job_scored) else None,
             )
+            stage_latencies["score"] = round(time.perf_counter() - score_started, 4)
 
             if progress_tracker is not None:
                 progress_tracker.set_stage_metrics(
@@ -362,12 +374,14 @@ def run_full_pipeline(
                 if options.on_job_embedded is not None:
                     options.on_job_embedded(i, total, job, chunk_count)
 
+            embed_started = time.perf_counter()
             embed_stats = run_embedding(
                 config,
                 profile,
                 force=options.force_embed,
                 on_job_embedded=_wrapped_on_job_embedded if (progress_tracker or options.on_job_embedded) else None,
             )
+            stage_latencies["embed"] = round(time.perf_counter() - embed_started, 4)
 
             if progress_tracker is not None:
                 embedding_metrics: dict[str, Any] = {
@@ -393,12 +407,13 @@ def run_full_pipeline(
     except Exception as exc:
         status = "failed"
         errors.append(str(exc))
+        pipeline_error = exc
+        pipeline_error_tb = exc.__traceback__
         if progress_tracker is not None and active_stage is not None:
             progress_tracker.fail_stage(active_stage, str(exc))
             _notify_progress(progress_tracker, options.on_progress)
         logger.exception("pipeline | failed")
         final_stats = count_jobs(profile=profile)
-        raise
 
     finally:
         finish_run(
@@ -422,6 +437,17 @@ def run_full_pipeline(
             progress_tracker.complete_stage(Stage.FINALIZING)
             _notify_progress(progress_tracker, options.on_progress)
 
+    result = PipelineResult(
+        run_id=run_id,
+        status=status,
+        errors=errors,
+        scrape=scrape_stats,
+        score=score_stats,
+        embed=embed_stats,
+        final_db_stats=final_stats,
+        duration_seconds=round(time.perf_counter() - started, 4),
+        stage_latencies=stage_latencies,
+    )
     logger.info(
         "pipeline | complete profile={} total_jobs={} scored={} embedded={} status={}",
         profile or "default",
@@ -430,12 +456,9 @@ def run_full_pipeline(
         final_stats.get("embedded", 0),
         status,
     )
-    return PipelineResult(
-        run_id=run_id,
-        status=status,
-        errors=errors,
-        scrape=scrape_stats,
-        score=score_stats,
-        embed=embed_stats,
-        final_db_stats=final_stats,
-    )
+    safe_log_pipeline_result(config, profile, result)
+    if pipeline_error is not None:
+        if pipeline_error_tb is not None:
+            raise pipeline_error.with_traceback(pipeline_error_tb)
+        raise pipeline_error
+    return result

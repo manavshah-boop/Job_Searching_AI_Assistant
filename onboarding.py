@@ -13,6 +13,7 @@ from typing import Any, Dict
 import pandas as pd
 import streamlit as st
 
+from config import apply_config_defaults
 from db import init_db
 from ui_shell import badge, callout, chip_row, page_header, panel, section_shell, stat_row, toolbar
 
@@ -372,13 +373,13 @@ def generate_config(data: Dict[str, Any]) -> dict:
         },
     }
 
-    return {
+    return apply_config_defaults({
         "llm":         llm,
         "profile":     profile_section,
         "preferences": preferences,
         "sources":     sources,
         "scoring":     scoring,
-    }
+    })
 
 
 def create_profile(data: Dict[str, Any]) -> None:

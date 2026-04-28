@@ -36,3 +36,6 @@ transformers~=4.46.3
 
 # step 18 — persistent vector retrieval
 chromadb>=0.5,<0.6
+
+# step 25 â€” optional experiment tracking
+mlflow>=2.16,<3.0

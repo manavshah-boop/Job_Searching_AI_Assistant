@@ -17,6 +17,7 @@ isolated profiles, deployed to GCP.
 | 21 | ✅ | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
 | 22 | ✅ | Role-agnostic profile intent + evidence matching: `profile_intent.py`, `ProfileIntent`, canonical section taxonomy, role-family section weights, `MatchEvidence` with positive/negative signals |
 | 23B | ✅ | Factor-wise match explanations: `match_explainer.py`, deterministic strengths/concerns/unknowns, recommended actions in dashboard + CLI semantic views |
+| 25 | ✅ | Lightweight optional MLflow tracking: `tracking.py`, local `./mlruns`, pipeline/eval/semantic observability |
 
 ---
 
@@ -36,6 +37,7 @@ isolated profiles, deployed to GCP.
 | 17+20 | ✅ | Semantic job embeddings: `embedder.py`, `job_embeddings` table, embedding pipeline stage, `--embed-only` |
 | 18 | ✅ | ChromaDB vector retrieval: `vector_store.py`, persistent profile-scoped ANN index, `--vector-search`, `--rebuild-vector-index`, `--clear-vector-index` |
 | 23B | ✅ | Factor-wise explanation layer over score dimensions and semantic/reranker evidence |
+| 25 | ✅ | Optional MLflow experiment tracking for pipeline, evaluation, and semantic comparison runs |
 
 ---
 
@@ -182,6 +184,96 @@ How explanation sources combine:
 
 No prompts, score formulas, scraping behavior, or vector indexing behavior were changed.
 
+## Step 25 - Lightweight MLflow experiment tracking
+
+### tracking.py
+
+New optional observability module. This is the only file that imports or calls MLflow.
+
+Public API:
+- `mlflow_enabled(config) -> bool`
+- `get_experiment_name(config, profile) -> str`
+- `start_run(config, profile, run_name, tags=None)`
+- `log_params(params)`
+- `log_metrics(metrics)`
+- `log_artifact(path)`
+- `log_text(name, text)`
+- `end_run(status="FINISHED")`
+- `safe_log_pipeline_result(config, profile, pipeline_result)`
+- `safe_log_eval_result(config, profile, eval_result, extra_params=None)`
+- `safe_log_semantic_match(config, profile, results, query=None)`
+
+Design constraints:
+- MLflow is disabled by default.
+- MLflow imports are lazy, so the app still works when MLflow is not installed.
+- MLflow setup and logging failures are caught, warned, and ignored.
+- Tracking never blocks scraping, scoring, evaluation, semantic search, or dashboard use.
+
+### Config keys
+
+All profiles support:
+
+```yaml
+tracking:
+  mlflow:
+    enabled: false
+    tracking_uri: ./mlruns
+    experiment_name: job-agent
+    log_artifacts: true
+    log_eval_labels: false
+```
+
+`config.py` applies these defaults automatically, and onboarding-generated profiles include the same block.
+
+### What gets logged
+
+Pipeline runs:
+- profile and inferred role family when available
+- LLM provider/model
+- embedding model
+- vector store and reranker toggles/models
+- enabled sources and top-k settings
+- jobs scraped, filtered, saved, scored, embedded, and indexed
+- average fit and ATS score
+- total pipeline duration plus simple per-stage wall-clock timings
+- success/failure metrics
+
+Evaluation runs:
+- profile, role family, reranker toggle
+- embedding and reranker models
+- top-k settings
+- labels path
+- `total_labeled`, `precision_at_5`, `precision_at_10`, `recall_at_10`, `mrr`, `ndcg_at_10`, `coverage`
+- `eval_last_result.json` artifact
+- optional `eval_labels.yaml` artifact when `tracking.mlflow.log_eval_labels` is enabled
+
+Semantic CLI runs:
+- whether a query was provided
+- number of results
+- average final, rerank, and vector score
+- top result job IDs as a small text artifact
+
+Privacy defaults:
+- no resumes are logged
+- no full raw job descriptions are logged by default
+- semantic tracking logs IDs only, not large posting text
+
+### How to enable locally
+
+1. Set `tracking.mlflow.enabled: true` in the profile config.
+2. Run the normal CLI or dashboard flows.
+3. Open the local MLflow UI from the repo root:
+
+```bash
+mlflow ui --backend-store-uri ./mlruns
+```
+
+This keeps tracking portfolio-friendly and fully local by default.
+
+### Why tracking stays optional
+
+The goal is to compare retrieval, reranking, scoring, and evaluation quality across role families over time without turning the project into a full ML platform or requiring a remote server.
+
 ## Actual file structure
 
 ```
@@ -196,6 +288,7 @@ job-agent/
 ├── reranker.py              # Cross-encoder reranking over vector-retrieved job chunks
 ├── profile_intent.py        # ProfileIntent normalization, canonical section taxonomy, role-family weights
 ├── match_explainer.py       # Deterministic factor-wise strengths, concerns, summaries, and action labels
+├── tracking.py              # Optional MLflow helpers with lazy import and fail-safe no-ops
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
 ├── text_utils.py            # extract_job_context() smart truncation
@@ -1079,4 +1172,4 @@ Evaluation is intentionally role-agnostic:
 - `evaluate_profile()` infers missing label role families from `ProfileIntent`
 - tests cover software, finance internship, marketing, and general fallback profiles
 
-This creates a clean benchmark layer before changing retrieval formulas and sets up the next step where evaluation runs can be tracked in MLflow later without changing the local metric definitions.
+This creates a clean benchmark layer for comparing retrieval and reranking quality across role families, and MLflow now records those evaluation runs without changing the local metric definitions.

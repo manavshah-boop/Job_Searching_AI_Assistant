@@ -17,6 +17,23 @@ import yaml
 from loguru import logger
 
 _BASE_DIR = Path(__file__).parent
+_DEFAULT_MLFLOW_CONFIG: Dict[str, Any] = {
+    "enabled": False,
+    "tracking_uri": "./mlruns",
+    "experiment_name": "job-agent",
+    "log_artifacts": True,
+    "log_eval_labels": False,
+}
+
+
+def apply_config_defaults(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fill in optional config defaults without changing normal app behavior."""
+    normalized = dict(config or {})
+    tracking_cfg = normalized.setdefault("tracking", {})
+    mlflow_cfg = tracking_cfg.setdefault("mlflow", {})
+    for key, value in _DEFAULT_MLFLOW_CONFIG.items():
+        mlflow_cfg.setdefault(key, value)
+    return normalized
 
 
 def _resolve_resume_path(
@@ -103,7 +120,7 @@ def load_config(profile: Optional[str] = None) -> Dict[str, Any]:
         profile_dir = _BASE_DIR
 
     with open(config_path, 'r', encoding='utf-8') as file:
-        config = yaml.safe_load(file)
+        config = apply_config_defaults(yaml.safe_load(file))
 
     # Handle resume: either inline text or PDF file
     if config['profile'].get('resume_file'):

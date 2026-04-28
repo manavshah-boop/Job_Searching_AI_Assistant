@@ -34,7 +34,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from config import _resolve_resume_path, load_config
+from config import _resolve_resume_path, apply_config_defaults, load_config
 from db import (
     count_jobs,
     finish_run,
@@ -62,6 +62,7 @@ from onboarding import render_onboarding, sanitize_slug
 from profile_intent import normalize_profile_intent
 from progress_tracker import ProgressTracker
 from scorer import score_all_jobs
+from tracking import get_experiment_name, get_tracking_uri, mlflow_enabled
 from ui_shell import (
     badge,
     callout,
@@ -1233,6 +1234,19 @@ def _render_summary_list(items: list[tuple[str, Any]]) -> None:
         for label, value in items
     )
     _render_html_block(f"<div class='summary-list'>{markup}</div>")
+
+
+def _render_tracking_status_panel(config: dict[str, Any], profile: str) -> None:
+    with panel("Experiment tracking", subtitle="Optional MLflow observability for pipeline, evaluation, and semantic runs"):
+        _render_summary_list(
+            [
+                ("MLflow", "Enabled" if mlflow_enabled(config) else "Disabled"),
+                ("Tracking URI", get_tracking_uri(config)),
+                ("Experiment", get_experiment_name(config, profile)),
+            ]
+        )
+        st.caption("Tracking is local and optional. Normal scraping, scoring, matching, and dashboard flows still work when it is off.")
+        st.code("mlflow ui --backend-store-uri ./mlruns", language="bash")
 
 
 def _queue_pipeline_run(slug: str) -> None:
@@ -2900,7 +2914,7 @@ def _lines_to_list(text: str) -> list[str]:
 
 
 def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any], metrics: dict[str, Any]) -> None:
-    editable = copy.deepcopy(raw_config)
+    editable = apply_config_defaults(copy.deepcopy(raw_config))
     job_type = editable.get("profile", {}).get("job_type", "fulltime")
     is_intern = job_type == "internship"
     editable.setdefault("scoring", {})
@@ -2915,6 +2929,7 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
     editable["sources"].setdefault("workable",   {"enabled": False, "companies": []})
     editable["sources"].setdefault("himalayas",  {"enabled": False})
     with section_shell("Settings", SECTION_COPY["Settings"]):
+        _render_tracking_status_panel(config, slug)
         location_defaults = editable["preferences"]["location"].get("preferred_locations", [])
         location_options = sorted({*LOCATION_PICKER_OPTIONS, *location_defaults})
         compensation = editable["preferences"]["compensation"]
