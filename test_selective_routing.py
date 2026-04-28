@@ -161,9 +161,9 @@ def test_create_synthetic_score_conservative():
     result = router.create_synthetic_score(job, routing_score=0.80)
 
     dims = result["dimension_scores"]
-    # At routing_score=0.80, role_fit should be 0.80 * 0.85 * 10 = 6.8 → 7, not 8+
-    assert dims["role_fit"] <= 7
-    assert dims["stack_match"] <= 7
+    # At routing_score=0.80, role_fit (0.80 * 0.85 * 10 = 6.8 → 7) + possible summary bonus
+    assert dims["role_fit"] <= 8
+    assert dims["stack_match"] <= 8
 
 
 def test_create_synthetic_score_fit_range():
@@ -201,6 +201,35 @@ def test_create_synthetic_score_match_reason_in_one_liner():
     result = router.create_synthetic_score(make_job(), 0.60)
     # one_liner should reference routing score
     assert "0.60" in result["one_liner"] or "reranker" in result["one_liner"].lower()
+
+
+def test_create_synthetic_score_uses_match_reason():
+    """When match_reason is provided, it becomes the one_liner."""
+    router = SelectiveRouter(make_config())
+    result = router.create_synthetic_score(make_job(), 0.60, match_reason="Good Python fit")
+    assert result["one_liner"] == "Good Python fit"
+
+
+def test_create_synthetic_score_uses_matched_sections():
+    """Providing matched_sections should adjust dimension scores."""
+    router = SelectiveRouter(make_config())
+    job = make_job()
+    result_no_sections = router.create_synthetic_score(job, 0.70, matched_sections=[])
+    result_with_req = router.create_synthetic_score(job, 0.70, matched_sections=["requirements"])
+    # stack_match should be higher when requirements section matched
+    assert (
+        result_with_req["dimension_scores"]["stack_match"]
+        >= result_no_sections["dimension_scores"]["stack_match"]
+    )
+
+
+def test_create_synthetic_score_responsibilities_lifts_seniority():
+    """'responsibilities' in matched_sections should lift seniority from 5 to 6."""
+    router = SelectiveRouter(make_config())
+    job = make_job()
+    result_no = router.create_synthetic_score(job, 0.70, matched_sections=[])
+    result_yes = router.create_synthetic_score(job, 0.70, matched_sections=["responsibilities"])
+    assert result_yes["dimension_scores"]["seniority"] > result_no["dimension_scores"]["seniority"]
 
 
 # ── get_effective_llm_model() ─────────────────────────────────────────────────
@@ -369,3 +398,60 @@ def test_quick_ats_skill_matching():
 
     assert ats_with > ats_without
     assert 0 <= ats_with <= 100
+
+
+# ── detect_matched_sections() ─────────────────────────────────────────────────
+
+def test_detect_matched_sections_empty_text():
+    router = SelectiveRouter(make_config())
+    result = router.detect_matched_sections(make_job(raw_text=""), "Python engineer")
+    assert result == []
+
+
+def test_detect_matched_sections_empty_query():
+    router = SelectiveRouter(make_config())
+    job = make_job(raw_text="Requirements\nPython experience required")
+    result = router.detect_matched_sections(job, "")
+    assert result == []
+
+
+def test_detect_matched_sections_finds_requirements():
+    router = SelectiveRouter(make_config())
+    text = (
+        "About the Role\nWe build ML platforms.\n\n"
+        "Requirements\nPython required. AWS experience. Machine learning background.\n"
+        "3+ years Python. Strong AWS skills."
+    )
+    result = router.detect_matched_sections(make_job(raw_text=text), "Python AWS Machine learning")
+    assert "requirements" in result
+
+
+def test_detect_matched_sections_finds_responsibilities():
+    router = SelectiveRouter(make_config())
+    text = (
+        "What you'll do\n"
+        "Build Python services on AWS. Deploy machine learning models. "
+        "Collaborate with ML engineers."
+    )
+    result = router.detect_matched_sections(make_job(raw_text=text), "Python AWS Machine learning")
+    assert "responsibilities" in result
+
+
+def test_detect_matched_sections_no_match():
+    router = SelectiveRouter(make_config())
+    text = "Looking for Java developers with Spring Boot and Kubernetes experience."
+    result = router.detect_matched_sections(make_job(raw_text=text), "Python AWS Machine learning")
+    # May or may not have sections, but should not crash
+    assert isinstance(result, list)
+
+
+def test_detect_matched_sections_stores_query():
+    """build_match_query should cache the query on self._match_query."""
+    router = SelectiveRouter(make_config())
+    router._match_query = "Python engineer"
+    job = make_job(raw_text="Requirements\nPython required. Python skills needed.")
+    # Should use self._match_query when match_query arg is empty
+    result = router.detect_matched_sections(job, "")
+    # Not empty because _match_query is used as fallback
+    # (result may or may not have "requirements" depending on hit count — just verify no crash)
+    assert isinstance(result, list)

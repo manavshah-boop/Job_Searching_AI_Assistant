@@ -66,6 +66,8 @@ class PipelineOptions:
     force_embed: bool = False
     rescore: bool = False
     run_source: str = "pipeline"
+    # None = use config value; True/False = override routing.enabled for this run
+    selective_routing: Optional[bool] = None
     on_job_scored: Optional[Callable[[int, int, dict[str, Any]], None]] = None
     on_job_embedded: Optional[Callable[[int, int, Any, int], None]] = None
     on_progress: Optional[Callable[[ProgressTracker], None]] = None
@@ -223,8 +225,13 @@ def run_scoring(
     profile: str | None,
     *,
     yes: bool = False,
+    selective_routing: Optional[bool] = None,
     on_job_scored: Optional[Callable[[int, int, dict[str, Any]], None]] = None,
 ) -> ScoreStats:
+    # Apply selective_routing override before scoring (None = keep config value)
+    if selective_routing is not None:
+        config = dict(config)  # shallow copy so we don't mutate the caller's dict
+        config.setdefault("routing", {})["enabled"] = selective_routing
     results = score_all_jobs(config, yes=yes, profile=profile, on_job_scored=on_job_scored)
     scored = [result for result in results if result.get("fit_score", 0) > 0]
     avg_fit = sum(result["fit_score"] for result in scored) / len(scored) if scored else 0.0
@@ -342,6 +349,7 @@ def run_full_pipeline(
                 config,
                 profile,
                 yes=options.yes,
+                selective_routing=options.selective_routing,
                 on_job_scored=_wrapped_on_job_scored if (progress_tracker or options.on_job_scored) else None,
             )
             stage_latencies["score"] = round(time.perf_counter() - score_started, 4)

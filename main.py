@@ -11,6 +11,8 @@ Usage:
   python main.py --yes            # skip all confirmation prompts
   python main.py --min-score 75   # override min display score for this run
   python main.py --profile sister # load from profiles/sister/config.yaml
+  python main.py --selective-routing    # force routing ON for this run
+  python main.py --no-selective-routing # force routing OFF for this run
 """
 
 from __future__ import annotations
@@ -86,6 +88,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=None, metavar="N", help="Override the number of semantic results to print")
     parser.add_argument("--profile", type=str, default=None, metavar="NAME", help="Load config from profiles/<NAME>/config.yaml")
     parser.add_argument("--debug", action="store_true", help="Enable debug-level console output")
+
+    routing_group = parser.add_mutually_exclusive_group()
+    routing_group.add_argument(
+        "--selective-routing",
+        action="store_true",
+        default=None,
+        help="Enable selective LLM routing for this run (overrides routing.enabled in config)",
+    )
+    routing_group.add_argument(
+        "--no-selective-routing",
+        action="store_true",
+        default=None,
+        help="Disable selective LLM routing for this run (overrides routing.enabled in config)",
+    )
     return parser.parse_args()
 
 
@@ -350,6 +366,14 @@ def main() -> None:
 
     if args.min_score is not None:
         config["scoring"]["min_display_score"] = args.min_score
+
+    # CLI flags override routing.enabled from config
+    if getattr(args, "selective_routing", False):
+        config.setdefault("routing", {})["enabled"] = True
+        logger.info("Selective routing ENABLED via --selective-routing flag")
+    elif getattr(args, "no_selective_routing", False):
+        config.setdefault("routing", {})["enabled"] = False
+        logger.info("Selective routing DISABLED via --no-selective-routing flag")
 
     provider = config["llm"]["provider"]
 

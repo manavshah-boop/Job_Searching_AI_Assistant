@@ -3,7 +3,8 @@ selective_routing.py — Step 26: Selective LLM routing for cost-efficient scori
 
 Routes jobs through the LLM only when a cross-encoder routing score meets the
 configured threshold. Below-threshold jobs get a conservative synthetic score
-derived from the cross-encoder signal — no API call needed.
+derived from the cross-encoder signal and lightweight section detection — no API
+call needed.
 
 Usage (config.yaml):
   routing:
@@ -15,6 +16,7 @@ Usage (config.yaml):
 
 import copy
 import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -42,6 +44,30 @@ _MODEL_MAP: dict[tuple[str, str], str] = {
     ("gemini", "fast"): "gemini-2.0-flash",
     ("gemini", "quality"): "gemini-2.5-flash",
 }
+
+# Heuristic section header patterns used for cheap section detection
+_SECTION_PATTERNS: dict[str, re.Pattern[str]] = {
+    "requirements": re.compile(
+        r"(?i)(requirements?|qualifications?|must.have|you.?ll need|what you need|"
+        r"basic qualifications|minimum qualifications|preferred qualifications)"
+    ),
+    "responsibilities": re.compile(
+        r"(?i)(responsibilities?|what you.?ll do|your role|day.to.day|"
+        r"key responsibilities|job duties|you will|you.?ll be)"
+    ),
+    "summary": re.compile(
+        r"(?i)(about (?:the role|this role|you|us|the job)|job description|"
+        r"overview|summary|we are looking|position overview)"
+    ),
+    "benefits": re.compile(
+        r"(?i)(benefits?|perks?|what we offer|we offer|compensation|equity|salary range)"
+    ),
+}
+
+_STOPWORDS: frozenset[str] = frozenset({
+    "the", "and", "for", "are", "with", "you", "our", "will", "have",
+    "this", "that", "from", "not", "but", "your", "they", "was", "all",
+})
 
 
 def routing_enabled(config: dict[str, Any]) -> bool:
@@ -108,6 +134,7 @@ class SelectiveRouter:
             "model", _DEFAULT_RERANKER_MODEL
         )
         self._encoder: Any = None
+        self._match_query: str = ""
         self._counts: dict[str, int] = {"llm": 0, "skipped": 0, "error": 0}
 
     # ── Encoder ───────────────────────────────────────────────────────────────
@@ -123,26 +150,27 @@ class SelectiveRouter:
         """Build the profile query used to score each job via cross-encoder."""
         try:
             from reranker import build_profile_match_query
-            return build_profile_match_query(self._config)
+            query = build_profile_match_query(self._config)
         except Exception as exc:
             logger.warning("selective_routing | build_match_query failed ({}), using fallback", exc)
-        # Fallback: simple concatenation from preferences
-        prefs = self._config.get("preferences", {})
-        titles = prefs.get("titles", [])
-        skills = prefs.get("desired_skills", [])
-        parts: list[str] = []
-        if titles:
-            parts.append(f"Looking for: {', '.join(titles[:4])}")
-        if skills:
-            parts.append(f"Skills: {', '.join(skills[:8])}")
-        return ". ".join(parts) or "software engineer"
+            prefs = self._config.get("preferences", {})
+            titles = prefs.get("titles", [])
+            skills = prefs.get("desired_skills", [])
+            parts: list[str] = []
+            if titles:
+                parts.append(f"Looking for: {', '.join(titles[:4])}")
+            if skills:
+                parts.append(f"Skills: {', '.join(skills[:8])}")
+            query = ". ".join(parts) or "software engineer"
+        self._match_query = query
+        return query
 
     # ── Routing score ─────────────────────────────────────────────────────────
 
     def compute_routing_score(self, job: Job, match_query: str) -> float:
         """
         Compute a cross-encoder routing score (0–1) for one job.
-        Truncates job text to 1800 chars to match the cross-encoder's 512-token limit.
+        Truncates job text to 1800 chars to fit the cross-encoder's 512-token window.
         Returns 0.5 on any error (fail-open → call LLM).
         """
         text = (job.raw_text or "").strip()
@@ -161,15 +189,15 @@ class SelectiveRouter:
         except Exception as exc:
             logger.warning(
                 "selective_routing | cross-encoder failed for job={} ({}), defaulting to 0.5",
-                job.id, exc
+                job.id, exc,
             )
             self._counts["error"] += 1
-            return 0.5  # fail-open: let LLM handle uncertain jobs
+            return 0.5  # fail-open: uncertain jobs go to LLM
 
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
         logger.debug(
             "selective_routing | job={} score={:.3f} latency_ms={}",
-            job.id, score, latency_ms
+            job.id, score, latency_ms,
         )
         return score
 
@@ -185,14 +213,76 @@ class SelectiveRouter:
     def record_skipped(self) -> None:
         self._counts["skipped"] += 1
 
+    # ── Section detection ─────────────────────────────────────────────────────
+
+    def detect_matched_sections(self, job: Job, match_query: str = "") -> list[str]:
+        """
+        Detect which job-description sections contain content that overlaps with
+        the match query. Pure-Python keyword matching — no model call.
+
+        Returns a subset of: ["requirements", "responsibilities", "summary", "benefits"]
+        """
+        text = (job.raw_text or "").strip()
+        if not text:
+            return []
+
+        query = match_query or self._match_query
+        query_terms: set[str] = {
+            t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{2,}", query)
+            if t.lower() not in _STOPWORDS
+        }
+        if not query_terms:
+            return []
+
+        # Bucket lines into sections by scanning for header patterns
+        current = "summary"
+        section_lines: dict[str, list[str]] = {k: [] for k in _SECTION_PATTERNS}
+        section_lines["summary"] = []
+
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            matched_header = False
+            if len(line) < 100:  # headers are short
+                for section, pattern in _SECTION_PATTERNS.items():
+                    if pattern.search(line):
+                        current = section
+                        matched_header = True
+                        break
+            if not matched_header:
+                section_lines.setdefault(current, []).append(line.lower())
+
+        # A section is "matched" if it has ≥2 query term hits
+        matched: list[str] = []
+        for section, lines in section_lines.items():
+            body = " ".join(lines)
+            hits = sum(1 for term in query_terms if term in body)
+            if hits >= 2:
+                matched.append(section)
+
+        return matched
+
     # ── Synthetic score ───────────────────────────────────────────────────────
 
-    def create_synthetic_score(self, job: Job, routing_score: float) -> dict[str, Any]:
+    def create_synthetic_score(
+        self,
+        job: Job,
+        routing_score: float,
+        matched_sections: Optional[list[str]] = None,
+        match_reason: str = "",
+    ) -> dict[str, Any]:
         """
         Create a conservative score result when the LLM is skipped.
 
-        Dimension scores are intentionally lower than what the LLM would produce
-        so that LLM-scored jobs always outrank synthetic-scored ones at equal quality.
+        Uses routing_score as the primary signal and matched_sections to refine
+        individual dimension scores:
+          - "requirements" matched  → better stack_match estimate
+          - "responsibilities" matched → better seniority estimate
+          - "summary" matched → confirms role_fit signal
+
+        Dimension scores are intentionally conservative (scaled by 0.85) so that
+        LLM-scored jobs always outrank synthetic ones at equal quality.
 
         Returns a dict matching score_job()'s return format.
         """
@@ -201,15 +291,40 @@ class SelectiveRouter:
             "location": 0.10, "growth": 0.10, "compensation": 0.05,
         })
 
-        # Scale routing_score by 0.85 so synthetic scores stay visibly below LLM scores
+        # Detect sections if not pre-computed
+        if matched_sections is None:
+            matched_sections = self.detect_matched_sections(job, self._match_query)
+
+        has_requirements = "requirements" in matched_sections
+        has_responsibilities = "responsibilities" in matched_sections
+        has_summary = "summary" in matched_sections
+
+        # Conservative scale: 0.85 keeps synthetic scores visibly below LLM scores
         scale = routing_score * 0.85
+
+        # role_fit: lifted slightly if the summary section matched (confirms general fit)
+        role_fit_scale = scale * (1.05 if has_summary else 1.0)
+        role_fit = max(0, min(10, round(role_fit_scale * 10)))
+
+        # stack_match: lifted if requirements section matched (skills overlap detected)
+        stack_scale = scale * (1.08 if has_requirements else 0.90)
+        stack_match = max(0, min(10, round(stack_scale * 9)))
+
+        # seniority: lifted from neutral (5) if responsibilities matched (role context found)
+        seniority = 6 if has_responsibilities else 5
+
+        # location / growth / compensation: neutral defaults (cross-encoder can't infer these)
+        location = 6
+        growth = 5
+        compensation = 5
+
         dims: dict[str, int] = {
-            "role_fit": max(0, min(10, round(scale * 10))),
-            "stack_match": max(0, min(10, round(scale * 9))),  # slightly more conservative
-            "seniority": 5,    # neutral — cross-encoder can't infer seniority fit
-            "location": 6,     # mild positive default (assume reasonable location)
-            "growth": 5,       # neutral
-            "compensation": 5, # neutral
+            "role_fit": role_fit,
+            "stack_match": stack_match,
+            "seniority": seniority,
+            "location": location,
+            "growth": growth,
+            "compensation": compensation,
         }
 
         fit_score = max(0, min(100, int(
@@ -217,12 +332,30 @@ class SelectiveRouter:
         )))
         ats_score = self._quick_ats(job)
 
+        # Build informative reasons from what we know
+        reasons: list[str] = []
+        if has_requirements:
+            reasons.append("Requirements section signals skill overlap")
+        if has_responsibilities:
+            reasons.append("Responsibilities section aligns with target role")
+        if not reasons:
+            reasons.append(f"Routing score {routing_score:.2f} indicates moderate fit")
+
+        # Use reranker match_reason as one_liner if available
+        one_liner = (
+            match_reason.strip()
+            if match_reason.strip()
+            else f"Reranker score {routing_score:.2f} — LLM skipped for cost"
+        )
+
+        section_str = ", ".join(matched_sections) if matched_sections else "none"
+
         self.record_skipped()
         if self.log_decisions:
             logger.info(
                 "routing | job={} company={} routed=skipped_llm routing_score={:.3f} "
-                "threshold={:.2f} synthetic_fit={}",
-                job.id, job.company, routing_score, self.threshold, fit_score,
+                "threshold={:.2f} matched_sections=[{}] synthetic_fit={}",
+                job.id, job.company, routing_score, self.threshold, section_str, fit_score,
             )
 
         return {
@@ -230,11 +363,9 @@ class SelectiveRouter:
             "fit_score": fit_score,
             "tokens_used": 0,
             "ats_score": ats_score,
-            "reasons": [
-                f"Auto-routed: reranker signal {routing_score:.2f} < threshold {self.threshold:.2f}"
-            ],
-            "flags": ["score_source:reranker"],
-            "one_liner": f"Reranker score {routing_score:.2f} — LLM skipped for cost",
+            "reasons": reasons,
+            "flags": [f"score_source:reranker", f"matched_sections:{section_str}"],
+            "one_liner": one_liner,
             "dimension_scores": dims,
             "skill_misses": [],
         }
@@ -258,7 +389,6 @@ class SelectiveRouter:
         candidate = _MODEL_MAP.get(key)
         if candidate:
             return candidate
-        # Fall back to whatever is in config
         return self._config.get("llm", {}).get("model", {}).get(provider, "")
 
     def apply_model_override(self, config: dict[str, Any]) -> dict[str, Any]:
