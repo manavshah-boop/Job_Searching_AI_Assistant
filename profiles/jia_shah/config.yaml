@@ -549,6 +549,12 @@ sources:
     - scale
   hn:
     enabled: false
+routing:
+  enabled: false           # set to true to enable selective LLM routing
+  threshold: 0.65          # reranker score cutoff; jobs below this skip the LLM
+  quality_mode: quality    # "fast" (cheaper model) or "quality" (current model)
+  log_routing_decisions: true
+
 scoring:
   min_display_score: 60
   weights:

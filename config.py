@@ -25,6 +25,13 @@ _DEFAULT_MLFLOW_CONFIG: Dict[str, Any] = {
     "log_eval_labels": False,
 }
 
+_DEFAULT_ROUTING_CONFIG: Dict[str, Any] = {
+    "enabled": False,
+    "threshold": 0.65,
+    "quality_mode": "fast",
+    "log_routing_decisions": True,
+}
+
 
 def apply_config_defaults(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Fill in optional config defaults without changing normal app behavior."""
@@ -33,6 +40,9 @@ def apply_config_defaults(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     mlflow_cfg = tracking_cfg.setdefault("mlflow", {})
     for key, value in _DEFAULT_MLFLOW_CONFIG.items():
         mlflow_cfg.setdefault(key, value)
+    routing_cfg = normalized.setdefault("routing", {})
+    for key, value in _DEFAULT_ROUTING_CONFIG.items():
+        routing_cfg.setdefault(key, value)
     return normalized
 
 

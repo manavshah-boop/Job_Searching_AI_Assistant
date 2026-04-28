@@ -162,6 +162,16 @@ def _migrate_db(db_path: Path) -> None:
         CREATE INDEX IF NOT EXISTS idx_job_embeddings_job
         ON job_embeddings (job_id)
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS routing_decisions (
+            job_id        TEXT PRIMARY KEY,
+            routing_score REAL NOT NULL,
+            threshold     REAL NOT NULL,
+            routed_to     TEXT NOT NULL,
+            reason        TEXT DEFAULT '',
+            decided_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -282,6 +292,38 @@ def rescore_reset(profile: Optional[str] = None) -> None:
     conn.execute("UPDATE jobs SET score_attempts = 0, score_error = NULL")
     conn.commit()
     conn.close()
+
+
+def log_routing_decision(
+    job_id: str,
+    routing_score: float,
+    threshold: float,
+    routed_to: str,
+    reason: str = "",
+    profile: Optional[str] = None,
+) -> None:
+    """Record a routing decision for a single job."""
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO routing_decisions
+            (job_id, routing_score, threshold, routed_to, reason)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (job_id, routing_score, threshold, routed_to, reason),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_routing_stats(profile: Optional[str] = None) -> dict[str, int]:
+    """Return {routed_to: count} for the routing_decisions table."""
+    conn = sqlite3.connect(get_db_path(profile))
+    rows = conn.execute(
+        "SELECT routed_to, COUNT(*) FROM routing_decisions GROUP BY routed_to"
+    ).fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
 
 
 def update_job_status(job_id: str, status: str, profile: Optional[str] = None) -> None:
