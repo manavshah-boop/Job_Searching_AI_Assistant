@@ -33,6 +33,7 @@ from db import (
     increment_score_attempts,
     init_db,
     load_config,
+    log_routing_decision,
     rescore_reset,
     save_score,
     write_score_error,
@@ -744,7 +745,21 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
     Scores all eligible unscored jobs. Prompts for confirmation unless yes=True.
     Returns results sorted by fit score descending.
     Uses instructor for structured output when available.
+    When routing.enabled=true, skips the LLM for jobs below the routing threshold.
     """
+    # ── Selective routing setup (must run before get_llm_client to apply model override) ──
+    router = None
+    _match_query = None
+    if config.get("routing", {}).get("enabled", False):
+        from selective_routing import SelectiveRouter
+        router = SelectiveRouter(config, profile)
+        config = router.apply_model_override(config)
+        _match_query = router.build_match_query()
+        logger.info(
+            "Selective routing enabled | threshold={:.2f} | quality_mode={} | model={}",
+            router.threshold, router.quality_mode, router.get_effective_llm_model(),
+        )
+
     llm_cfg  = config["llm"]
     provider = llm_cfg["provider"]
     model    = llm_cfg["model"][provider]
@@ -831,7 +846,28 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         increment_score_attempts(job.id, profile=profile)
 
         try:
-            result = score_job(job, config, llm_call, structured_profile, instructor_client)
+            if router and _match_query:
+                _routing_score = router.compute_routing_score(job, _match_query)
+                if not router.should_call_llm(_routing_score):
+                    result = router.create_synthetic_score(job, _routing_score)
+                    log_routing_decision(
+                        job.id, _routing_score, router.threshold,
+                        "skipped_llm", "below_threshold", profile,
+                    )
+                else:
+                    router.record_llm_call()
+                    if router.log_decisions:
+                        logger.info(
+                            "routing | job={} company={} routed=llm_called routing_score={:.3f} reason=meets_threshold",
+                            job.id, job.company, _routing_score,
+                        )
+                    result = score_job(job, config, llm_call, structured_profile, instructor_client)
+                    log_routing_decision(
+                        job.id, _routing_score, router.threshold,
+                        "llm_called", "meets_threshold", profile,
+                    )
+            else:
+                result = score_job(job, config, llm_call, structured_profile, instructor_client)
             limiter.record(result.get("tokens_used", 500))
 
             dims = result["dimension_scores"]
@@ -875,6 +911,9 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         avg_fit = sum(r["fit_score"] for r in scored) / len(scored)
         avg_ats = sum(r["ats_score"] for r in scored) / len(scored)
         logger.info(f"Done. {len(scored)}/{len(jobs)} scored  |  avg fit={avg_fit:.0f}  avg ats={avg_ats:.0f}")
+
+    if router:
+        router.log_summary()
 
     return sorted(results, key=lambda r: r["fit_score"], reverse=True)
 

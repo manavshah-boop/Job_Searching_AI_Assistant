@@ -41,6 +41,7 @@ from db import (
     get_db_path,
     get_job_with_score,
     get_recent_runs,
+    get_routing_stats,
     init_db,
     load_discovered_slugs,
     rescore_reset,
@@ -3077,6 +3078,69 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 ash_companies = st.text_area("Ashby companies",        value=ash_companies, height=140, help="One company slug per line.")
                 wl_companies  = st.text_area("Workable companies",     value=wl_companies,  height=140, help="One company slug per line.")
 
+        with st.expander("Cost optimization (selective routing)", expanded=False):
+            st.caption(
+                "Route low-confidence jobs to a synthetic score instead of calling the LLM. "
+                "Reduces API costs by 60–90% with minimal quality impact."
+            )
+            routing_cfg = editable.get("routing", {})
+            routing_enabled_val = st.toggle(
+                "Enable selective routing",
+                value=bool(routing_cfg.get("enabled", False)),
+                key=f"routing_enabled_{slug}",
+                help="When on, jobs below the threshold skip the LLM and get a synthetic score.",
+            )
+            routing_threshold = st.slider(
+                "Routing threshold",
+                min_value=0.40,
+                max_value=0.90,
+                value=float(routing_cfg.get("threshold", 0.65)),
+                step=0.05,
+                key=f"routing_threshold_{slug}",
+                help=(
+                    "Jobs whose cross-encoder score is below this value skip the LLM. "
+                    "Lower = more LLM calls (higher quality, higher cost). "
+                    "Higher = fewer LLM calls (lower cost, may miss edge cases). "
+                    "Start at 0.65 and adjust after a sanity check."
+                ),
+                disabled=not routing_enabled_val,
+            )
+            routing_quality = st.radio(
+                "Quality mode",
+                options=["fast", "quality"],
+                index=0 if routing_cfg.get("quality_mode", "fast") == "fast" else 1,
+                horizontal=True,
+                key=f"routing_quality_{slug}",
+                help=(
+                    "**fast**: cheaper/faster model for LLM-routed jobs (e.g. llama-3.1-8b-instant). "
+                    "**quality**: current configured model — best output, higher cost."
+                ),
+                disabled=not routing_enabled_val,
+            )
+            routing_log = st.checkbox(
+                "Log routing decisions",
+                value=bool(routing_cfg.get("log_routing_decisions", True)),
+                key=f"routing_log_{slug}",
+                disabled=not routing_enabled_val,
+            )
+            # Routing stats panel
+            try:
+                stats = get_routing_stats(profile=slug)
+                if stats:
+                    total = sum(stats.values())
+                    skipped = stats.get("skipped_llm", 0)
+                    called = stats.get("llm_called", 0)
+                    savings_pct = round(skipped / total * 100) if total else 0
+                    st.markdown("**Routing history (this profile)**")
+                    col_r1, col_r2, col_r3 = st.columns(3)
+                    col_r1.metric("LLM calls", called)
+                    col_r2.metric("Skipped (synthetic)", skipped)
+                    col_r3.metric("Cost savings", f"{savings_pct}%")
+                else:
+                    st.caption("No routing decisions logged yet for this profile.")
+            except Exception:
+                pass
+
         submitted = st.button(
             "Save settings",
             key=f"save_settings_{slug}",
@@ -3120,6 +3184,12 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 callout("error", "At least one source is required", "Enable at least one source before saving.")
                 return
 
+            editable["routing"] = {
+                "enabled": routing_enabled_val,
+                "threshold": round(float(routing_threshold), 2),
+                "quality_mode": routing_quality,
+                "log_routing_decisions": routing_log,
+            }
             _write_profile_config(slug, editable)
             _set_notice(slug, "success", "Settings saved for this profile.")
             invalidate_dashboard_caches()

@@ -21,7 +21,7 @@ def test_run_full_pipeline_orchestrates_enabled_stages(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "run_scoring",
-        lambda config, profile, yes=False, on_job_scored=None: calls.append(("score", profile, yes, on_job_scored is not None)) or pipeline.ScoreStats(results=[{"fit_score": 82, "ats_score": 76}], jobs_scored=1, avg_fit_score=82.0, avg_ats_score=76.0),
+        lambda config, profile, yes=False, selective_routing=None, on_job_scored=None: calls.append(("score", profile, yes, on_job_scored is not None)) or pipeline.ScoreStats(results=[{"fit_score": 82, "ats_score": 76}], jobs_scored=1, avg_fit_score=82.0, avg_ats_score=76.0),
     )
     monkeypatch.setattr(
         pipeline,
@@ -57,7 +57,7 @@ def test_run_full_pipeline_skips_disabled_embedding_stage(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "run_scoring",
-        lambda config, profile, yes=False, on_job_scored=None: pipeline.ScoreStats(results=[], jobs_scored=0),
+        lambda config, profile, yes=False, selective_routing=None, on_job_scored=None: pipeline.ScoreStats(results=[], jobs_scored=0),
     )
 
     result = pipeline.run_full_pipeline(
