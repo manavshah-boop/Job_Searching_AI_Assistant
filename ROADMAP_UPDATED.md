@@ -58,15 +58,30 @@
 
 | Feature | Description | Effort | Impact |
 |---------|-------------|--------|--------|
-| **Dynamic routing** | Vector → Rerank → Route top-K to LLM only (not all jobs) | 2–3 days | 60% cost cut, faster daily runs |
+| **Dynamic routing** | Reranker score ≥ threshold → LLM; else keep reranker score (no LLM call) | 2–3 days | 60% cost cut, faster daily runs |
 | **Cost/Quality slider** | Streamlit toggle: cheap (GPT-4o-mini) ↔ quality (Claude/GPT-4) | 1 day | Fine-grained control |
-| **Route selection logic** | Semantic score ≥ threshold → LLM; else return reranker score | 1 day | Deterministic, auditable |
 | **Latency tracking** | Log retrieval/rerank/LLM timing; alert if any stage is slow | 1 day | Observe bottlenecks |
+| **One-hour sanity check** | Post-live: compare top-5 LLM jobs vs. top-5 routed jobs; verify no great matches missed | 1 hour | Confidence in threshold quality |
 
-**Deliverable:** CLI flag `--selective-routing` + dashboard toggle. LLM calls only for top 10–15 jobs per run.
+**Sanity Check Protocol (post-implementation):**
+```
+1. Run full pipeline once (all jobs via LLM, expensive).
+2. Run full pipeline again with routing enabled (cheap run).
+3. Extract top-5 jobs from each run.
+4. Manually review: Are any great matches missing from the routed top-5?
+5. If drift detected, adjust threshold or model.
+6. If all looks good, mark threshold as "verified".
+7. Future: optionally log top-10 job IDs each run + monthly spot-check for drift.
+```
+
+**Deliverable:** 
+- CLI flag `--selective-routing` + dashboard toggle
+- LLM calls only for jobs with reranker score ≥ threshold (e.g., 0.65)
+- Documented sanity check results (top-5 comparison, any misses noted)
+- Vector rank still displayed for transparency, but routing uses reranker
 
 **Status:** Not started.  
-**Why next:** Unblocks daily runs without fear of hitting API quotas. Every week adds up; this pays for itself in a month.
+**Why next:** Unblocks daily runs without API fear. Sanity check (1 hour) gives you confidence you didn't lose quality.
 
 ---
 
@@ -348,7 +363,7 @@ routing:
 
 | Risk | Severity | Mitigation |
 |------|----------|-----------|
-| Playwright stealth blocked by Cloudflare | Medium | Use official `playwright_stealth` plugin; monitor GitHub issues |
+| Playwright stealth blocked by Cloudflare | Medium | Use official `playwright_stealth` plugin; if unreliable, upgrade to **Patchright** or **Nodriver** (drop-in replacements with deeper fingerprint evasion). Monitor GitHub issues for latest. |
 | Form field detection fails for custom ATS | Medium | Manual fallback: pause and show form preview for human inspection |
 | Typos in auto-filled fields (name, email) | Low | Require human review before submit (Step 33 approval gate) |
 | Application rate limiting | Low | Track submission timestamps; enforce 5-second minimum between submits |
