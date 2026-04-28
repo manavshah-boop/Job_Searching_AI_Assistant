@@ -19,13 +19,16 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from loguru import logger
 
-from db import count_jobs, get_top_jobs, init_db, load_config, set_active_profile
+from db import count_jobs, get_job_with_score, get_top_jobs, init_db, load_config, set_active_profile
 from logging_config import configure_logging
+from match_explainer import build_match_explanation
 from pipeline import PipelineOptions, run_full_pipeline
+from profile_intent import normalize_profile_intent
 from reranker import reranking_enabled, reranking_top_k_final, semantic_match_jobs
 from scorer import print_results
 from vector_store import (
@@ -169,6 +172,44 @@ def _print_reranked_results(results, query_label: str) -> None:
         print()
 
 
+def _print_explained_reranked_results(results, query_label: str, profile: str, config: dict[str, Any]) -> None:
+    if not results:
+        logger.info("No semantic matches found for {}.", query_label)
+        return
+
+    profile_intent = normalize_profile_intent(config)
+    print(f"\n{'=' * 72}")
+    print(f"  SEMANTIC MATCH RESULTS ({len(results)} jobs)")
+    print(f"{'=' * 72}\n")
+
+    for result in results:
+        job_record = get_job_with_score(result.job_id, profile=profile)
+        explanation = build_match_explanation(job_record, job_record, result, profile_intent)
+        print(f"- {explanation.title} - {explanation.company}")
+        final_value = f"{round(explanation.overall_score)}%" if explanation.overall_score is not None else "n/a"
+        llm_value = explanation.llm_fit_score if explanation.llm_fit_score is not None else "n/a"
+        print(f"  Action: {explanation.recommended_action}")
+        print(f"  Final score: {final_value}  |  LLM fit: {llm_value}")
+        if explanation.strengths:
+            print("  Top strengths:")
+            for factor in explanation.strengths[:3]:
+                detail = factor.evidence[0] if factor.evidence else factor.explanation
+                print(f"    - {factor.name}: {detail}")
+        if explanation.concerns:
+            print("  Top concerns:")
+            for factor in explanation.concerns[:3]:
+                detail = factor.evidence[0] if factor.evidence else factor.explanation
+                print(f"    - {factor.name}: {detail}")
+        elif explanation.unknowns:
+            print("  Needs more info:")
+            for factor in explanation.unknowns[:2]:
+                detail = factor.evidence[0] if factor.evidence else factor.explanation
+                print(f"    - {factor.name}: {detail}")
+        if result.url:
+            print(f"  {result.url}")
+        print()
+
+
 def _fallback_to_sqlite_results(config: dict, context: str, exc: Exception) -> None:
     logger.warning("{} failed: {}", context, exc)
     logger.info("Falling back to SQLite-ranked results.")
@@ -272,7 +313,12 @@ def main() -> None:
             if args.rerank:
                 results = semantic_match_jobs(args.profile or "default", config, user_query=args.semantic_search)
                 limit = args.top_k or reranking_top_k_final(config)
-                _print_reranked_results(results[:limit], f"query '{args.semantic_search}'")
+                _print_explained_reranked_results(
+                    results[:limit],
+                    f"query '{args.semantic_search}'",
+                    args.profile or "default",
+                    config,
+                )
             else:
                 results = query_similar_jobs(
                     args.profile or "default",
@@ -295,7 +341,12 @@ def main() -> None:
             limit = args.top_k or reranking_top_k_final(config)
             if not reranking_enabled(config):
                 logger.info("Reranking is disabled in config; falling back to vector-only semantic matching.")
-            _print_reranked_results(results[:limit], "the active profile")
+            _print_explained_reranked_results(
+                results[:limit],
+                "the active profile",
+                args.profile or "default",
+                config,
+            )
         except Exception as exc:
             _fallback_to_sqlite_results(config, "Semantic match", exc)
         return

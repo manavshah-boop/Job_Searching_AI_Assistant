@@ -8,6 +8,9 @@ from typing import Any
 
 import streamlit as st
 
+from db import get_job_with_score
+from match_explainer import build_match_explanation
+from profile_intent import normalize_profile_intent
 from reranker import build_profile_match_query, reranking_enabled, semantic_match_jobs
 from ui_shell import panel
 from vector_store import query_similar_jobs, vector_store_enabled, vector_top_k_chunks, vector_top_k_jobs
@@ -40,6 +43,56 @@ def _cached_semantic_match(
 def clear_semantic_panel_caches() -> None:
     _cached_vector_search.clear()
     _cached_semantic_match.clear()
+
+
+def _render_explanation_card(explanation) -> None:
+    st.caption(f"Recommended action: {explanation.recommended_action}")
+    st.write(explanation.summary)
+    score_parts: list[str] = []
+    if explanation.overall_score is not None:
+        score_parts.append(f"Final score {round(explanation.overall_score)}%")
+    if explanation.llm_fit_score is not None:
+        score_parts.append(f"LLM fit {explanation.llm_fit_score}")
+    if explanation.ats_score is not None:
+        score_parts.append(f"ATS {explanation.ats_score}")
+    if score_parts:
+        st.caption(" | ".join(score_parts))
+
+    if explanation.strengths:
+        st.caption(
+            "**Top strengths:** "
+            + " · ".join(factor.evidence[0] if factor.evidence else factor.name for factor in explanation.strengths[:3])
+        )
+    if explanation.concerns:
+        st.caption(
+            "**Top concerns:** "
+            + " · ".join(factor.evidence[0] if factor.evidence else factor.name for factor in explanation.concerns[:3])
+        )
+    elif explanation.unknowns:
+        st.caption("**Needs clarification:** " + " · ".join(factor.name for factor in explanation.unknowns[:2]))
+
+    with st.expander("Factor-wise explanation", expanded=False):
+        if explanation.matched_sections:
+            st.caption("Matched sections: " + ", ".join(explanation.matched_sections))
+        if explanation.evidence_snippets:
+            st.caption("Evidence snippets")
+            for snippet in explanation.evidence_snippets[:2]:
+                st.caption(f"_{snippet}_")
+        if explanation.strengths:
+            st.write("Strengths")
+            for factor in explanation.strengths[:4]:
+                details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
+                st.write(f"- {factor.name}: {factor.explanation}{details}")
+        if explanation.concerns:
+            st.write("Concerns")
+            for factor in explanation.concerns[:4]:
+                details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
+                st.write(f"- {factor.name}: {factor.explanation}{details}")
+        if explanation.unknowns:
+            st.write("Unknowns")
+            for factor in explanation.unknowns[:3]:
+                details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
+                st.write(f"- {factor.name}: {factor.explanation}{details}")
 
 
 def render_semantic_match_panel(slug: str, config: dict[str, Any]) -> None:
@@ -108,32 +161,21 @@ def render_semantic_match_panel(slug: str, config: dict[str, Any]) -> None:
     else:
         st.caption("Showing profile-aware reranked semantic matches.")
 
+    profile_intent = normalize_profile_intent(config)
     for index, result in enumerate(results[:5], start=1):
         if hasattr(result, "final_score"):
-            score_pct = round(result.final_score * 100)
-            matched = ", ".join(result.matched_sections) or "none"
-            subtitle = f"{result.company} · {result.source} · Final score {score_pct}%"
-            reason = result.match_reason
-            evidence_snippets = getattr(result, "evidence_snippets", [])
-            ev = getattr(result, "evidence", None)
+            subtitle = f"{result.company} · {result.source} · Final score {round(result.final_score * 100)}%"
         else:
-            score_pct = round(result.aggregate_score * 100)
-            matched = ", ".join(result.matched_chunks) or "none"
-            subtitle = f"{result.company} · {result.source} · Similarity {score_pct}%"
-            reason = result.retrieval_reason
-            evidence_snippets = []
-            ev = None
+            subtitle = f"{result.company} · {result.source} · Similarity {round(result.aggregate_score * 100)}%"
 
         with panel(f"{index}. {result.title}", subtitle=subtitle):
-            st.caption(f"Matched sections: {matched}")
-            st.write(reason)
-            if ev is not None:
-                if ev.positive:
-                    st.caption("**Positive signals:** " + " · ".join(ev.positive))
-                if ev.concerns:
-                    st.caption("**Concerns:** " + " · ".join(ev.concerns))
-            for snippet in evidence_snippets[:2]:
-                if snippet:
-                    st.caption(f"_{snippet}_")
+            if hasattr(result, "final_score"):
+                score_record = get_job_with_score(result.job_id, profile=slug)
+                explanation = build_match_explanation(score_record, score_record, result, profile_intent)
+                _render_explanation_card(explanation)
+            else:
+                matched = ", ".join(result.matched_chunks) or "none"
+                st.caption(f"Matched sections: {matched}")
+                st.write(result.retrieval_reason)
             if result.url:
                 st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")

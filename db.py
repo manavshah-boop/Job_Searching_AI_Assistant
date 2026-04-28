@@ -314,6 +314,50 @@ def _row_to_job(row: sqlite3.Row) -> Job:
     )
 
 
+def _load_json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if value in (None, ""):
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item).strip()]
+
+
+def _normalize_job_with_score_record(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    record = dict(row)
+    record["reasons"] = _load_json_list(record.get("reasons"))
+    record["flags"] = _load_json_list(record.get("flags"))
+    record["skill_misses"] = _load_json_list(record.get("skill_misses"))
+    record["one_liner"] = record.get("one_liner") or ""
+    record["raw_text"] = record.get("raw_text") or ""
+    record["dimension_scores"] = {
+        "role_fit": record.get("role_fit"),
+        "stack_match": record.get("stack_match"),
+        "seniority": record.get("seniority"),
+        "location": record.get("score_location"),
+        "growth": record.get("growth"),
+        "compensation": record.get("compensation"),
+    }
+    disq_from_db = bool(record.get("disqualified", 0))
+    disq_reason = record.get("disqualify_reason", "") or ""
+    if not disq_from_db and not disq_reason:
+        for flag in record["flags"]:
+            if str(flag).startswith("disqualified:"):
+                disq_from_db = True
+                disq_reason = str(flag).replace("disqualified:", "", 1).strip()
+                break
+    record["disqualified"] = disq_from_db
+    record["disqualify_reason"] = disq_reason
+    record["scrape_qualified"] = int(record.get("scrape_qualified") or 1)
+    record["scrape_filter_reason"] = record.get("scrape_filter_reason") or ""
+    return record
+
+
 def get_unscored(profile: Optional[str] = None) -> list:
     """
     Jobs that have not yet been scored successfully and have fewer than
@@ -556,9 +600,9 @@ def get_top_jobs(min_score: int = 60, profile: Optional[str] = None) -> list:
             "job": job,
             "fit_score": row["fit_score"],
             "ats_score": row["ats_score"] or 0,
-            "reasons":      json.loads(row["reasons"]      or "[]"),
-            "flags":        json.loads(row["flags"]        or "[]"),
-            "skill_misses": json.loads(row["skill_misses"] or "[]"),
+            "reasons": _load_json_list(row["reasons"]),
+            "flags": _load_json_list(row["flags"]),
+            "skill_misses": _load_json_list(row["skill_misses"]),
             "one_liner": row["one_liner"] or "",
             "dimension_scores": {
                 "role_fit":     row["role_fit"],
@@ -570,6 +614,61 @@ def get_top_jobs(min_score: int = 60, profile: Optional[str] = None) -> list:
             },
         })
     return results
+
+
+def get_job_with_score(job_id: str, profile: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """
+    Fetch one job joined with any available score fields and return a normalized dict.
+
+    This is the shared read path for job detail views, explanations, and CLI/dashboard
+    integrations that need parsed reasons/flags/skill misses plus dimension scores.
+    """
+    init_db(profile=profile)
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                j.id,
+                j.title,
+                j.company,
+                j.location,
+                j.url,
+                j.raw_text,
+                j.source,
+                j.score_attempts,
+                j.score_error,
+                j.status,
+                j.created_at,
+                j.scrape_qualified,
+                j.scrape_filter_reason,
+                s.fit_score,
+                s.ats_score,
+                s.reasons,
+                s.flags,
+                s.skill_misses,
+                s.one_liner,
+                s.role_fit,
+                s.stack_match,
+                s.seniority,
+                s.location AS score_location,
+                s.growth,
+                s.compensation,
+                s.scored_at,
+                s.disqualified,
+                s.disqualify_reason
+            FROM jobs j
+            LEFT JOIN scores s ON j.id = s.job_id
+            WHERE j.id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _normalize_job_with_score_record(row)
+    finally:
+        conn.close()
 
 
 def get_all_jobs(profile: Optional[str] = None) -> list:
