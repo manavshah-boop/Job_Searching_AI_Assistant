@@ -49,6 +49,7 @@ from db import (
     update_job_status,
 )
 from dashboard_semantic import clear_semantic_panel_caches, render_semantic_match_panel
+from evaluation import evaluate_profile, export_eval_template, load_eval_labels, load_last_eval_result
 from dashboard_ui import (
     render_activity_feed,
     render_pipeline_stages,
@@ -190,6 +191,10 @@ def _profile_config_path(slug: str) -> Path:
 
 def _dashboard_log_path(profile: str) -> Path:
     return BASE_DIR / "logs" / profile / "agent.log"
+
+
+def _eval_labels_path(slug: str) -> Path:
+    return PROFILES_DIR / slug / "eval_labels.yaml"
 
 
 def _safe_count_jobs(slug: str) -> dict[str, int]:
@@ -2655,6 +2660,7 @@ def _render_activity_tab(
 
         with right:
             _render_review_status_card(slug, metrics, raw_config)
+            _render_evaluation_card(slug, config)
 
         disq_count = metrics.get("disqualified_count", 0)
         if disq_count > 0:
@@ -2701,6 +2707,65 @@ def _render_activity_tab(
                     ("Workable cache",   len(wl_slugs)),
                 ]
             )
+
+
+def _render_evaluation_card(slug: str, config: dict[str, Any]) -> None:
+    labels_path = _eval_labels_path(slug)
+    labels = load_eval_labels(labels_path)
+    last_result = load_last_eval_result(slug)
+
+    with panel("Evaluation", subtitle="Measure whether semantic ranking is improving for this profile"):
+        st.caption("Label a small set of jobs as great/good/okay/bad/skip to measure ranking quality.")
+        st.write(f"Labels file: {'available' if labels_path.exists() else 'not created yet'}")
+        st.write(f"Labeled jobs: {len(labels)}")
+
+        action_cols = st.columns(2, gap="small")
+        if action_cols[0].button("Export eval template", key=f"export_eval_template_{slug}", use_container_width=True):
+            try:
+                exported = export_eval_template(
+                    slug,
+                    config,
+                    labels_path,
+                    use_reranker=reranking_enabled(config),
+                )
+                _set_notice(slug, "success", f"Exported {len(exported)} eval labels to {labels_path.name}.")
+                invalidate_dashboard_caches()
+                st.rerun()
+            except Exception as exc:
+                callout("error", "Eval template export failed", str(exc))
+
+        run_disabled = not labels_path.exists() or not labels
+        if action_cols[1].button("Run evaluation", key=f"run_eval_{slug}", use_container_width=True, disabled=run_disabled):
+            try:
+                evaluate_profile(
+                    slug,
+                    config,
+                    labels_path,
+                    use_reranker=reranking_enabled(config),
+                )
+                _set_notice(slug, "success", "Evaluation complete. Metrics refreshed.")
+                invalidate_dashboard_caches()
+                st.rerun()
+            except Exception as exc:
+                callout("error", "Evaluation failed", str(exc))
+
+        if last_result is None:
+            st.caption("No evaluation has been run for this profile yet.")
+            return
+
+        stat_row(
+            [
+                ("P@5", f"{last_result.precision_at_5:.2f}", "Top-5 precision"),
+                ("P@10", f"{last_result.precision_at_10:.2f}", "Top-10 precision"),
+                ("Recall@10", f"{last_result.recall_at_10:.2f}", "Relevant labeled jobs found in top 10"),
+                ("NDCG@10", f"{last_result.ndcg_at_10:.2f}", "Graded ranking quality"),
+                ("MRR", f"{last_result.mrr:.2f}", "Reciprocal rank of first relevant job"),
+                ("Coverage", f"{last_result.coverage:.2f}", "Labeled jobs present anywhere in the candidate set"),
+            ],
+            columns_count=2,
+        )
+        if last_result.notes:
+            st.caption(last_result.notes)
 
 
 def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any]) -> None:
