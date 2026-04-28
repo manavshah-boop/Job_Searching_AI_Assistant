@@ -25,6 +25,11 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from db import count_jobs, get_job_with_score, get_top_jobs, init_db, load_config, set_active_profile
+from evaluation import (
+    evaluate_profile,
+    export_eval_template,
+    load_eval_labels,
+)
 from logging_config import configure_logging
 from match_explainer import build_match_explanation
 from pipeline import PipelineOptions, run_full_pipeline
@@ -68,12 +73,15 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--semantic-match", action="store_true", help="Run profile-aware matching against indexed jobs, skip scraping/scoring")
     mode.add_argument("--rebuild-vector-index", action="store_true", help="Rebuild the ChromaDB vector index from SQLite embeddings")
     mode.add_argument("--clear-vector-index", action="store_true", help="Delete the profile-scoped ChromaDB vector index")
+    mode.add_argument("--eval", action="store_true", help="Evaluate semantic ranking against profiles/<name>/eval_labels.yaml")
+    mode.add_argument("--export-eval-template", action="store_true", help="Create a starter eval_labels.yaml from current semantic matches")
     mode.add_argument("--show", action="store_true", help="Print current top jobs from DB, no scraping or scoring")
 
     parser.add_argument("--rescore", action="store_true", help="Clear all scores and re-score everything")
     parser.add_argument("--yes", action="store_true", help="Skip all confirmation prompts (non-interactive / cron)")
     parser.add_argument("--min-score", type=int, default=None, metavar="N", help="Override min_display_score from config for this run")
     parser.add_argument("--rerank", action="store_true", help="Use the cross-encoder reranker for semantic search")
+    parser.add_argument("--no-rerank", action="store_true", help="Disable reranking for evaluation or semantic comparisons that support it")
     parser.add_argument("--top-k", type=int, default=None, metavar="N", help="Override the number of semantic results to print")
     parser.add_argument("--profile", type=str, default=None, metavar="NAME", help="Load config from profiles/<NAME>/config.yaml")
     parser.add_argument("--debug", action="store_true", help="Enable debug-level console output")
@@ -118,6 +126,90 @@ def _print_banner(config: dict) -> None:
     logger.info("Provider: {} ({})", provider, model)
     logger.info("Sources: {}", "  ".join(enabled_names) if enabled_names else "none")
     logger.info("DB: {} jobs total, {} scored, {} embedded", stats["total"], stats["scored"], stats.get("embedded", 0))
+
+
+def _default_eval_labels_path(profile: str | None) -> Path:
+    resolved = profile or "default"
+    return Path(__file__).parent / "profiles" / resolved / "eval_labels.yaml"
+
+
+def _eval_ranked_job_ids(
+    profile: str,
+    config: dict[str, Any],
+    *,
+    use_reranker: bool,
+    top_k_override: int | None = None,
+) -> list[str]:
+    if use_reranker:
+        return [result.job_id for result in semantic_match_jobs(profile, config, user_query=None)]
+    query = " ".join(normalize_profile_intent(config).raw_keywords) or "job match"
+    results = query_similar_jobs(
+        profile,
+        query,
+        top_k_chunks=vector_top_k_chunks(config),
+        top_k_jobs=top_k_override or vector_top_k_jobs(config),
+    )
+    return [result.job_id for result in results]
+
+
+def _top_missed_relevant(
+    profile: str,
+    labels_path: Path,
+    config: dict[str, Any],
+    *,
+    use_reranker: bool,
+    top_k_override: int | None = None,
+) -> list[str]:
+    labels = load_eval_labels(labels_path)
+    ranked_job_ids = set(
+        _eval_ranked_job_ids(
+            profile,
+            config,
+            use_reranker=use_reranker,
+            top_k_override=top_k_override,
+        )
+    )
+    missed = [
+        f"{label.job_id} ({label.label})"
+        for label in labels
+        if label.label in {"great_match", "good_match"} and label.job_id not in ranked_job_ids
+    ]
+    return missed[:5]
+
+
+def _print_eval_summary(
+    profile: str,
+    result,
+    labels_path: Path,
+    config: dict[str, Any],
+    *,
+    use_reranker: bool,
+    top_k_override: int | None = None,
+) -> None:
+    print(f"\n{'=' * 68}")
+    print(f"  EVALUATION RESULTS ({profile})")
+    print(f"{'=' * 68}\n")
+    print(f"Labels file: {labels_path}")
+    print(f"Role family: {result.role_family or 'unknown'}")
+    print(f"Total labeled jobs: {result.total_labeled}")
+    print(f"Precision@5:  {result.precision_at_5:.3f}")
+    print(f"Precision@10: {result.precision_at_10:.3f}")
+    print(f"Recall@10:    {result.recall_at_10:.3f}")
+    print(f"MRR:          {result.mrr:.3f}")
+    print(f"NDCG@10:      {result.ndcg_at_10:.3f}")
+    print(f"Coverage:     {result.coverage:.3f}")
+    if result.notes:
+        print(f"Notes:        {result.notes}")
+    missed = _top_missed_relevant(
+        profile,
+        labels_path,
+        config,
+        use_reranker=use_reranker,
+        top_k_override=top_k_override,
+    )
+    if missed:
+        print(f"Top missed great/good matches: {', '.join(missed)}")
+    print()
 
 
 def _print_vector_results(results, query: str) -> None:
@@ -267,6 +359,49 @@ def main() -> None:
             logger.info("No scored jobs above {} in DB.", config["scoring"].get("min_display_score", 60))
         else:
             print_results(results, config)
+        return
+
+    if args.export_eval_template:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; eval template export is unavailable.")
+            return
+        profile_slug = args.profile or "default"
+        labels_path = _default_eval_labels_path(args.profile)
+        labels = export_eval_template(
+            profile_slug,
+            config,
+            labels_path,
+            use_reranker=not args.no_rerank,
+            limit=args.top_k or 20,
+        )
+        logger.info("Exported {} starter eval labels to {}", len(labels), labels_path)
+        return
+
+    if args.eval:
+        _print_banner(config)
+        if not vector_store_enabled(config):
+            logger.info("Vector store is disabled in this profile config; evaluation is unavailable.")
+            return
+        profile_slug = args.profile or "default"
+        labels_path = _default_eval_labels_path(args.profile)
+        if not labels_path.exists():
+            logger.info("No eval labels found at {}. Run --export-eval-template first.", labels_path)
+            return
+        result = evaluate_profile(
+            profile_slug,
+            config,
+            labels_path,
+            use_reranker=not args.no_rerank,
+        )
+        _print_eval_summary(
+            profile_slug,
+            result,
+            labels_path,
+            config,
+            use_reranker=not args.no_rerank,
+            top_k_override=args.top_k,
+        )
         return
 
     if args.clear_vector_index:

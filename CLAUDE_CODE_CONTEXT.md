@@ -987,3 +987,96 @@ Typed boundary objects:
 - change stage ordering -> `pipeline.py`
 
 If one of those changes requires edits across multiple orchestration layers, the architecture has drifted.
+
+## Step 24 - Evaluation dataset and ranking metrics
+
+### evaluation.py
+
+New module for deterministic local evaluation of semantic ranking quality. This layer is profile-scoped, uses no LLM calls, and does not change retrieval/reranking formulas.
+
+Dataclasses:
+- `EvalLabel` - `profile_slug`, `job_id`, `label`, `notes`, `role_family`
+- `EvalResult` - `profile_slug`, `role_family`, `total_labeled`, `precision_at_5`, `precision_at_10`, `recall_at_10`, `mrr`, `ndcg_at_10`, `coverage`, `notes`
+
+Allowed labels and graded relevance:
+- `great_match` -> 4
+- `good_match` -> 3
+- `okay_match` -> 2
+- `bad_match` -> 1
+- `should_skip` -> 0
+
+Public API:
+- `load_eval_labels(path) -> list[EvalLabel]`
+- `save_eval_labels(labels, path) -> None`
+- `label_to_relevance(label) -> int`
+- `evaluate_ranked_results(labels, ranked_job_ids, k_values=(5, 10)) -> EvalResult`
+- `evaluate_profile(profile_slug, config, labels_path, use_reranker=True) -> EvalResult`
+- `compare_eval_runs(previous, current) -> dict`
+- `export_eval_template(profile_slug, config, path, use_reranker=True, limit=20) -> list[EvalLabel]`
+- `load_last_eval_result(profile_slug) -> EvalResult | None`
+
+### Eval label format
+
+Each profile keeps local hand-editable labels at:
+- `profiles/{profile}/eval_labels.yaml`
+
+Format:
+
+```yaml
+labels:
+  - job_id: greenhouse_123
+    label: great_match
+    notes: Strong backend Python role, good location, right seniority
+    role_family: software_engineering
+  - job_id: lever_456
+    label: should_skip
+    notes: Senior manager role, not entry-level
+```
+
+Starter templates are exported from current semantic matches. New template rows default to `okay_match` with a reminder note so they can be relabeled manually.
+
+### Metrics
+
+Implemented deterministically in pure Python:
+- `Precision@K` - fraction of top-K results labeled `good_match` or `great_match`
+- `Recall@10` - fraction of all labeled relevant jobs that appear in the top 10
+- `MRR` - reciprocal rank of the first relevant result
+- `NDCG@10` - graded ranking quality using the 0-4 relevance mapping
+- `Coverage` - fraction of labeled jobs that appear anywhere in the evaluated candidate set
+
+This helps answer:
+- are strong matches ranking above weak matches?
+- are role-family-specific profiles behaving correctly?
+- are good jobs missing entirely from candidate generation?
+- did changes to embeddings, reranking, or explanation logic improve outcomes?
+
+### CLI commands
+
+- `python main.py --profile manav --eval`
+- `python main.py --profile manav --eval --no-rerank`
+- `python main.py --profile manav --export-eval-template`
+
+Behavior:
+- `--eval` runs semantic ranking for the active profile, compares the ranked job IDs to `profiles/{profile}/eval_labels.yaml`, prints metrics, and saves the latest result to `profiles/{profile}/eval_last_result.json`
+- `--no-rerank` evaluates vector-only retrieval instead of the reranked path
+- `--export-eval-template` creates or refreshes a starter local label file from the current semantic matches
+
+### Dashboard integration
+
+The Activity tab now includes a lightweight Evaluation panel that shows:
+- whether `eval_labels.yaml` exists for the active profile
+- number of labeled jobs
+- last saved evaluation metrics
+- an export-template button
+- a simple run-evaluation button
+
+No full labeling UI has been added yet.
+
+### Role-family generalization
+
+Evaluation is intentionally role-agnostic:
+- labels can store `role_family`, but metrics do not assume software roles
+- `evaluate_profile()` infers missing label role families from `ProfileIntent`
+- tests cover software, finance internship, marketing, and general fallback profiles
+
+This creates a clean benchmark layer before changing retrieval formulas and sets up the next step where evaluation runs can be tracked in MLflow later without changing the local metric definitions.
