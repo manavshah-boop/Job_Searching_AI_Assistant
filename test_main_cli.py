@@ -133,6 +133,13 @@ def test_main_cli_runs_eval_mode(monkeypatch, tmp_path: Path):
         )(),
     )
     monkeypatch.setattr(main, "_print_eval_summary", lambda *args, **kwargs: calls.append("summary"))
+    monkeypatch.setattr(
+        main,
+        "safe_log_eval_result",
+        lambda config, profile, result, extra_params=None: calls.append(
+            ("track_eval", profile, extra_params["use_reranker"], extra_params["labels_path"])
+        ),
+    )
 
     main.main()
 
@@ -140,6 +147,7 @@ def test_main_cli_runs_eval_mode(monkeypatch, tmp_path: Path):
         "banner",
         ("evaluate", "alpha", str(labels_path), False),
         "summary",
+        ("track_eval", "alpha", False, str(labels_path)),
     ]
 
 

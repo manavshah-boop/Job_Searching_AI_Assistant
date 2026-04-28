@@ -57,3 +57,6 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+.pytest_tmp/
+pytest-cache-files-*/
+.tmp_streamlit_test/tmp*/

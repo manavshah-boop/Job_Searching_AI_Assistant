@@ -36,6 +36,7 @@ from pipeline import PipelineOptions, run_full_pipeline
 from profile_intent import normalize_profile_intent
 from reranker import reranking_enabled, reranking_top_k_final, semantic_match_jobs
 from scorer import print_results
+from tracking import safe_log_eval_result, safe_log_semantic_match
 from vector_store import (
     clear_vector_index,
     query_similar_jobs,
@@ -402,6 +403,19 @@ def main() -> None:
             use_reranker=not args.no_rerank,
             top_k_override=args.top_k,
         )
+        safe_log_eval_result(
+            config,
+            profile_slug,
+            result,
+            extra_params={
+                "labels_path": str(labels_path),
+                "role_family": result.role_family,
+                "use_reranker": not args.no_rerank,
+                "top_k_chunks": vector_top_k_chunks(config),
+                "top_k_jobs": vector_top_k_jobs(config),
+                "top_k_final": reranking_top_k_final(config),
+            },
+        )
         return
 
     if args.clear_vector_index:
@@ -448,6 +462,12 @@ def main() -> None:
             if args.rerank:
                 results = semantic_match_jobs(args.profile or "default", config, user_query=args.semantic_search)
                 limit = args.top_k or reranking_top_k_final(config)
+                safe_log_semantic_match(
+                    config,
+                    args.profile or "default",
+                    results[:limit],
+                    query=args.semantic_search,
+                )
                 _print_explained_reranked_results(
                     results[:limit],
                     f"query '{args.semantic_search}'",
@@ -476,6 +496,12 @@ def main() -> None:
             limit = args.top_k or reranking_top_k_final(config)
             if not reranking_enabled(config):
                 logger.info("Reranking is disabled in config; falling back to vector-only semantic matching.")
+            safe_log_semantic_match(
+                config,
+                args.profile or "default",
+                results[:limit],
+                query=None,
+            )
             _print_explained_reranked_results(
                 results[:limit],
                 "the active profile",
