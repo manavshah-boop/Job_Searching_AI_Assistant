@@ -582,7 +582,7 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
             label="scorer",
         )
         if dims is not None:
-            tokens_used = 500  # instructor doesn't expose real token counts
+            tokens_used = max(500, len(prompt) // 4)
 
     # Fallback: raw LLM call + JSON parsing (also handles {"value": x} wrapping)
     if dims is None:
@@ -813,7 +813,7 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         )
     else:
         structured_profile = build_structured_profile(config, llm_call)
-    limiter.record(600)
+    limiter.record(1000)
     print_profile_summary(structured_profile)
     logger.info(
         f"Profile: {structured_profile.get('name')} | "

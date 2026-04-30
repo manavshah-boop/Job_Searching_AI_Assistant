@@ -501,7 +501,6 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
     companies = slugs if slugs is not None else []
     preferences = config.get('preferences', {})
     preferred_titles = _preferred_titles(config)
-    desired_skills = profile_info.get('desired_skills') or preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
     max_job_age_days = _configured_max_job_age_days(config)
 
@@ -778,7 +777,6 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
 
     preferences = config.get('preferences', {})
     preferred_titles = _preferred_titles(config)
-    desired_skills = preferences.get('desired_skills', [])
     hard_no_keywords = preferences.get('hard_no_keywords', [])
 
     new_jobs_saved = 0
@@ -886,7 +884,6 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
                 # For now, just use the first line as title, rest as description
                 lines = comment_text.split('\n', 1)
                 title = lines[0].strip() if lines else "Job Posting"
-                description = lines[1].strip() if len(lines) > 1 else comment_text
 
                 # Skip if title doesn't match keywords
                 if not title_matches(title, preferred_titles):
@@ -1021,8 +1018,6 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
 
     companies = slugs if slugs is not None else []
     preferences = config.get('preferences', {})
-    profile_info = config.get('profile', {})
-
     preferred_titles = _preferred_titles(config)
     hard_no_keywords = preferences.get('hard_no_keywords', [])
     max_job_age_days = _configured_max_job_age_days(config)
