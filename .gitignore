@@ -60,3 +60,5 @@ logs/
 .pytest_tmp/
 pytest-cache-files-*/
 .tmp_streamlit_test/tmp*/
+.tmp_streamlit_test/vector_store_*/
+.claude/worktrees/
