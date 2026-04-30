@@ -724,6 +724,57 @@ def get_all_jobs(profile: Optional[str] = None) -> list:
     return [_row_to_job(r) for r in rows]
 
 
+def get_all_jobs_with_scores(profile: Optional[str] = None) -> List[Dict[str, Any]]:
+    """All jobs joined with scores, sorted best-first. Used by the dashboard."""
+    conn = sqlite3.connect(get_db_path(profile))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                j.id, j.title, j.company, j.location, j.url, j.raw_text,
+                j.source, j.score_attempts, j.score_error, j.status,
+                j.created_at, j.scrape_qualified, j.scrape_filter_reason,
+                s.fit_score, s.ats_score, s.reasons, s.flags, s.skill_misses,
+                s.one_liner, s.role_fit, s.stack_match, s.seniority,
+                s.location AS score_location, s.growth, s.compensation,
+                s.scored_at, s.disqualified, s.disqualify_reason
+            FROM jobs j
+            LEFT JOIN scores s ON j.id = s.job_id
+            ORDER BY COALESCE(s.fit_score, -1) DESC, j.created_at DESC
+            """
+        ).fetchall()
+        return [_normalize_job_with_score_record(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def search_jobs_by_raw_text(query: str, profile: Optional[str] = None) -> set:
+    """Return job IDs where raw_text contains query (case-insensitive)."""
+    conn = sqlite3.connect(get_db_path(profile))
+    like_query = f"%{query.lower()}%"
+    try:
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE LOWER(COALESCE(raw_text, '')) LIKE ?",
+            (like_query,),
+        ).fetchall()
+        return {row[0] for row in rows}
+    finally:
+        conn.close()
+
+
+def clear_profile_jobs(profile: Optional[str] = None) -> None:
+    """Delete all jobs, scores, and scrape_runs for the given profile."""
+    conn = sqlite3.connect(get_db_path(profile))
+    try:
+        conn.execute("DELETE FROM scores")
+        conn.execute("DELETE FROM jobs")
+        conn.execute("DELETE FROM scrape_runs")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def count_jobs(profile: Optional[str] = None) -> dict:
     """Quick stats — useful for end-of-run summary."""
     init_db(profile=profile)
