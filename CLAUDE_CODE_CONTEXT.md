@@ -43,6 +43,13 @@ isolated profiles, deployed to GCP.
 
 ## Step 22 — Role-agnostic profile intent and evidence-based matching
 
+Current status addendum:
+- Step 21 is complete: cross-encoder reranking with profile-aware semantic matching.
+- Step 22 is complete: role-agnostic profile intent and deterministic match evidence.
+- Step 26 is complete: selective LLM routing with CLI/dashboard controls, synthetic scores for skipped jobs, and `routing_decisions` audit logging.
+- Next stage: Step 27 resume intelligence, then Steps 28/30 application tracking and packet storage.
+- Before relying on aggressive routing thresholds, run the Step 26 top-5 sanity check from `STEP_26.md`.
+
 ### profile_intent.py
 
 New module that converts a config dict into a `ProfileIntent` dataclass. This removes the assumption that users are always searching for software engineering roles.
@@ -274,6 +281,45 @@ This keeps tracking portfolio-friendly and fully local by default.
 
 The goal is to compare retrieval, reranking, scoring, and evaluation quality across role families over time without turning the project into a full ML platform or requiring a remote server.
 
+## Step 26 - Selective LLM routing
+
+Selective routing is implemented in `selective_routing.py` and wired through `scorer.py`, `pipeline.py`, `main.py`, and the dashboard Settings panel.
+
+Core behavior:
+- Builds the same profile-aware match query used by reranking.
+- Computes a cross-encoder routing score for each unscored job.
+- Calls the LLM only when `routing_score >= routing.threshold`.
+- Creates a conservative synthetic `ScoreResult` when the LLM is skipped.
+- Persists every decision to `routing_decisions` through `db.log_routing_decision()`.
+
+Config:
+
+```yaml
+routing:
+  enabled: false
+  threshold: 0.65
+  quality_mode: fast
+  log_routing_decisions: true
+```
+
+CLI overrides:
+- `python main.py --profile default --selective-routing`
+- `python main.py --profile default --no-selective-routing`
+
+Dashboard:
+- Settings -> Cost optimization controls routing enablement, threshold, quality mode, and decision logging.
+- Routing stats are read through `db.get_routing_stats()`.
+
+Important implementation notes:
+- `pipeline.run_scoring()` deep-copies config before applying CLI routing overrides so caller config is not mutated.
+- Synthetic scores intentionally stay conservative; `stack_match` and `role_fit` use the 0-10 dimension scale.
+- Dashboard job summary/detail reads should use DB helpers (`get_all_jobs_with_scores`, `get_job_with_score`, `search_jobs_by_raw_text`, `clear_profile_jobs`) rather than direct SQLite queries in UI code.
+- `vector_store._vector_store_config()` caches profile config but invalidates when `config.yaml` path, size, or mtime changes.
+
+Sanity check before daily reliance:
+- Follow `STEP_26.md` to compare top-5 results from a full LLM run vs. a routed run.
+- Start at threshold `0.65`; lower by `0.05` if excellent jobs fall out of top results.
+
 ## Actual file structure
 
 ```
@@ -320,6 +366,12 @@ job-agent/
 └── logs/
     └── {slug}/agent.log
 ```
+
+File structure addendum:
+- `selective_routing.py` - Step 26 reranker-gated LLM routing and synthetic skipped-job scores.
+- `STEP_26.md` - operator guide and top-5 sanity-check protocol.
+- `test_selective_routing.py` - routing thresholds, synthetic scores, and quality-mode model selection.
+- `test_pipeline.py` - includes routing override coverage for `pipeline.run_scoring()`.
 
 ---
 
@@ -808,12 +860,11 @@ Dashboard usage:
   - profile-aware matching when the query is left blank
 - Falls back cleanly to vector-only results when reranking is disabled
 
-Future LLM-reduction path:
-- Intended next architecture:
-  - vector recall
-  - cross-encoder precision
-  - selective LLM scoring only for top reranked job IDs
-- `select_jobs_for_llm_scoring()` is the bridge for that next step
+Implemented LLM-reduction path:
+- Step 26 uses vector/reranker-style profile matching as a gate before expensive LLM scoring.
+- `selective_routing.py` owns routing scores, threshold checks, synthetic score creation, and quality-mode model selection.
+- `scorer.score_all_jobs()` logs every routed job to `routing_decisions` and saves both LLM and synthetic scores through the normal score table path.
+- `select_jobs_for_llm_scoring()` remains useful for semantic candidate selection, but the production per-job LLM gate is now `SelectiveRouter`.
 
 ### Retrieval Architecture
 
