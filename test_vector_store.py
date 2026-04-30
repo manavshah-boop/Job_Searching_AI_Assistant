@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 
 import config as config_module
 import db
+import vector_store
 from db import Job, init_db, insert_job, replace_job_embeddings, save_score
 from vector_store import (
     clear_vector_index,
@@ -176,6 +178,26 @@ def test_profile_scoped_collection_creation(monkeypatch):
     assert beta.name == "job_chunks"
     assert (root / "profiles" / "alpha" / "chroma").exists()
     assert (root / "profiles" / "beta" / "chroma").exists()
+
+
+def test_vector_store_config_cache_refreshes_when_profile_config_changes(monkeypatch):
+    root = Path(".tmp_streamlit_test") / "vector_store_config_cache"
+    if root.exists():
+        shutil.rmtree(root)
+    _configure_temp_workspace(monkeypatch, root)
+    _write_profile_config(root, "refresh", vector_enabled=True)
+
+    first = vector_store._vector_store_config("refresh")
+    assert first["embeddings"]["vector_store"]["enabled"] is True
+
+    _write_profile_config(root, "refresh", vector_enabled=False)
+    config_path = root / "profiles" / "refresh" / "config.yaml"
+    updated_time = config_path.stat().st_mtime + 5
+    os.utime(config_path, (updated_time, updated_time))
+
+    second = vector_store._vector_store_config("refresh")
+    assert second is not first
+    assert second["embeddings"]["vector_store"]["enabled"] is False
 
 
 def test_upsert_query_and_rebuild_round_trip(monkeypatch):

@@ -7,6 +7,7 @@ It coordinates specialized modules but does not own their implementation.
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -230,7 +231,7 @@ def run_scoring(
 ) -> ScoreStats:
     # Apply selective_routing override before scoring (None = keep config value)
     if selective_routing is not None:
-        config = dict(config)  # shallow copy so we don't mutate the caller's dict
+        config = copy.deepcopy(config)
         config.setdefault("routing", {})["enabled"] = selective_routing
     results = score_all_jobs(config, yes=yes, profile=profile, on_job_scored=on_job_scored)
     scored = [result for result in results if result.get("fit_score", 0) > 0]

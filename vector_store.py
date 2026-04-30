@@ -14,9 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+import config as config_module
 from loguru import logger
 
-from config import load_config
 from db import get_db_path, get_embedding_index_rows
 from embedder import DEFAULT_EMBEDDING_MODEL, embed_texts, embedding_model_name
 
@@ -140,9 +140,24 @@ def _distance_to_similarity(distance: float) -> float:
     return max(0.0, min(1.0, 1.0 - float(distance)))
 
 
+_config_cache: dict[str, tuple[tuple[str, int | None, int | None], dict[str, Any]]] = {}
+
+
 def _vector_store_config(profile: str) -> dict[str, Any]:
-    config = load_config(profile=profile)
+    config_path = config_module._BASE_DIR / "profiles" / profile / "config.yaml"
+    try:
+        stat = config_path.stat()
+        signature = (str(config_path.resolve(strict=False)), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        signature = (str(config_path.resolve(strict=False)), None, None)
+
+    cached = _config_cache.get(profile)
+    if cached and cached[0] == signature:
+        return cached[1]
+
+    config = config_module.load_config(profile=profile)
     config["_active_profile"] = profile
+    _config_cache[profile] = (signature, config)
     return config
 
 

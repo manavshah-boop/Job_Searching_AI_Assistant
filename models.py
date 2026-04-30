@@ -45,13 +45,15 @@ class ScoreResult(BaseModel):
     @field_validator("reasons", mode="before")
     @classmethod
     def limit_reasons(cls, v):
-        """Limit reasons to exactly 2-4 items. If fewer, keep as-is. If more than 4, keep first 4."""
+        """Enforce 2–4 reasons. Fewer than 2 is padded; more than 4 is truncated."""
         if not isinstance(v, list):
             return []
-        # Ensure all items are strings
-        v = [str(item) if item else "" for item in v]
-        # Keep max 4 items
-        return v[:4]
+        v = [str(item).strip() for item in v if item]
+        v = [item for item in v if item]
+        v = v[:4]
+        while len(v) < 2:
+            v.append("No additional details provided.")
+        return v
 
     @model_validator(mode="after")
     def zero_scores_when_disqualified(self):

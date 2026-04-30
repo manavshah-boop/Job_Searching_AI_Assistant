@@ -20,7 +20,6 @@ import copy
 import html
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import time
@@ -36,15 +35,18 @@ from loguru import logger
 
 from config import _resolve_resume_path, apply_config_defaults, load_config
 from db import (
+    clear_profile_jobs,
     count_jobs,
     finish_run,
     get_db_path,
+    get_all_jobs_with_scores,
     get_job_with_score,
     get_recent_runs,
     get_routing_stats,
     init_db,
     load_discovered_slugs,
     rescore_reset,
+    search_jobs_by_raw_text,
     set_active_profile,
     start_run,
     update_job_status,
@@ -864,7 +866,7 @@ def _source_label(source: str) -> str:
     return SOURCE_LABELS.get(source, source.replace("_", " ").title())
 
 
-def _score_state(record: sqlite3.Row) -> str:
+def _score_state(record: dict[str, Any]) -> str:
     if record["fit_score"] is not None:
         return "Scored"
     if (record["score_attempts"] or 0) >= 3:
@@ -874,84 +876,17 @@ def _score_state(record: sqlite3.Row) -> str:
     return "Pending"
 
 
-def _deserialize_job_record(row: sqlite3.Row) -> dict[str, Any]:
-    record = dict(row)
-    record["score_state"] = _score_state(row)
+def _deserialize_job_record(record: dict[str, Any]) -> dict[str, Any]:
+    # record is already normalized by db.get_all_jobs_with_scores; add UI-only fields
+    record["score_state"] = _score_state(record)
     record["source_label"] = _source_label(record["source"])
     record["status_label"] = str(record["status"]).title()
-    record["reasons"] = json.loads(record.get("reasons") or "[]")
-    record["flags"] = json.loads(record.get("flags") or "[]")
-    record["skill_misses"] = json.loads(record.get("skill_misses") or "[]")
-    record["one_liner"] = record.get("one_liner") or ""
-    record["raw_text"] = record.get("raw_text") or ""
-    record["dimension_scores"] = {
-        "role_fit": record.get("role_fit"),
-        "stack_match": record.get("stack_match"),
-        "seniority": record.get("seniority"),
-        "location": record.get("score_location"),
-        "growth": record.get("growth"),
-        "compensation": record.get("compensation"),
-    }
-    # Canonical disqualified signal from DB column; fall back to flags for
-    # jobs scored before the disqualified column existed.
-    disq_from_db = bool(record.get("disqualified", 0))
-    disq_reason = record.get("disqualify_reason", "") or ""
-    if not disq_from_db and not disq_reason:
-        for flag in record["flags"]:
-            if str(flag).startswith("disqualified:"):
-                disq_from_db = True
-                disq_reason = str(flag).replace("disqualified:", "", 1).strip()
-                break
-    record["disqualified"] = disq_from_db
-    record["disqualify_reason"] = disq_reason
-    record["scrape_qualified"] = int(record.get("scrape_qualified") or 1)
-    record["scrape_filter_reason"] = record.get("scrape_filter_reason") or ""
     return record
 
 
 def _fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
     init_db(profile=slug)
-    conn = sqlite3.connect(get_db_path(slug))
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-                j.id,
-                j.title,
-                j.company,
-                j.location,
-                j.url,
-                j.source,
-                j.score_attempts,
-                j.score_error,
-                j.status,
-                j.created_at,
-                j.scrape_qualified,
-                j.scrape_filter_reason,
-                s.fit_score,
-                s.ats_score,
-                s.reasons,
-                s.flags,
-                s.skill_misses,
-                s.one_liner,
-                s.role_fit,
-                s.stack_match,
-                s.seniority,
-                s.location AS score_location,
-                s.growth,
-                s.compensation,
-                s.scored_at,
-                s.disqualified,
-                s.disqualify_reason
-            FROM jobs j
-            LEFT JOIN scores s ON j.id = s.job_id
-            ORDER BY COALESCE(s.fit_score, -1) DESC, j.created_at DESC
-            """
-        ).fetchall()
-        return [_deserialize_job_record(row) for row in rows]
-    finally:
-        conn.close()
+    return [_deserialize_job_record(r) for r in get_all_jobs_with_scores(slug)]
 
 
 def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
@@ -959,21 +894,7 @@ def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
 
 
 def _search_job_ids_by_raw_text(slug: str, query: str) -> set[str]:
-    init_db(profile=slug)
-    conn = sqlite3.connect(get_db_path(slug))
-    like_query = f"%{query.lower()}%"
-    try:
-        rows = conn.execute(
-            """
-            SELECT id
-            FROM jobs
-            WHERE LOWER(COALESCE(raw_text, '')) LIKE ?
-            """,
-            (like_query,),
-        ).fetchall()
-        return {row[0] for row in rows}
-    finally:
-        conn.close()
+    return search_jobs_by_raw_text(query, profile=slug)
 
 
 def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1077,12 +998,7 @@ def _render_pipeline_snapshot(
 
 def _clear_profile_jobs(slug: str) -> None:
     init_db(profile=slug)
-    conn = sqlite3.connect(get_db_path(slug))
-    conn.execute("DELETE FROM scores")
-    conn.execute("DELETE FROM jobs")
-    conn.execute("DELETE FROM scrape_runs")
-    conn.commit()
-    conn.close()
+    clear_profile_jobs(slug)
 
 
 def _hero(profile_name: str, config: dict[str, Any], metrics: dict[str, Any], raw_config: dict[str, Any]) -> None:
