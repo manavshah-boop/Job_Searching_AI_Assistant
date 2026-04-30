@@ -25,7 +25,7 @@ from loguru import logger
 
 from db import Job
 
-# ── Cross-encoder model cache (shared with reranker if both run in-process) ───
+# ── Cross-encoder model cache (module-level; separate from reranker._MODEL_CACHE) ─
 
 _MODEL_CACHE: dict[str, Any] = {}
 
@@ -308,7 +308,7 @@ class SelectiveRouter:
 
         # stack_match: lifted if requirements section matched (skills overlap detected)
         stack_scale = scale * (1.08 if has_requirements else 0.90)
-        stack_match = max(0, min(10, round(stack_scale * 9)))
+        stack_match = max(0, min(10, round(stack_scale * 10)))
 
         # seniority: lifted from neutral (5) if responsibilities matched (role context found)
         seniority = 6 if has_responsibilities else 5
