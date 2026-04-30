@@ -1,7 +1,7 @@
 # Job Agent – Realigned Roadmap (v3.0)
 
-**Last updated:** April 28, 2026  
-**Current state:** Phases 1–3 complete (steps 1–24)  
+**Last updated:** April 30, 2026
+**Current state:** Phases 1-4 complete (steps 1-26); Phase 5 is next
 **Goal:** A personal AI job search assistant that finds, ranks, and applies to relevant jobs with human judgment gates.
 
 ---
@@ -31,6 +31,13 @@
 - ✅ Factor-wise explanations (match_explainer.py)
 - ✅ MLflow optional observability (safe fail-safe integration)
 
+### Phase 4: Selective LLM Routing (Step 26)
+- ✅ Dynamic routing gate: reranker score above threshold calls the LLM; below threshold gets a conservative synthetic score
+- ✅ CLI flags: `--selective-routing` and `--no-selective-routing`
+- ✅ Dashboard Settings controls for routing threshold, quality mode, and decision logging
+- ✅ Routing decision persistence and cost-saving summary support
+- ✅ Safe config handling and vector-store config cache invalidation cleanup
+
 ---
 
 ## What's Ready Today
@@ -42,6 +49,7 @@
 - Profile-aware scoring with role-family section weights
 - Clear match explanations (why is this job ranked #3?)
 - MLflow optional experiment tracking for portfolio
+- Selective LLM routing for cheaper daily runs with transparent routing decisions
 
 **What's Missing:** Application efficiency.
 
@@ -80,8 +88,8 @@
 - Documented sanity check results (top-5 comparison, any misses noted)
 - Vector rank still displayed for transparency, but routing uses reranker
 
-**Status:** Not started.  
-**Why next:** Unblocks daily runs without API fear. Sanity check (1 hour) gives you confidence you didn't lose quality.
+**Status:** Implemented and merged.
+**Follow-up:** Run the one-hour top-5 sanity check on a real daily run before relying on aggressive thresholds. Start with threshold `0.65`; lower it if any excellent roles fall out of the top results.
 
 ---
 
@@ -254,11 +262,11 @@ CREATE TABLE application_packets (
 ## Implementation Order & Dependencies
 
 ```
-Phase 4 (Step 26)
- ├─ Selective LLM Routing (2–3 days)
- └─ Unblocks: Daily runs without API fear
+Phase 4 (Step 26) - complete
+ ├─ Selective LLM Routing
+ └─ Unblocked: Daily runs without API fear
 
-Phase 5 (Steps 27, 28, 30)
+Phase 5 (Steps 27, 28, 30) - next
  ├─ Step 27: Resume Intelligence (1 day) — improves profile data quality
  ├─ Step 28: Shortlist CRM (2 days) — tracks where you've applied
  ├─ Step 30: Application Packets (2 days) — stores form responses
@@ -312,7 +320,7 @@ Total effort: ~24–27 days (realistically 4–5 weeks with testing + debugging)
 
 ## Timeline
 
-- **Week 1:** Step 26 (selective routing) + Step 27 (resume intelligence)
+- **Week 1:** Step 26 complete; begin Step 27 (resume intelligence)
 - **Week 2:** Steps 28 + 30 (CRM + packet storage)
 - **Week 3–4:** Steps 32–35 (form automation pipeline)
 - **Week 5:** Integration testing + edge case handling
@@ -429,8 +437,8 @@ Once **Phase 5 (Steps 27, 28, 30)** is stable:
 
 ## Open Questions
 
-1. **Should selective routing use semantic score or reranker score as the cutoff?**  
-   → Reranker is profile-aware, so prefer that. Threshold ~0.65.
+1. **Resolved: selective routing uses reranker score as the cutoff.**
+   → Reranker is profile-aware. Start at threshold ~0.65 and tune after the top-5 sanity check.
 
 2. **For custom response suggestions (Step 34), should we use Claude or cheap model?**  
    → Cheap model (Groq fast) for speed; user edits anyway.
@@ -461,11 +469,10 @@ And your sister can do the same for finance internships.
 
 ## Next Action
 
-1. **Confirm this roadmap aligns with your goals.** (This doc)
-2. **Code Step 26 (selective routing).** (~3 days)
-3. **Validate: run daily for a week, track cost savings.**
-4. **Code Steps 27, 28, 30 in parallel.** (~5 days)
-5. **Code Steps 32–35 with careful testing.** (~8 days)
+1. **Run the Step 26 top-5 sanity check on a real daily run.** (~1 hour)
+2. **Start Step 27: Resume Intelligence Upgrade.** (~1 day)
+3. **Build Step 28 + Step 30 in parallel: Shortlist CRM and application packets.** (~5 days)
+4. **Code Steps 32–35 with careful testing.** (~8 days)
 
 **Estimated total: 3–4 weeks to full application automation.**
 
