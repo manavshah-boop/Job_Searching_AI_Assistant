@@ -5,7 +5,7 @@
 A personal AI job search agent. Scrapes Greenhouse, Lever, Ashby, Workable,
 Himalayas, and HN Who's Hiring, scores every job against a user profile using
 an LLM, and surfaces the best matches. Two users (Manav + sister), fully
-isolated profiles, deployed to GCP.
+isolated profiles, with deployment scripts for an Ubuntu/systemd VM setup.
 
 ## Core philosophy
 
@@ -13,13 +13,6 @@ isolated profiles, deployed to GCP.
 - Incremental — each step is independently runnable
 - Simple infra — SQLite, profile-isolated DBs
 - No overengineering — if it works for two people, it's done
-
-| 21 | ✅ | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
-| 22 | ✅ | Role-agnostic profile intent + evidence matching: `profile_intent.py`, `ProfileIntent`, canonical section taxonomy, role-family section weights, `MatchEvidence` with positive/negative signals |
-| 23B | ✅ | Factor-wise match explanations: `match_explainer.py`, deterministic strengths/concerns/unknowns, recommended actions in dashboard + CLI semantic views |
-| 25 | ✅ | Lightweight optional MLflow tracking: `tracking.py`, local `./mlruns`, pipeline/eval/semantic observability |
-
----
 
 ## Current status
 
@@ -36,19 +29,20 @@ isolated profiles, deployed to GCP.
 | 13 | ✅ | Scrape-filter rejection persistence: scrape_qualified/scrape_filter_reason columns, auditable dashboard toggle |
 | 17+20 | ✅ | Semantic job embeddings: `embedder.py`, `job_embeddings` table, embedding pipeline stage, `--embed-only` |
 | 18 | ✅ | ChromaDB vector retrieval: `vector_store.py`, persistent profile-scoped ANN index, `--vector-search`, `--rebuild-vector-index`, `--clear-vector-index` |
+| 21 | ✅ | Cross-encoder reranking: `reranker.py`, profile-aware semantic matching, `--semantic-match`, `--semantic-search`, dashboard rerank toggle |
+| 22 | ✅ | Role-agnostic profile intent + evidence matching: `profile_intent.py`, `ProfileIntent`, canonical section taxonomy, role-family section weights, `MatchEvidence` |
 | 23B | ✅ | Factor-wise explanation layer over score dimensions and semantic/reranker evidence |
+| 24 | ✅ | Local evaluation framework: `evaluation.py`, eval labels, deterministic ranking metrics, CLI/dashboard eval flows |
 | 25 | ✅ | Optional MLflow experiment tracking for pipeline, evaluation, and semantic comparison runs |
+| 26 | ✅ | Selective LLM routing: reranker gate, synthetic scores for skipped jobs, CLI/dashboard controls, `routing_decisions` audit trail |
+
+---
+
+Next stage: Step 27 resume intelligence, then Steps 28/30 application tracking and packet storage. Before relying on aggressive routing thresholds, run the Step 26 top-5 sanity check from `STEP_26.md`.
 
 ---
 
 ## Step 22 — Role-agnostic profile intent and evidence-based matching
-
-Current status addendum:
-- Step 21 is complete: cross-encoder reranking with profile-aware semantic matching.
-- Step 22 is complete: role-agnostic profile intent and deterministic match evidence.
-- Step 26 is complete: selective LLM routing with CLI/dashboard controls, synthetic scores for skipped jobs, and `routing_decisions` audit logging.
-- Next stage: Step 27 resume intelligence, then Steps 28/30 application tracking and packet storage.
-- Before relying on aggressive routing thresholds, run the Step 26 top-5 sanity check from `STEP_26.md`.
 
 ### profile_intent.py
 
@@ -199,6 +193,7 @@ New optional observability module. This is the only file that imports or calls M
 
 Public API:
 - `mlflow_enabled(config) -> bool`
+- `get_tracking_uri(config) -> str`
 - `get_experiment_name(config, profile) -> str`
 - `start_run(config, profile, run_name, tags=None)`
 - `log_params(params)`
@@ -320,20 +315,23 @@ Sanity check before daily reliance:
 - Follow `STEP_26.md` to compare top-5 results from a full LLM run vs. a routed run.
 - Start at threshold `0.65`; lower by `0.05` if excellent jobs fall out of top results.
 
-## Actual file structure
+## Key file structure
 
 ```
 job-agent/
-├── config.yaml              # root config — CLI fallback when no --profile
+├── config.yaml              # optional root config — CLI fallback when no --profile (not tracked by default)
 ├── db.py                    # SQLite, profile-aware, all DB logic
 ├── config.py                # load_config() with PyPDF2 resume extraction
 ├── scraper.py               # Greenhouse + Lever + HN + Ashby + Workable + Himalayas scrapers
 ├── scorer.py                # LLM pipeline, RateLimiter, instructor integration
+├── pipeline.py              # Shared scrape -> score -> embed orchestration
 ├── embedder.py              # Semantic chunking + sentence-transformers batch embeddings
 ├── vector_store.py          # ChromaDB wrapper: profile-scoped indexing + semantic retrieval
 ├── reranker.py              # Cross-encoder reranking over vector-retrieved job chunks
+├── selective_routing.py     # Reranker-gated LLM routing + synthetic skipped-job scores
 ├── profile_intent.py        # ProfileIntent normalization, canonical section taxonomy, role-family weights
 ├── match_explainer.py       # Deterministic factor-wise strengths, concerns, summaries, and action labels
+├── evaluation.py            # Local eval labels, ranking metrics, template export, last-result persistence
 ├── tracking.py              # Optional MLflow helpers with lazy import and fail-safe no-ops
 ├── candidate_profile.py     # build_structured_profile(), confirm_profile()
 ├── llm_utils.py             # Shared LLM resilience (see below — read this first)
@@ -341,37 +339,38 @@ job-agent/
 ├── theirstack.py            # slug resolution utilities for GH, Lever, Ashby, Workable; get_or_discover_slugs()
 ├── models.py                # Pydantic: ScoreResult, StructuredProfile, ScoringWeights
 ├── progress_tracker.py      # ProgressTracker + dataclasses with to_dict/from_dict
-├── main.py                  # CLI orchestrator (unchanged CLI interface)
+├── main.py                  # CLI parsing and command routing
 ├── onboarding.py            # Streamlit 5-step profile creation flow
 ├── dashboard.py             # Streamlit web UI — polling-only, no inline pipeline
+├── dashboard_semantic.py    # Semantic match/explanation panel helpers
 ├── dashboard_ui.py          # render_progress_header, render_pipeline_stages, etc.
 ├── logging_config.py        # configure_logging(profile, debug)
 ├── ui_shell.py              # toolbar(), panel(), callout(), badge(), etc.
 ├── ui_theme.py              # PAGE_TITLE, apply_page_scaffold()
-├── test_scorer_recovery.py  # 10 unit tests for llm_utils recovery layer
+├── test_scorer_recovery.py  # llm_utils recovery layer tests
+├── test_pipeline.py         # Shared orchestration and routing override coverage
 ├── test_embedder.py         # Chunking, embedding batch shape, DB round-trip, canonical alias tests
 ├── test_vector_store.py     # Chroma indexing, idempotent upserts, rebuild/query tests
 ├── test_reranker.py         # Profile-aware query building, role-family weights, evidence tests
+├── test_selective_routing.py # Routing thresholds, synthetic scores, quality-mode model selection
 ├── test_profile_intent.py   # Role family inference, ProfileIntent normalization, canonical taxonomy
 ├── test_match_explainer.py  # Deterministic explanation coverage across role families and missing-data cases
+├── test_evaluation.py       # Eval labels, metrics, template export, CLI/dashboard integration
+├── test_tracking.py         # MLflow no-op/fail-safe behavior and logging payload coverage
+├── STEP_26.md               # Selective routing operator guide and sanity-check protocol
 ├── worker/
-│   └── run_pipeline.py      # Out-of-process pipeline runner (the ONLY way to run a pipeline)
+│   ├── run_pipeline.py      # Out-of-process dashboard/cron pipeline runner
+│   └── db_guard.py          # Worker-side DB safety checks
 ├── profiles/
 │   └── {slug}/
 │       ├── config.yaml
-│       ├── {slug}.db
+│       ├── jobs.db
 │       ├── .worker_running      # lockfile: PID + started_at JSON, deleted on finish
 │       ├── .run_progress.json   # live tracker state, written atomically during run
 │       └── .last_run            # final status JSON written on finish
 └── logs/
     └── {slug}/agent.log
 ```
-
-File structure addendum:
-- `selective_routing.py` - Step 26 reranker-gated LLM routing and synthetic skipped-job scores.
-- `STEP_26.md` - operator guide and top-5 sanity-check protocol.
-- `test_selective_routing.py` - routing thresholds, synthetic scores, and quality-mode model selection.
-- `test_pipeline.py` - includes routing override coverage for `pipeline.run_scoring()`.
 
 ---
 
@@ -504,8 +503,8 @@ and `fit_score=0` from `score_job()`. They are stored in the DB (score row
 written) but must not pollute the review queue.
 
 **Canonical signal:** `scores.disqualified INTEGER DEFAULT 0`, `scores.disqualify_reason TEXT DEFAULT ''`.
-Backwards compat: `_deserialize_job_record()` also checks `flags` for items
-starting with `"disqualified:"` so pre-migration rows are caught too.
+Backwards compat: `db._normalize_job_with_score_record()` also checks `flags`
+for items starting with `"disqualified:"` so pre-migration rows are caught too.
 
 ### 2. Scrape-rejected jobs
 
@@ -574,6 +573,10 @@ error states — only `disqualified=1` and `scrape_qualified=0` hide jobs.
 - `save_score()` now accepts `disqualified=int` and `disqualify_reason=str`
 - `safe_structured_call` from llm_utils is used for structured output; raw
   `llm_call` + `parse_llm_response` is the fallback
+- When `routing.enabled` is true, `score_all_jobs()` constructs a
+  `SelectiveRouter` before creating the LLM client, applies the quality-mode
+  model override, logs every routing decision, and saves either normal LLM
+  scores or conservative synthetic scores through the same `scores` table path
 - `config["_active_profile"]` must be set before any LLM call so DB writes
   scope to the correct profile
 
@@ -604,9 +607,10 @@ Three Pydantic v2 models:
 **ScoreResult** — LLM output for job scoring
 - Fields: `disqualified`, `disqualify_reason`, `role_fit`, `stack_match`,
   `seniority`, `location`, `growth`, `compensation` (all 0-10),
-  `reasons` (list, max 4), `flags` (list), `one_liner`
+  `reasons` (list, normalized to 2-4 items), `flags` (list), `one_liner`
 - Validators: clamps scores to 0-10, zeros all dimensions when disqualified,
-  limits reasons to 4 items, filters empty strings
+  strips/filters empty reasons, truncates to 4, and pads fewer than 2 with a
+  neutral placeholder
 
 **StructuredProfile** — LLM output for profile extraction
 - Fields: `name`, `yoe`, `current_title`, `core_skills`, `languages`,
@@ -631,17 +635,24 @@ Key functions (all accept `profile=None`):
 - `init_db(profile=None)` — creates profile folder if needed, runs migrations
 - `insert_job(job, profile=None) -> bool`
 - `save_score(job_id, ..., disqualified=0, disqualify_reason="", profile=None)`
+- `log_routing_decision(job_id, routing_score, threshold, routed_to, reason="", profile=None)`
+- `get_routing_stats(profile=None) -> dict[str, int]`
 - `get_unscored(profile=None) -> list[Job]` — jobs with score IS NULL, score_attempts < 3, AND scrape_qualified = 1
 - `get_scored_jobs_for_embedding(model_name, profile=None, limit=None, force=False) -> list[Job]` — scrape-qualified jobs with score rows, optionally only the unembedded subset for one model
 - `replace_job_embeddings(job_id, model_name, rows, profile=None)` — atomic delete+bulk-insert for one job/model pair
 - `get_job_embeddings(job_id, profile=None, model_name=None) -> list[dict]`
 - `get_embedding_index_rows(model_name, profile=None, job_ids=None) -> list[dict]` — SQLite-backed embedding rows joined with job and score metadata for Chroma indexing/rebuilds
+- `get_job_with_score(job_id, profile=None) -> dict | None` — normalized joined job/score record
+- `get_all_jobs_with_scores(profile=None) -> list[dict]` — normalized dashboard list records
+- `search_jobs_by_raw_text(query, profile=None) -> set[str]`
+- `clear_profile_jobs(profile=None)` — deletes jobs, scores, and scrape_runs for one profile
 - `get_top_jobs(min_score, profile=None) -> list`
 - `count_jobs(profile=None) -> dict` — `{total, scored, embedded}` (includes disqualified in total)
 - `rescore_reset(profile=None)` — clears scores, resets score_attempts to 0
 - `update_job_status(job_id, status, profile=None)`
 - `save_discovered_slug(slug, company_name, ats, profile=None)` — valid ats: greenhouse, lever, ashby, workable
 - `load_discovered_slugs(ats, profile=None) -> list[str]`
+- `clear_discovered_slugs(ats=None, profile=None)`
 - `increment_score_attempts(job_id, profile=None)`
 - `write_score_error(job_id, error, profile=None)`
 
@@ -678,7 +689,7 @@ CREATE TABLE scores (
     location          INTEGER,
     growth            INTEGER,
     compensation      INTEGER,
-    reasons           TEXT,       -- JSON array, max 4 items
+    reasons           TEXT,       -- JSON array; LLM outputs normalized to 2-4 items
     flags             TEXT,       -- JSON array
     skill_misses      TEXT,       -- JSON array, top 5 missing skills
     one_liner         TEXT,
@@ -686,6 +697,33 @@ CREATE TABLE scores (
     disqualified      INTEGER DEFAULT 0,   -- 1 = hidden from review queue
     disqualify_reason TEXT DEFAULT '',     -- human-readable reason
     scored_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+### Routing decisions table
+
+```sql
+CREATE TABLE routing_decisions (
+    job_id        TEXT PRIMARY KEY,
+    routing_score REAL NOT NULL,
+    threshold     REAL NOT NULL,
+    routed_to     TEXT NOT NULL,   -- llm_called | skipped_llm
+    reason        TEXT DEFAULT '',
+    decided_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+### Discovered slug cache tables
+
+Created lazily per ATS as `discovered_greenhouse_slugs`,
+`discovered_lever_slugs`, `discovered_ashby_slugs`, and
+`discovered_workable_slugs`:
+
+```sql
+CREATE TABLE discovered_{ats}_slugs (
+    slug          TEXT PRIMARY KEY,
+    company_name  TEXT,
+    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 ```
 
@@ -831,7 +869,7 @@ Job-level aggregation formula:
 - Job rerank score:
   - `best_weighted_chunk * 0.55`
   - `top3_weighted_average * 0.30`
-  - `required_section_coverage_bonus * 0.10`
+  - `coverage_bonus` (up to 0.10)
 - Final score:
   - `rerank_score + vector_score * 0.05`
 - Coverage bonus rewards strong `requirements + responsibilities` support, with a smaller summary bonus
@@ -871,7 +909,8 @@ Implemented LLM-reduction path:
 - SQLite: durable job, score, run, and embedding records
 - ChromaDB: ANN retrieval index over chunk embeddings
 - Cross encoder: profile-aware reranking over top vector candidates
-- LLM scorer: expensive final evaluator, not used for every retrieved job
+- LLM scorer: expensive final evaluator; with Step 26 routing enabled, not every
+  unscored job requires an LLM call
 
 ### config.yaml structure
 
@@ -967,6 +1006,20 @@ reranking:
   max_chunk_chars: 900
   include_profile_context: true
   include_query_context: true
+
+routing:
+  enabled: false
+  threshold: 0.65
+  quality_mode: fast
+  log_routing_decisions: true
+
+tracking:
+  mlflow:
+    enabled: false
+    tracking_uri: ./mlruns
+    experiment_name: job-agent
+    log_artifacts: true
+    log_eval_labels: false
 ```
 
 Internship profiles use this compensation shape instead:
@@ -1028,7 +1081,7 @@ Resolution order: `{KEY}_{PROFILE_UPPER}` → `{KEY}` (fallback).
 - `_collect_metrics()` expects pre-filtered records (no disqualified) — the split
   happens in `_render_profile_dashboard()` before passing records downstream
 - Old disqualified rows (pre-migration) are caught by the flags fallback in
-  `_deserialize_job_record()` — no data migration needed
+  `db._normalize_job_with_score_record()` — no data migration needed
 # Step 23A addendum
 
 ## Architecture cleanup snapshot
@@ -1072,6 +1125,7 @@ CLI or worker
 - `embedder.py` â€” chunking + embedding only
 - `vector_store.py` â€” vector indexing + retrieval only
 - `reranker.py` â€” reranking + evidence only
+- `selective_routing.py` — selective LLM routing, synthetic skipped-job scores, quality-mode model selection only
 - `dashboard.py` â€” dashboard shell, navigation, profile views
 - `dashboard_semantic.py` â€” semantic match panel UI only
 - `main.py` â€” CLI parsing and command routing only
@@ -1083,7 +1137,7 @@ CLI or worker
 
 Public API:
 - `run_scrapers(config, profile) -> ScrapeStats`
-- `run_scoring(config, profile, yes=False, on_job_scored=None) -> ScoreStats`
+- `run_scoring(config, profile, yes=False, selective_routing=None, on_job_scored=None) -> ScoreStats`
 - `run_embedding(config, profile, force=False, on_job_embedded=None) -> EmbedStats`
 - `run_full_pipeline(config, profile, options, progress_tracker=None) -> PipelineResult`
 
@@ -1093,6 +1147,9 @@ Typed boundary objects:
 - `EmbedStats`
 - `PipelineOptions`
 - `PipelineResult`
+
+`PipelineOptions.selective_routing` is `None` by default (use config), `True`
+to force routing on, or `False` to force routing off for one run.
 
 ### CLI vs worker responsibilities
 
