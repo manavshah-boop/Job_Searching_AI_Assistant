@@ -371,6 +371,7 @@ def score_dimensions(
     llm_call: LlmCall,
     structured_profile: Optional[Dict] = None,
     instructor_client: Optional[Any] = None,
+    max_tokens: int = 700,
 ) -> dict:
     """
     Single LLM call that handles both disqualifier detection and dimension
@@ -577,7 +578,7 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
         logger.info(f"scorer | structured output via {provider}/{model_name}")
         dims = safe_structured_call(
             instructor_client, model_name, prompt, ScoreResult,
-            max_tokens=700,
+            max_tokens=max_tokens,
             temperature=config["llm"].get("temperature", 0),
             label="scorer",
         )
@@ -587,7 +588,7 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
     # Fallback: raw LLM call + JSON parsing (also handles {"value": x} wrapping)
     if dims is None:
         try:
-            raw, tokens_used = _llm_call_with_retry(llm_call, prompt, 700)
+            raw, tokens_used = _llm_call_with_retry(llm_call, prompt, max_tokens)
             dims = parse_llm_response(raw)
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse failed: {e}")
@@ -648,13 +649,46 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
 
 # ── 3. ATS score ──────────────────────────────────────────────────────────────
 
-def compute_ats_score(job: Job, config: Dict[str, Any]) -> dict:
+def compute_ats_score(
+    job: Job,
+    config: Dict[str, Any],
+    structured_profile: Optional[Dict] = None,
+) -> dict:
     """
-    Pure Python. Simulates keyword-based ATS matching.
-    Measures overlap between job description words and resume text.
+    ATS keyword matching.
+
+    When structured_profile is available (LLM-extracted skills), counts how many
+    of the candidate's concrete skills appear in the job description. This produces
+    realistic 20–60% scores for genuine matches instead of single-digit values.
+
+    Falls back to word-level resume matching when no structured profile is given.
     """
+    job_lower = (job.raw_text or "").lower()
+    des_skills = [s.lower() for s in config["preferences"].get("desired_skills", [])]
+
+    if structured_profile:
+        all_skills: list[str] = (
+            [s.lower() for s in structured_profile.get("core_skills", [])]
+            + [s.lower() for s in structured_profile.get("languages", [])]
+            + [s.lower() for s in structured_profile.get("frameworks", [])]
+            + [s.lower() for s in structured_profile.get("cloud", [])]
+        )
+        if not all_skills:
+            return {"ats_score": 0, "skill_misses": []}
+
+        found_count = sum(1 for s in all_skills if s in job_lower)
+        all_skills_set = set(all_skills)
+        # Skills the job wants that didn't appear in the structured profile
+        skill_misses = [
+            s for s in des_skills
+            if s in job_lower and s not in all_skills_set
+        ][:5]
+        ats_score = min(100, int(found_count / max(1, len(all_skills)) * 100))
+        return {"ats_score": ats_score, "skill_misses": skill_misses}
+
+    # Fallback: word-level overlap between job description and raw resume text
     resume_text = (config["profile"].get("resume") or "").lower()
-    job_text    = job.raw_text.lower()
+    job_text = job_lower
 
     stopwords = {
         "and", "or", "the", "a", "an", "to", "of", "in",
@@ -667,7 +701,6 @@ def compute_ats_score(job: Job, config: Dict[str, Any]) -> dict:
     jd_words -= stopwords
 
     matched       = {w for w in jd_words if w in resume_text}
-    des_skills    = [s.lower() for s in config["preferences"].get("desired_skills", [])]
     skill_matches = [s for s in des_skills if s in job_text and s in resume_text]
     skill_misses  = [s for s in des_skills if s in job_text and s not in resume_text]
 
@@ -686,6 +719,7 @@ def score_job(
     llm_call: LlmCall,
     structured_profile: Optional[Dict] = None,
     instructor_client: Optional[Any] = None,
+    max_tokens: int = 700,
 ) -> dict:
     """
     Runs the full pipeline for one job. Returns a result dict.
@@ -714,7 +748,9 @@ def score_job(
         return base
 
     # Stage 2: merged disqualifier + dimension scoring (single LLM call)
-    result = score_dimensions(job, config, llm_call, structured_profile, instructor_client)
+    result = score_dimensions(
+        job, config, llm_call, structured_profile, instructor_client, max_tokens=max_tokens
+    )
     base["fit_score"]        = result["fit_score"]
     base["tokens_used"]      = result["tokens_used"]
     base["reasons"]          = result["reasons"]
@@ -722,8 +758,8 @@ def score_job(
     base["one_liner"]        = result["one_liner"]
     base["dimension_scores"] = result["dimension_scores"]
 
-    # Stage 3: ATS score — pure Python, always runs
-    ats = compute_ats_score(job, config)
+    # Stage 3: ATS score — structured_profile skills give realistic 20-60% scores
+    ats = compute_ats_score(job, config, structured_profile)
     base["ats_score"]    = ats["ats_score"]
     base["skill_misses"] = ats["skill_misses"]
 
@@ -750,6 +786,11 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
     # ── Selective routing setup (must run before get_llm_client to apply model override) ──
     router = None
     _match_query = None
+    _fast_config: Dict[str, Any] = config
+    _quality_config: Dict[str, Any] = config
+    _fast_llm_call: Optional[LlmCall] = None
+    _quality_llm_call: Optional[LlmCall] = None
+
     if config.get("routing", {}).get("enabled", False):
         from selective_routing import SelectiveRouter
         router = SelectiveRouter(config, profile)
@@ -759,13 +800,30 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
             "Selective routing enabled | threshold={:.2f} | quality_mode={} | model={}",
             router.threshold, router.quality_mode, router.get_effective_llm_model(),
         )
+        # Pre-create LLM clients for each tier so we don't reconstruct per job.
+        try:
+            _fast_config    = router.apply_model_override_for_mode(config, "fast")
+            _quality_config = router.apply_model_override_for_mode(config, "quality")
+            _fast_llm_call    = get_llm_client(_fast_config)
+            _quality_llm_call = get_llm_client(_quality_config)
+            logger.info(
+                "Tier clients ready | fast={} | quality={}",
+                router.get_model_for_quality_mode("fast"),
+                router.get_model_for_quality_mode("quality"),
+            )
+        except Exception as exc:
+            logger.warning("Could not pre-create tier LLM clients ({}); using default", exc)
 
     llm_cfg  = config["llm"]
     provider = llm_cfg["provider"]
     model    = llm_cfg["model"][provider]
 
     llm_call = get_llm_client(config)
-    
+    if _fast_llm_call is None:
+        _fast_llm_call = llm_call
+    if _quality_llm_call is None:
+        _quality_llm_call = llm_call
+
     # Try to get instructor client for structured output
     instructor_client = None
     try:
@@ -848,23 +906,45 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         try:
             if router and _match_query:
                 _routing_score = router.compute_routing_score(job, _match_query)
-                if not router.should_call_llm(_routing_score):
-                    result = router.create_synthetic_score(job, _routing_score)
+                _title_boost   = router.compute_title_boost(job)
+                title_matched  = _title_boost > 0
+                _effective     = _routing_score + _title_boost
+
+                if not router.should_call_llm(_effective):
+                    result = router.create_synthetic_score(
+                        job, _routing_score, title_matched=title_matched
+                    )
                     log_routing_decision(
-                        job.id, _routing_score, router.threshold,
+                        job.id, _effective, router.threshold,
                         "skipped_llm", "below_threshold", profile,
                     )
                 else:
+                    tier = router.compute_tier(_effective, job.raw_text or "", title_matched)
+                    # Route to the pre-created client matching this tier's quality mode
+                    if tier["quality_mode"] == "quality":
+                        tier_llm    = _quality_llm_call
+                        tier_config = _quality_config
+                    else:
+                        tier_llm    = _fast_llm_call
+                        tier_config = _fast_config
+
                     router.record_llm_call()
                     if router.log_decisions:
                         logger.info(
-                            "routing | job={} company={} routed=llm_called routing_score={:.3f} reason=meets_threshold",
-                            job.id, job.company, _routing_score,
+                            "routing | job={} company={} tier={} model={} "
+                            "routing_score={:.3f} effective={:.3f} title_match={}",
+                            job.id, job.company, tier["tier"],
+                            router.get_model_for_quality_mode(tier["quality_mode"]),
+                            _routing_score, _effective, title_matched,
                         )
-                    result = score_job(job, config, llm_call, structured_profile, instructor_client)
+                    result = score_job(
+                        job, tier_config, tier_llm,
+                        structured_profile, instructor_client,
+                        max_tokens=tier["max_tokens"],
+                    )
                     log_routing_decision(
-                        job.id, _routing_score, router.threshold,
-                        "llm_called", "meets_threshold", profile,
+                        job.id, _effective, router.threshold,
+                        "llm_called", f"tier:{tier['tier']}", profile,
                     )
             else:
                 result = score_job(job, config, llm_call, structured_profile, instructor_client)

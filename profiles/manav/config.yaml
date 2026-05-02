@@ -174,7 +174,27 @@ tracking:
 routing:
   enabled: true
   threshold: 0.65          # base threshold (kept for reference)
-  llm_threshold: 0.25      # per-profile override — ms-marco scores job-matching queries
-                           # in a compressed range; 0.25 ensures good-fit jobs aren't skipped
+  llm_threshold: 0.18      # per-profile override — lowered so that most plausible jobs
+                           # reach the LLM; title-match boost (+0.15) lifts obvious roles
+                           # above this floor. Tune higher (e.g. 0.25) to save API calls.
   quality_mode: fast
   log_routing_decisions: true
+  # Three-tier routing: high-confidence jobs use a cheap fast model;
+  # uncertain/low-confidence jobs get the quality model for deeper analysis.
+  tiers:
+    high:
+      min_reranker: 0.40
+      require_title_match: true
+      quality_mode: fast
+      max_tokens: 500
+    medium:
+      min_reranker: 0.25
+      quality_mode: fast
+      max_tokens: 700
+    low:
+      min_reranker: 0.0
+      quality_mode: quality
+      max_tokens: 900
+  fallback_chain:
+    - groq/llama-3.1-8b-instant
+    - groq/llama-4-scout-17b

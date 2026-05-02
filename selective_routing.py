@@ -30,20 +30,26 @@ from db import Job
 _MODEL_CACHE: dict[str, Any] = {}
 
 _DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-# ms-marco-MiniLM-L-6-v2 outputs logits in a different scale than semantic similarity
-# models — 0.25 keeps good-fit jobs from being silently skipped. Was 0.65.
-_DEFAULT_THRESHOLD = 0.25
+# ms-marco-MiniLM-L-6-v2 outputs logits in a compressed range (0.2-0.35 for decent
+# matches). 0.18 lets most plausible jobs reach the LLM; title-match boost (+0.15)
+# lifts obvious roles over this floor without touching the stored score. Was 0.65.
+_DEFAULT_THRESHOLD = 0.18
 _DEFAULT_QUALITY_MODE = "fast"
 
 # (provider, quality_mode) → model name
+# Three modes: fast (cheapest), medium (balanced), quality (best — used for uncertain jobs)
 _MODEL_MAP: dict[tuple[str, str], str] = {
-    ("groq", "fast"): "llama-3.1-8b-instant",
+    ("groq", "fast"):    "llama-3.1-8b-instant",
+    ("groq", "medium"):  "llama-3.3-70b-versatile",
     ("groq", "quality"): "meta-llama/llama-4-scout-17b-16e-instruct",
-    ("anthropic", "fast"): "claude-haiku-4-5-20251001",
+    ("anthropic", "fast"):    "claude-haiku-4-5-20251001",
+    ("anthropic", "medium"):  "claude-haiku-4-5-20251001",
     ("anthropic", "quality"): "claude-sonnet-4-20250514",
-    ("openai", "fast"): "gpt-4o-mini",
+    ("openai", "fast"):    "gpt-4o-mini",
+    ("openai", "medium"):  "gpt-4o-mini",
     ("openai", "quality"): "gpt-4o",
-    ("gemini", "fast"): "gemini-2.0-flash",
+    ("gemini", "fast"):    "gemini-2.0-flash",
+    ("gemini", "medium"):  "gemini-2.5-flash",
     ("gemini", "quality"): "gemini-2.5-flash",
 }
 
@@ -70,6 +76,37 @@ _STOPWORDS: frozenset[str] = frozenset({
     "the", "and", "for", "are", "with", "you", "our", "will", "have",
     "this", "that", "from", "not", "but", "your", "they", "was", "all",
 })
+
+# Rare/niche tech terms signal a complex job that warrants a quality-tier model
+# even when the reranker score looks high.
+_RARE_TERMS: frozenset[str] = frozenset({
+    "kubernetes", "terraform", "mlops", "consensus", "cryptography",
+    "zero-knowledge", "homomorphic", "formal verification", "model parallelism",
+    "rlhf", "quantization", "fpga", "asic", "verilog", "cuda", "triton",
+    "flash attention", "byzantine", "sharding",
+})
+
+# Default tier configuration — overridable via routing.tiers in profile config.yaml.
+# High confidence (obvious match) → cheap fast model.
+# Low confidence (uncertain) → quality model for deeper analysis.
+_DEFAULT_TIERS: dict[str, Any] = {
+    "high": {
+        "min_reranker": 0.40,
+        "require_title_match": True,
+        "quality_mode": "fast",
+        "max_tokens": 500,
+    },
+    "medium": {
+        "min_reranker": 0.25,
+        "quality_mode": "fast",
+        "max_tokens": 700,
+    },
+    "low": {
+        "min_reranker": 0.0,
+        "quality_mode": "quality",
+        "max_tokens": 900,
+    },
+}
 
 
 def routing_enabled(config: dict[str, Any]) -> bool:
@@ -207,6 +244,23 @@ class SelectiveRouter:
         )
         return score
 
+    # ── Title boost ───────────────────────────────────────────────────────────
+
+    def compute_title_boost(self, job: Job) -> float:
+        """
+        Return 0.15 when the job title contains any configured target role.
+        Applied to the effective score for the routing/tier decision only —
+        never stored in the final score record.
+        """
+        target_roles = self._config.get("preferences", {}).get("titles", [])
+        if not target_roles or not job.title:
+            return 0.0
+        job_title_lower = job.title.lower().strip()
+        for role in target_roles:
+            if role.lower().strip() in job_title_lower:
+                return 0.15
+        return 0.0
+
     # ── Routing decision ──────────────────────────────────────────────────────
 
     def should_call_llm(self, routing_score: float) -> bool:
@@ -218,6 +272,67 @@ class SelectiveRouter:
 
     def record_skipped(self) -> None:
         self._counts["skipped"] += 1
+
+    # ── Complexity + tier ─────────────────────────────────────────────────────
+
+    def compute_complexity_score(self, job_text: str) -> float:
+        """
+        Returns 0.0–1.0 complexity estimate.
+        Weighted by description length and presence of rare/niche tech terms.
+        Used to downgrade a high-confidence tier when the job is unexpectedly complex.
+        """
+        word_count = len(job_text.split())
+        length_score = min(1.0, word_count / 750)
+        text_lower = job_text.lower()
+        rare_hits = sum(1 for term in _RARE_TERMS if term in text_lower)
+        rare_score = min(1.0, rare_hits / 3)
+        return round(min(1.0, length_score * 0.5 + rare_score * 0.5), 3)
+
+    def compute_tier(
+        self,
+        effective_score: float,
+        job_text: str,
+        title_matched: bool,
+    ) -> dict[str, Any]:
+        """
+        Assign a routing tier from effective_score (reranker + title boost) and complexity.
+
+        Tier priority (highest first):
+          high   — strong score + title match + low complexity → cheapest fast model
+          medium — moderate score → standard fast model
+          low    — low score or complex job → quality model for deeper analysis
+
+        Returns {'tier': str, 'quality_mode': str, 'max_tokens': int}.
+        """
+        tiers = self._config.get("routing", {}).get("tiers", _DEFAULT_TIERS)
+        complexity = self.compute_complexity_score(job_text)
+
+        high = tiers.get("high", _DEFAULT_TIERS["high"])
+        if (
+            effective_score >= high.get("min_reranker", 0.40)
+            and (not high.get("require_title_match", True) or title_matched)
+            and complexity <= 0.7
+        ):
+            return {
+                "tier": "high",
+                "quality_mode": high.get("quality_mode", "fast"),
+                "max_tokens": high.get("max_tokens", 500),
+            }
+
+        medium = tiers.get("medium", _DEFAULT_TIERS["medium"])
+        if effective_score >= medium.get("min_reranker", 0.25):
+            return {
+                "tier": "medium",
+                "quality_mode": medium.get("quality_mode", "fast"),
+                "max_tokens": medium.get("max_tokens", 700),
+            }
+
+        low = tiers.get("low", _DEFAULT_TIERS["low"])
+        return {
+            "tier": "low",
+            "quality_mode": low.get("quality_mode", "quality"),
+            "max_tokens": low.get("max_tokens", 900),
+        }
 
     # ── Section detection ─────────────────────────────────────────────────────
 
@@ -271,12 +386,20 @@ class SelectiveRouter:
 
     # ── Synthetic score ───────────────────────────────────────────────────────
 
+    def _extract_tech_overlaps(self, job_text: str) -> list[str]:
+        """Profile skills that appear in the job text (for synthetic explanations)."""
+        prefs = self._config.get("preferences", {})
+        skills = prefs.get("desired_skills", [])
+        job_lower = job_text.lower()
+        return [s for s in skills if s.lower() in job_lower][:6]
+
     def create_synthetic_score(
         self,
         job: Job,
         routing_score: float,
         matched_sections: Optional[list[str]] = None,
         match_reason: str = "",
+        title_matched: bool = False,
     ) -> dict[str, Any]:
         """
         Create a conservative score result when the LLM is skipped.
@@ -338,21 +461,30 @@ class SelectiveRouter:
         )))
         ats_score = self._quick_ats(job)
 
-        # Build informative reasons from what we know
+        # Build informative reasons with specific evidence
+        tech_found = self._extract_tech_overlaps(job.raw_text or "")
         reasons: list[str] = []
+        if title_matched:
+            reasons.append(f"Title match: {job.title.split(',')[0].strip()}")
+        if tech_found:
+            reasons.append(f"Skills overlap: {', '.join(tech_found[:4])}")
         if has_requirements:
-            reasons.append("Requirements section signals skill overlap")
-        if has_responsibilities:
+            reasons.append("Requirements section signals skill alignment")
+        if has_responsibilities and len(reasons) < 4:
             reasons.append("Responsibilities section aligns with target role")
         if not reasons:
-            reasons.append(f"Routing score {routing_score:.2f} indicates moderate fit")
+            reasons.append(f"Routing score {routing_score:.2f} — plausible match")
 
-        # Use reranker match_reason as one_liner if available
+        # Build a human-readable one_liner with concrete evidence
+        title_note = f"Title match: {job.title.split(',')[0].strip()}. " if title_matched else ""
+        tech_note = f"Skills: {', '.join(tech_found[:4])}. " if tech_found else ""
         one_liner = (
-            match_reason.strip()
-            if match_reason.strip()
-            else f"Reranker score {routing_score:.2f} — LLM skipped for cost"
-        )
+            f"{title_note}{tech_note}"
+            "Keyword-based estimate — AI deep review skipped to save time. "
+            "Consider a manual check."
+        ).strip()
+        if not title_note and not tech_note and match_reason.strip():
+            one_liner = match_reason.strip()
 
         section_str = ", ".join(matched_sections) if matched_sections else "none"
 
@@ -361,12 +493,15 @@ class SelectiveRouter:
         if self.log_decisions:
             logger.info(
                 "routing | job={} company={} routed=skipped_llm routing_score={:.3f} "
-                "threshold={:.2f} matched_sections=[{}] synthetic_fit={}",
-                job.id, job.company, routing_score, self.threshold, section_str, fit_score,
+                "threshold={:.2f} title_match={} matched_sections=[{}] synthetic_fit={}",
+                job.id, job.company, routing_score, self.threshold,
+                title_matched, section_str, fit_score,
             )
 
         # Human-readable flags — never expose raw internal field names to the UI
-        synthetic_flags: list[str] = ["Estimate only — not reviewed by AI. Consider a manual check."]
+        synthetic_flags: list[str] = [
+            "Fast keyword estimate — not reviewed by AI. Consider a manual check."
+        ]
         if not matched_sections:
             synthetic_flags.append("No strong section matches found in job description")
 
@@ -403,6 +538,14 @@ class SelectiveRouter:
             return candidate
         return self._config.get("llm", {}).get("model", {}).get(provider, "")
 
+    def get_model_for_quality_mode(self, quality_mode: str) -> str:
+        """Return the model name for an explicit quality_mode and the configured provider."""
+        provider = self._config.get("llm", {}).get("provider", "groq")
+        candidate = _MODEL_MAP.get((provider, quality_mode))
+        if candidate:
+            return candidate
+        return self._config.get("llm", {}).get("model", {}).get(provider, "")
+
     def apply_model_override(self, config: dict[str, Any]) -> dict[str, Any]:
         """
         Return a deep copy of config with the LLM model replaced by the
@@ -414,6 +557,21 @@ class SelectiveRouter:
         provider = config.get("llm", {}).get("provider", "groq")
         cfg = copy.deepcopy(config)
         cfg.setdefault("llm", {}).setdefault("model", {})[provider] = effective
+        return cfg
+
+    def apply_model_override_for_mode(
+        self, config: dict[str, Any], quality_mode: str
+    ) -> dict[str, Any]:
+        """
+        Return a deep copy of config with the LLM model set to the given quality_mode.
+        Used to pre-create per-tier LLM clients before the job scoring loop.
+        """
+        model = self.get_model_for_quality_mode(quality_mode)
+        if not model:
+            return config
+        provider = config.get("llm", {}).get("provider", "groq")
+        cfg = copy.deepcopy(config)
+        cfg.setdefault("llm", {}).setdefault("model", {})[provider] = model
         return cfg
 
     # ── Summary ───────────────────────────────────────────────────────────────
