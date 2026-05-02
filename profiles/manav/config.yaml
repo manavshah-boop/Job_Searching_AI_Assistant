@@ -1,130 +1,180 @@
 llm:
   provider: groq
-  temperature: 0
   model:
     anthropic: claude-sonnet-4-20250514
     gemini: gemini-2.5-flash
+    groq_production: meta-llama/llama-4-scout-17b-16e-instruct
+    groq_testing: llama-3.1-8b-instant
+    groq_balanced: llama-3.3-70b-versatile
     groq: meta-llama/llama-4-scout-17b-16e-instruct
     openai: gpt-4o-mini
+  temperature: 0
   rate_limits:
+    anthropic:
+      max_rpm: 50
+      max_tpm: 9000000
+    gemini:
+      max_rpm: 9
+      max_tpm: 240000
+      max_rpd: 250
+    groq_production:
+      max_rpm: 28
+      max_tpm: 28000
+      max_rpd: 950
+    groq_testing:
+      max_rpm: 28
+      max_tpm: 5500
+      max_rpd: 14000
+    groq_balanced:
+      max_rpm: 28
+      max_tpm: 11000
+      max_rpd: 950
     groq:
       max_rpm: 28
       max_tpm: 28000
-      max_rpd: 1000
-    anthropic:
+      max_rpd: 950
+    openai:
       max_rpm: 50
       max_tpm: 9000000
 
 profile:
   name: Manav Shah
-  bio: >
-    Early-career software engineer with 2+ years of experience in Python, AWS,
-    and LLM integration. Building AI-native developer tools and data pipelines.
-    Strong interest in backend infrastructure, networking, and productivity tooling.
-  job_type: fulltime
+  resume_file: ../../resume.pdf
+  bio: Software Engineer specializing in cloud-native, AI-integrated backend systems
+    and data pipelines, with experience across medical devices, machine learning,
+    and simulation platforms. Proven ability to design scalable systems, improve reliability,
+    and integrate ML models into production workflows to drive real-world decision
+    making.
   resume: null
-  resume_file: resume.pdf   # place your resume PDF here
 
 preferences:
   titles:
-    - Software Engineer
-    - Backend Engineer
-    - Platform Engineer
-    - ML Engineer
-    - AI Engineer
-    - Software Engineer II
-    - Software Development Engineer
+  - Software Engineer
+  - Software Developer
+  - Software Development Engineer
+  - SDE
+  - SWE
+  - Backend Engineer
+  - AI Engineer
   desired_skills:
-    - Python
-    - AWS
-    - LLM
-    - Machine Learning
-    - FastAPI
-    - Docker
-    - PostgreSQL
-    - REST API
-    - Kubernetes
-    - TypeScript
-    - networking
-    - TCP/IP
-    - distributed systems
+  - Python
+  - Machine learning infrastructure
+  - LLM systems
+  - Backend development
+  - REST APIs
+  - API design
+  - Microservices
+  - Authentication and authorization
+  - Database design
+  - SQL
+  - PostgreSQL
+  - MySQL
+  - Redis
+  - Data modeling
+  - Query optimization
+  - AWS
+  - Cloud architecture
+  - Scalability design
+  - System design
+  - Distributed systems
+  - Docker
+  - CI/CD pipelines
+  - Git version control
+  - Logging and monitoring
+  - Data pipelines
+  - Model evaluation
+  - Problem solving
+  - Data structures and algorithms
+  - Object oriented programming
   hard_no_keywords:
-    - security clearance required
-    - 10+ years
-    - 8+ years
-  yoe: 2
+  - security clearance required
+  - 5+ years of experience
+  - internship
+  - intern
   location:
     remote_ok: true
     preferred_locations:
-      - Remote
-      - San Francisco, CA
-      - New York, NY
-      - Seattle, WA
-  filters:
-    countries_allowed:
-      - United States
-      - US
-      - USA
-      - Remote
-    min_yoe: 0
-    max_yoe: 5
-    require_degree_filter: false
-    title_blocklist:
-      - Staff
-      - Principal
-      - VP
-      - Director
-      - Head of
-      - Manager
-      - Lead
-    max_job_age_days: 21
+    - Seattle, WA
+    - Washington
+    - New York
+    - California
   compensation:
     min_salary: 130000
+  yoe: 3
+  filters:
+    countries_allowed:
+    - United States
+    - US
+    - USA
+    - Remote
+    min_yoe: 0
+    max_yoe: 4
+    require_degree_filter: true
+    title_blocklist:
+    - Staff
+    - Principal
+    - VP
+    - Director
+    - Head of
+    - Manager
+    - Lead
+    - Executive
+    - Intern
 
 sources:
   greenhouse:
-    enabled: true
-    companies:
-      - anthropic
-      - stripe
-      - figma
-      - databricks
-      - asana
-      - coinbase
-      - datadog
-      - dropbox
-      - github
-      - notion
+    enabled: false
+    companies: []
+  lever:
+    enabled: false
+    companies: []
+  hn:
+    enabled: false
   ashby:
     enabled: true
     companies:
-      - linear
-      - loom
-      - retool
-      - codeium
-      - replit
-  lever:
+    - OpenAI
+  workable:
+    enabled: false
+    companies: []
+  himalayas:
+    enabled: false
+
+scoring:
+  min_display_score: 60
+  weights:
+    role_fit: 0.3
+    stack_match: 0.25
+    seniority: 0.2
+    location: 0.1
+    growth: 0.1
+    compensation: 0.05
+
+embeddings:
+  enabled: true
+  model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 8
+  vector_store:
     enabled: true
-    companies:
-      - linear
-      - vercel
-      - notion
-      - rippling
+    provider: chromadb
+    persist_directory: null
+    collection_name: job_chunks
+    top_k_chunks: 50
+    top_k_jobs: 30
+    strict: false
+
+tracking:
+  mlflow:
+    enabled: true
+    tracking_uri: ./mlruns
+    experiment_name: job-agent
+    log_artifacts: true
+    log_eval_labels: false
 
 routing:
   enabled: true
   threshold: 0.65          # base threshold (kept for reference)
-  llm_threshold: 0.25      # per-profile override — ms-marco scores job-match queries in a
-                           # lower range; 0.25 ensures good-fit jobs are not silently skipped
-  quality_mode: quality
+  llm_threshold: 0.25      # per-profile override — ms-marco scores job-matching queries
+                           # in a compressed range; 0.25 ensures good-fit jobs aren't skipped
+  quality_mode: fast
   log_routing_decisions: true
-
-scoring:
-  min_display_score: 55
-  weights:
-    role_fit: 0.30
-    stack_match: 0.25
-    seniority: 0.20
-    location: 0.10
-    growth: 0.10
-    compensation: 0.05
