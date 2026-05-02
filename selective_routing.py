@@ -30,7 +30,9 @@ from db import Job
 _MODEL_CACHE: dict[str, Any] = {}
 
 _DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-_DEFAULT_THRESHOLD = 0.65
+# ms-marco-MiniLM-L-6-v2 outputs logits in a different scale than semantic similarity
+# models — 0.25 keeps good-fit jobs from being silently skipped. Was 0.65.
+_DEFAULT_THRESHOLD = 0.25
 _DEFAULT_QUALITY_MODE = "fast"
 
 # (provider, quality_mode) → model name
@@ -120,8 +122,11 @@ class SelectiveRouter:
         raw = config.get("routing", {})
         self.enabled: bool = bool(raw.get("enabled", False))
 
+        # Per-profile llm_threshold overrides the base threshold (both fall back to code default).
+        # This lets individual profiles fine-tune without changing the global default.
+        raw_threshold = raw.get("llm_threshold") if raw.get("llm_threshold") is not None else raw.get("threshold", _DEFAULT_THRESHOLD)
         try:
-            threshold = float(raw.get("threshold", _DEFAULT_THRESHOLD))
+            threshold = float(raw_threshold)
         except (TypeError, ValueError):
             threshold = _DEFAULT_THRESHOLD
         self.threshold: float = max(0.0, min(1.0, threshold))
@@ -136,6 +141,7 @@ class SelectiveRouter:
         self._encoder: Any = None
         self._match_query: str = ""
         self._counts: dict[str, int] = {"llm": 0, "skipped": 0, "error": 0}
+        self._synthetic_routing_scores: list[float] = []  # for domain suitability diagnostic
 
     # ── Encoder ───────────────────────────────────────────────────────────────
 
@@ -351,6 +357,7 @@ class SelectiveRouter:
         section_str = ", ".join(matched_sections) if matched_sections else "none"
 
         self.record_skipped()
+        self._synthetic_routing_scores.append(routing_score)
         if self.log_decisions:
             logger.info(
                 "routing | job={} company={} routed=skipped_llm routing_score={:.3f} "
@@ -358,13 +365,18 @@ class SelectiveRouter:
                 job.id, job.company, routing_score, self.threshold, section_str, fit_score,
             )
 
+        # Human-readable flags — never expose raw internal field names to the UI
+        synthetic_flags: list[str] = ["Estimate only — not reviewed by AI. Consider a manual check."]
+        if not matched_sections:
+            synthetic_flags.append("No strong section matches found in job description")
+
         return {
             "job": job,
             "fit_score": fit_score,
             "tokens_used": 0,
             "ats_score": ats_score,
             "reasons": reasons,
-            "flags": [f"score_source:reranker", f"matched_sections:{section_str}"],
+            "flags": synthetic_flags,
             "one_liner": one_liner,
             "dimension_scores": dims,
             "skill_misses": [],
@@ -419,3 +431,15 @@ class SelectiveRouter:
             self._counts["error"],
             pct_saved,
         )
+
+        # Step 5 diagnostic: warn if many synthetically-scored jobs had very low reranker scores,
+        # which suggests the ms-marco model is poorly calibrated for job-matching queries.
+        scores = self._synthetic_routing_scores
+        if len(scores) >= 5:
+            below_threshold = sum(1 for s in scores[:5] if s < 0.35)
+            if below_threshold >= 3:
+                logger.warning(
+                    "Reranker may be undertuned for this domain. "
+                    "Consider swapping to cross-encoder/stsb-roberta-base "
+                    "or fine-tuning on feedback data."
+                )
