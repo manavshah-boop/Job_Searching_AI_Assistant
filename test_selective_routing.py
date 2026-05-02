@@ -102,7 +102,7 @@ def test_router_init_invalid_threshold_uses_default():
     cfg = make_config()
     cfg["routing"]["threshold"] = "not_a_number"
     router = SelectiveRouter(cfg)
-    assert router.threshold == 0.65
+    assert router.threshold == 0.25  # updated to match new _DEFAULT_THRESHOLD
 
 
 def test_router_init_quality_mode():
@@ -178,7 +178,10 @@ def test_create_synthetic_score_fit_range():
 def test_create_synthetic_score_flag():
     router = SelectiveRouter(make_config())
     result = router.create_synthetic_score(make_job(), 0.60)
-    assert "score_source:reranker" in result["flags"]
+    # Flags must be human-readable — no raw internal key names allowed
+    assert len(result["flags"]) >= 1
+    assert all("score_source:" not in f and "matched_sections:" not in f for f in result["flags"])
+    assert any("estimate" in f.lower() or "not reviewed" in f.lower() for f in result["flags"])
 
 
 def test_create_synthetic_score_not_disqualified():

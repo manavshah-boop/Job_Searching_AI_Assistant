@@ -1,0 +1,130 @@
+llm:
+  provider: groq
+  temperature: 0
+  model:
+    anthropic: claude-sonnet-4-20250514
+    gemini: gemini-2.5-flash
+    groq: meta-llama/llama-4-scout-17b-16e-instruct
+    openai: gpt-4o-mini
+  rate_limits:
+    groq:
+      max_rpm: 28
+      max_tpm: 28000
+      max_rpd: 1000
+    anthropic:
+      max_rpm: 50
+      max_tpm: 9000000
+
+profile:
+  name: Manav Shah
+  bio: >
+    Early-career software engineer with 2+ years of experience in Python, AWS,
+    and LLM integration. Building AI-native developer tools and data pipelines.
+    Strong interest in backend infrastructure, networking, and productivity tooling.
+  job_type: fulltime
+  resume: null
+  resume_file: resume.pdf   # place your resume PDF here
+
+preferences:
+  titles:
+    - Software Engineer
+    - Backend Engineer
+    - Platform Engineer
+    - ML Engineer
+    - AI Engineer
+    - Software Engineer II
+    - Software Development Engineer
+  desired_skills:
+    - Python
+    - AWS
+    - LLM
+    - Machine Learning
+    - FastAPI
+    - Docker
+    - PostgreSQL
+    - REST API
+    - Kubernetes
+    - TypeScript
+    - networking
+    - TCP/IP
+    - distributed systems
+  hard_no_keywords:
+    - security clearance required
+    - 10+ years
+    - 8+ years
+  yoe: 2
+  location:
+    remote_ok: true
+    preferred_locations:
+      - Remote
+      - San Francisco, CA
+      - New York, NY
+      - Seattle, WA
+  filters:
+    countries_allowed:
+      - United States
+      - US
+      - USA
+      - Remote
+    min_yoe: 0
+    max_yoe: 5
+    require_degree_filter: false
+    title_blocklist:
+      - Staff
+      - Principal
+      - VP
+      - Director
+      - Head of
+      - Manager
+      - Lead
+    max_job_age_days: 21
+  compensation:
+    min_salary: 130000
+
+sources:
+  greenhouse:
+    enabled: true
+    companies:
+      - anthropic
+      - stripe
+      - figma
+      - databricks
+      - asana
+      - coinbase
+      - datadog
+      - dropbox
+      - github
+      - notion
+  ashby:
+    enabled: true
+    companies:
+      - linear
+      - loom
+      - retool
+      - codeium
+      - replit
+  lever:
+    enabled: true
+    companies:
+      - linear
+      - vercel
+      - notion
+      - rippling
+
+routing:
+  enabled: true
+  threshold: 0.65          # base threshold (kept for reference)
+  llm_threshold: 0.25      # per-profile override — ms-marco scores job-match queries in a
+                           # lower range; 0.25 ensures good-fit jobs are not silently skipped
+  quality_mode: quality
+  log_routing_decisions: true
+
+scoring:
+  min_display_score: 55
+  weights:
+    role_fit: 0.30
+    stack_match: 0.25
+    seniority: 0.20
+    location: 0.10
+    growth: 0.10
+    compensation: 0.05

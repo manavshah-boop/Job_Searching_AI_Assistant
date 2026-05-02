@@ -55,6 +55,7 @@ class MatchExplanation:
     unknowns: list[FactorExplanation] = field(default_factory=list)
     matched_sections: list[str] = field(default_factory=list)
     evidence_snippets: list[str] = field(default_factory=list)
+    coach_summary: str = ""  # human-readable actionable text; never contains raw internal keys
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -70,6 +71,113 @@ def _dedupe(values: list[str]) -> list[str]:
         seen.add(lowered)
         result.append(cleaned)
     return result
+
+
+# Raw internal flag prefixes that must never reach user-facing text
+_INTERNAL_FLAG_PREFIXES = ("score_source:", "matched_sections:", "parse error")
+
+
+def _clean_flags(flags: list[str]) -> list[str]:
+    """Strip raw internal key-value flags that expose implementation details."""
+    return [f for f in flags if not any(f.startswith(p) for p in _INTERNAL_FLAG_PREFIXES)]
+
+
+def _is_llm_skipped(score_record: Optional[dict]) -> bool:
+    """True when the score came from the reranker synthetic path, not an LLM call."""
+    flags = list((score_record or {}).get("flags") or [])
+    return any(
+        "estimate" in f.lower() or "not reviewed" in f.lower()
+        for f in flags
+    )
+
+
+def _extract_skill_overlaps(
+    job_text: str,
+    profile_intent: ProfileIntent,
+) -> tuple[list[str], list[str]]:
+    """Compare profile skills against job text. Returns (found_skills, missing_skills)."""
+    domain_skills = list(getattr(profile_intent, "domain_skills", []) or [])
+    tools = list(getattr(profile_intent, "tools", []) or [])
+    all_skills = domain_skills + tools
+    job_lower = job_text.lower()
+    found = [s for s in all_skills if s.lower() in job_lower]
+    missing = [s for s in all_skills if s.lower() not in job_lower]
+    return found[:6], missing[:5]
+
+
+def build_coach_summary(
+    job_record: Optional[dict],
+    score_record: Optional[dict],
+    reranked_result: Optional[RerankedJobResult],
+    profile_intent: ProfileIntent,
+) -> str:
+    """
+    Build a concise, actionable coach-style match summary.
+
+    Extracts concrete insights (title match, skill overlap, risks) from the
+    job record and score data. Never exposes raw internal field names.
+
+    Example output:
+      Strengths:
+      - Title match: Software Engineer
+      - Skills overlap: Python, AWS, Docker mentioned
+      Concerns:
+      - AI verification skipped (auto-estimate)
+      Missing/unclear:
+      - Compensation not listed
+    """
+    job = job_record or score_record or {}
+    job_title = str(job.get("title") or "Unknown role")
+    job_text = str(job.get("raw_text") or "")
+
+    # Fall back to evidence snippets when raw_text isn't available
+    if not job_text and reranked_result is not None:
+        job_text = " ".join(list(getattr(reranked_result, "evidence_snippets", []) or []))
+
+    target_roles = list(getattr(profile_intent, "target_roles", []) or [])
+    title_match = any(
+        role.lower() in job_title.lower() or job_title.lower().split(",")[0].strip() in role.lower()
+        for role in target_roles
+    ) if target_roles else False
+
+    found_skills, missing_skills = _extract_skill_overlaps(job_text, profile_intent)
+
+    dims = dict((score_record or {}).get("dimension_scores") or {})
+    llm_skipped = _is_llm_skipped(score_record)
+
+    strengths: list[str] = []
+    if title_match:
+        strengths.append(f"Title match: {job_title.split(',')[0].strip()}")
+    if found_skills:
+        strengths.append(f"Skills overlap: {', '.join(found_skills)} mentioned")
+
+    concerns: list[str] = []
+    if llm_skipped:
+        concerns.append("AI verification skipped (auto-estimate)")
+    if missing_skills:
+        missing_str = ", ".join(missing_skills[:3])
+        concerns.append(f"Profile may lack explicit keywords: {missing_str}")
+    loc = dims.get("location")
+    if loc is not None and loc < 4:
+        concerns.append("Location not explicitly remote")
+    seniority = dims.get("seniority")
+    if seniority is not None and seniority < 4:
+        concerns.append("Experience level unclear")
+
+    missing: list[str] = []
+    comp = dims.get("compensation")
+    if comp is None or comp < 3:
+        missing.append("Compensation not listed")
+
+    sections: list[str] = []
+    if strengths:
+        sections.append("Strengths:\n" + "\n".join(f"- {s}" for s in strengths))
+    if concerns:
+        sections.append("Concerns:\n" + "\n".join(f"- {c}" for c in concerns))
+    if missing:
+        sections.append("Missing/unclear:\n" + "\n".join(f"- {m}" for m in missing))
+
+    return "\n".join(sections) if sections else "No additional insights available."
 
 
 def _dimension_score(score_record: Optional[dict], key: str) -> int | None:
@@ -110,8 +218,11 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
         return []
 
     reasons = list(score_record.get("reasons") or [])
-    flags = list(score_record.get("flags") or [])
+    raw_flags = list(score_record.get("flags") or [])
+    # Filter out raw internal keys before they reach any user-facing evidence field
+    flags = _clean_flags(raw_flags)
     skill_misses = list(score_record.get("skill_misses") or [])
+
     factors = [
         FactorExplanation(
             name="Role fit",
@@ -131,7 +242,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             name="Seniority fit",
             status=_status_from_score(_dimension_score(score_record, "seniority")),
             score=_dimension_score(score_record, "seniority"),
-            evidence=flags[:2],
+            evidence=flags[:2],  # cleaned — no raw internal keys here
             explanation="How well the posting level lines up with the profile's target seniority.",
         ),
         FactorExplanation(
@@ -446,4 +557,5 @@ def build_match_explanation(
     )
     explanation.recommended_action = recommend_action(explanation)
     explanation.summary = summarize_match(explanation)
+    explanation.coach_summary = build_coach_summary(job_record, score_record, reranked_result, profile_intent)
     return explanation
