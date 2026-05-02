@@ -172,6 +172,7 @@ def _collection_metadata(model_name: str, dimensions: int) -> dict[str, Any]:
         "embedding_model": model_name,
         "embedding_dimensions": int(dimensions),
         "distance_metric": DEFAULT_DISTANCE_METRIC,
+        "hnsw:space": DEFAULT_DISTANCE_METRIC,
         "created_by": "job_search_ai_assistant",
     }
 

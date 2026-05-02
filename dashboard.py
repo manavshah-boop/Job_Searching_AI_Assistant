@@ -105,6 +105,7 @@ SOURCE_LABELS = {
 }
 
 SECTION_ORDER = ["Overview", "Jobs", "Activity", "Profile", "Settings"]
+SECTION_WIDGET_KEY = "_dashboard_section_widget"
 SECTION_COPY = {
     "Overview": "Track profile health, top matches, and recent run outcomes in one place.",
     "Jobs": "Scan the pipeline quickly, refine filters, and update job status without losing context.",
@@ -136,6 +137,7 @@ def _init_state() -> None:
         "dashboard_notice": None,
         "celebrate_profile_create": False,
         "dashboard_section": "Overview",
+        SECTION_WIDGET_KEY: "Overview",
         "last_status_change": None,
         "last_pipeline_result": None,
         "last_pipeline_error": None,
@@ -147,6 +149,23 @@ def _init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _valid_dashboard_section(value: Any) -> str:
+    return value if value in SECTION_ORDER else "Overview"
+
+
+def _sync_dashboard_section_from_widget() -> None:
+    st.session_state.dashboard_section = _valid_dashboard_section(
+        st.session_state.get(SECTION_WIDGET_KEY, "Overview")
+    )
+
+
+def _prepare_dashboard_section_widget() -> None:
+    section = _valid_dashboard_section(st.session_state.get("dashboard_section", "Overview"))
+    st.session_state.dashboard_section = section
+    if st.session_state.get(SECTION_WIDGET_KEY) != section:
+        st.session_state[SECTION_WIDGET_KEY] = section
 
 
 _WORKER_LOCKFILE  = ".worker_running"
@@ -829,10 +848,12 @@ def _render_sidebar_nav(
         _render_html_block("<div class='shell-sidebar-divider' aria-hidden='true'></div>")
         _render_html_block("<div class='shell-sidebar-section'>")
         _render_html_block("<div class='shell-inline-section-label shell-inline-section-label--sidebar'>Navigation</div>")
+        _prepare_dashboard_section_widget()
         st.radio(
             "Sections",
             SECTION_ORDER,
-            key="dashboard_section",
+            key=SECTION_WIDGET_KEY,
+            on_change=_sync_dashboard_section_from_widget,
             label_visibility="collapsed",
         )
         _render_html_block("</div>")
@@ -890,7 +911,10 @@ def _fetch_job_summaries(slug: str) -> list[dict[str, Any]]:
 
 
 def _fetch_job_detail(slug: str, job_id: str) -> Optional[dict[str, Any]]:
-    return get_job_with_score(job_id, profile=slug)
+    record = get_job_with_score(job_id, profile=slug)
+    if record is None:
+        return None
+    return _deserialize_job_record(record)
 
 
 def _search_job_ids_by_raw_text(slug: str, query: str) -> set[str]:
@@ -2096,6 +2120,8 @@ def _render_overview_run_bar(runs: list[dict[str, Any]]) -> None:
 
 
 def _render_job_detail(record: dict[str, Any], slug: str) -> None:
+    if not {"source_label", "status_label", "score_state"}.issubset(record):
+        record = _deserialize_job_record(dict(record))
     fit_value = record["fit_score"] if record["fit_score"] is not None else "N/A"
     ats_value = record["ats_score"] if record["ats_score"] is not None else "N/A"
     _render_html_block(

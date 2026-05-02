@@ -52,6 +52,11 @@ def test_score_all_jobs_uses_profile_for_attempt_and_error_writes(monkeypatch):
     )
 
     monkeypatch.setattr(scorer, "get_llm_client", lambda config: object())
+    monkeypatch.setattr(
+        scorer,
+        "get_instructor_client",
+        lambda config: (_ for _ in ()).throw(RuntimeError("instructor unavailable")),
+    )
     monkeypatch.setattr(scorer, "get_unscored", lambda profile=None: [job])
     monkeypatch.setattr(scorer, "build_structured_profile", lambda config, llm_call: {"name": "Test"})
     monkeypatch.setattr(scorer, "print_profile_summary", lambda profile: None)
@@ -165,6 +170,68 @@ def test_dashboard_invalidate_caches_clears_semantic_panel_cache(monkeypatch):
     dashboard.invalidate_dashboard_caches()
 
     assert calls == ["profiles", "summaries", "detail", "runs", "semantic"]
+
+
+def test_fetch_job_detail_adds_dashboard_only_fields(monkeypatch):
+    raw_record = {
+        "id": "job-1",
+        "title": "Software Engineer",
+        "company": "Acme",
+        "location": "Remote",
+        "url": "https://example.com/job-1",
+        "raw_text": "Python backend role",
+        "source": "ashby",
+        "score_attempts": 1,
+        "score_error": None,
+        "status": "new",
+        "fit_score": 88,
+        "ats_score": 74,
+        "reasons": [],
+        "flags": [],
+        "skill_misses": [],
+        "one_liner": "Strong backend match.",
+        "dimension_scores": {},
+    }
+
+    monkeypatch.setattr(
+        dashboard,
+        "get_job_with_score",
+        lambda job_id, profile=None: dict(raw_record),
+    )
+
+    record = dashboard._fetch_job_detail("default", "job-1")
+
+    assert record is not None
+    assert record["source_label"] == "Ashby"
+    assert record["status_label"] == "New"
+    assert record["score_state"] == "Scored"
+
+
+def test_dashboard_section_uses_private_widget_state(monkeypatch):
+    class FakeSessionState(dict):
+        def __getattr__(self, key):
+            try:
+                return self[key]
+            except KeyError as exc:
+                raise AttributeError(key) from exc
+
+        def __setattr__(self, key, value):
+            self[key] = value
+
+    state = FakeSessionState(
+        {
+            "dashboard_section": "Jobs",
+            dashboard.SECTION_WIDGET_KEY: "Overview",
+        }
+    )
+    monkeypatch.setattr(dashboard.st, "session_state", state)
+
+    dashboard._prepare_dashboard_section_widget()
+    assert state[dashboard.SECTION_WIDGET_KEY] == "Jobs"
+
+    state[dashboard.SECTION_WIDGET_KEY] = "Activity"
+    dashboard._sync_dashboard_section_from_widget()
+    assert state["dashboard_section"] == "Activity"
 
 
 def test_render_semantic_match_panel_handles_disabled_vector_store(monkeypatch):

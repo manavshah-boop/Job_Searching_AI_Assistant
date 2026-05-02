@@ -31,7 +31,8 @@ loguru>=0.7.0
 
 # step 17+20 — semantic job embeddings
 sentence-transformers~=3.2.1
-torch~=2.5.1
+torch~=2.5.1; python_version < "3.13"
+torch~=2.6.0; python_version >= "3.13"
 transformers~=4.46.3
 
 # step 18 — persistent vector retrieval
