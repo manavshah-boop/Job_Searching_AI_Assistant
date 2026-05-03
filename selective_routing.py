@@ -249,9 +249,11 @@ class SelectiveRouter:
 
     def compute_title_boost(self, job: Job) -> float:
         """
-        Return 0.15 when the job title contains any configured target role.
+        Return 0.25 when the job title contains any configured target role.
         Applied to the effective score for the routing/tier decision only —
-        never stored in the final score record.
+        never stored in the final score record. ms-marco emits compressed scores
+        (great matches still land at ~0.30), so a single +0.25 boost reliably
+        clears the 0.18 floor for any title-matched role.
         """
         target_roles = self._config.get("preferences", {}).get("titles", [])
         if not target_roles or not job.title:
@@ -259,7 +261,37 @@ class SelectiveRouter:
         job_title_lower = job.title.lower().strip()
         for role in target_roles:
             if role.lower().strip() in job_title_lower:
-                return 0.15
+                return 0.25
+        return 0.0
+
+    # ── Skills-overlap boost ──────────────────────────────────────────────────
+
+    def compute_skills_boost(self, job: Job) -> float:
+        """
+        Return a boost based on how many of the candidate's desired_skills appear
+        in the job text. The reranker (ms-marco) is undertuned for resume↔JD
+        matching and routinely under-scores good fits; explicit skill-keyword
+        overlap is a direct, conservative signal we can layer on top.
+
+          ≥3 desired-skill hits  → +0.20 (likely-good fit, force-route to LLM)
+          ≥2 desired-skill hits  → +0.10 (plausible fit, lifts borderline scores)
+          else                   → 0
+        """
+        skills = self._config.get("preferences", {}).get("desired_skills", [])
+        if not skills or not job.raw_text:
+            return 0.0
+        text_lower = job.raw_text.lower()
+        hits = 0
+        for skill in skills:
+            sl = skill.lower().strip()
+            if not sl:
+                continue
+            if sl in text_lower:
+                hits += 1
+                if hits >= 3:
+                    return 0.20
+        if hits >= 2:
+            return 0.10
         return 0.0
 
     # ── Routing decision ──────────────────────────────────────────────────────
