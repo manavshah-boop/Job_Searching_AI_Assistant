@@ -16,10 +16,11 @@ Usage (config.yaml):
 
 import copy
 import math
+import os
 import re
 import time
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional, Tuple
 
 from loguru import logger
 
@@ -601,3 +602,229 @@ class SelectiveRouter:
                     "Consider swapping to cross-encoder/stsb-roberta-base "
                     "or fine-tuning on feedback data."
                 )
+
+
+# ── Multi-provider fallback chain ─────────────────────────────────────────────
+
+class RoutingExhaustedError(Exception):
+    """Raised when every provider in the fallback chain has exhausted its run budget."""
+
+
+# Default model for each provider when used as a fallback.
+# Values are bare model names (without the "provider/" prefix).
+_FALLBACK_PROVIDER_MODELS: dict[str, str] = {
+    "groq":       "llama-3.1-8b-instant",
+    "gemini":     "gemini-2.5-flash",
+    "cerebras":   "llama-3.3-70b",
+    "openai":     "gpt-4o-mini",
+    "openrouter": "auto",
+    "mistral":    "mistral-small-latest",
+}
+
+# For the low tier (uncertain jobs) Gemini's stronger model is preferred.
+_FALLBACK_PROVIDER_MODELS_LOW: dict[str, str] = {
+    **_FALLBACK_PROVIDER_MODELS,
+    "gemini": "gemini-2.5-pro",
+}
+
+# Map provider name → environment variable for its API key.
+_PROVIDER_API_KEY_ENV: dict[str, str] = {
+    "groq":       "GROQ_API_KEY",
+    "gemini":     "GEMINI_API_KEY",
+    "cerebras":   "CEREBRAS_API_KEY",
+    "openai":     "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "mistral":    "MISTRAL_API_KEY",
+}
+
+
+@dataclass
+class ProviderBudget:
+    """
+    Tracks per-provider LLM usage within a single pipeline run.
+
+    Instantiate once at the start of a run with the rate_limit_budget section
+    from the routing config. Call can_afford() before every LLM request and
+    spend() immediately after to keep counters accurate.
+    """
+
+    _limits: dict[str, dict[str, int]] = field(default_factory=dict)
+    _requests_used: dict[str, int] = field(default_factory=dict)
+    _tokens_used: dict[str, int] = field(default_factory=dict)
+    _fallback_counts: dict[str, int] = field(default_factory=dict)
+
+    def __init__(self, budget_config: dict[str, Any]) -> None:
+        self._limits = {}
+        self._requests_used = {}
+        self._tokens_used = {}
+        self._fallback_counts = {}
+        for provider, limits in budget_config.items():
+            self._limits[provider] = {
+                "max_requests": int(limits.get("max_requests_per_run", 999)),
+                "max_tokens":   int(limits.get("max_tokens_per_run",   999_999)),
+            }
+            self._requests_used[provider]  = 0
+            self._tokens_used[provider]    = 0
+            self._fallback_counts[provider] = 0
+
+    def can_afford(self, provider: str, estimated_tokens: int) -> bool:
+        """True if provider has remaining request and token headroom."""
+        if provider not in self._limits:
+            return True  # unconfigured provider → allow (no cap)
+        lim = self._limits[provider]
+        return (
+            self._requests_used[provider] < lim["max_requests"]
+            and self._tokens_used[provider] + estimated_tokens <= lim["max_tokens"]
+        )
+
+    def spend(self, provider: str, tokens: int) -> None:
+        """Record one request and its estimated token cost."""
+        if provider not in self._requests_used:
+            self._requests_used[provider] = 0
+            self._tokens_used[provider]   = 0
+            self._fallback_counts[provider] = 0
+        self._requests_used[provider] += 1
+        self._tokens_used[provider]   += tokens
+
+    def update_actual(self, provider: str, estimated: int, actual: int) -> None:
+        """Correct the token ledger after a call returns its actual usage."""
+        if provider in self._tokens_used:
+            self._tokens_used[provider] += actual - estimated
+
+    def force_exhaust(self, provider: str) -> None:
+        """Mark provider as fully exhausted (e.g. after a 429 response)."""
+        if provider in self._limits:
+            lim = self._limits[provider]
+            self._requests_used[provider] = lim["max_requests"]
+            self._tokens_used[provider]   = lim["max_tokens"]
+        else:
+            # Provider not in budget config — add a sentinel so can_afford returns False.
+            self._limits[provider]        = {"max_requests": 0, "max_tokens": 0}
+            self._requests_used[provider] = 1
+            self._tokens_used[provider]   = 1
+
+    def record_fallback(self, provider: str) -> None:
+        """Increment the fallback counter for a provider (used in summary log)."""
+        self._fallback_counts[provider] = self._fallback_counts.get(provider, 0) + 1
+
+    def remaining(self, provider: str) -> dict[str, int]:
+        lim = self._limits.get(provider, {})
+        return {
+            "requests_remaining": max(0, lim.get("max_requests", 0) - self._requests_used.get(provider, 0)),
+            "tokens_remaining":   max(0, lim.get("max_tokens",   0) - self._tokens_used.get(provider, 0)),
+        }
+
+    def log_summary(self) -> None:
+        """Log a per-provider budget usage summary at the end of a run."""
+        logger.info("Provider budget summary:")
+        for provider in self._limits:
+            req_used = self._requests_used.get(provider, 0)
+            tok_used = self._tokens_used.get(provider, 0)
+            max_req  = self._limits[provider]["max_requests"]
+            max_tok  = self._limits[provider]["max_tokens"]
+            fb_count = self._fallback_counts.get(provider, 0)
+            fb_note  = f" (fallback used: {fb_count})" if fb_count else ""
+            if req_used == 0:
+                logger.info("  {}: 0/{} requests (not needed)", provider, max_req)
+            else:
+                logger.info(
+                    "  {}: {}/{} requests, {:,}/{:,} tokens{}",
+                    provider, req_used, max_req, tok_used, max_tok, fb_note,
+                )
+
+
+def _provider_has_key(provider: str, profile: Optional[str] = None) -> bool:
+    """Return True if the provider's API key is present in the environment."""
+    env_var = _PROVIDER_API_KEY_ENV.get(provider)
+    if not env_var:
+        return False
+    if profile:
+        if os.environ.get(f"{env_var}_{profile.upper()}"):
+            return True
+    return bool(os.environ.get(env_var))
+
+
+def select_model_with_fallback(
+    tier_config: dict[str, Any],
+    tier_name: str,
+    routing_config: dict[str, Any],
+    budgets: ProviderBudget,
+    estimated_tokens: int = 500,
+    job_id: Optional[Any] = None,
+    profile: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Select the best available (provider, model) for a scoring call.
+
+    Starts with the tier's primary_model. If that provider's budget is
+    exhausted, walks the fallback_chain until a provider with budget is found.
+    Logs a WARNING for every fallback decision so the audit trail is clear.
+
+    Returns:
+        (provider, model_name) — bare model name without the "provider/" prefix.
+
+    Raises:
+        RoutingExhaustedError — if every provider in the chain is exhausted.
+    """
+    fallback_models = (
+        _FALLBACK_PROVIDER_MODELS_LOW if tier_name == "low"
+        else _FALLBACK_PROVIDER_MODELS
+    )
+
+    # Parse the tier's primary_model ("provider/model-name")
+    primary_model_str = tier_config.get("primary_model", "")
+    if "/" in primary_model_str:
+        primary_provider, primary_model = primary_model_str.split("/", 1)
+    else:
+        primary_provider = "groq"
+        primary_model    = primary_model_str or fallback_models.get("groq", "llama-3.1-8b-instant")
+
+    # Try primary first
+    if (
+        _provider_has_key(primary_provider, profile)
+        and budgets.can_afford(primary_provider, estimated_tokens)
+    ):
+        return primary_provider, primary_model
+
+    # Walk the fallback chain
+    fallback_chain: list[str] = routing_config.get("fallback_chain", list(fallback_models.keys()))
+    exhausted_reason = (
+        f"budget exhausted ({budgets._tokens_used.get(primary_provider, 0):,}/"
+        f"{budgets._limits.get(primary_provider, {}).get('max_tokens', 0):,} tokens)"
+        if budgets._limits.get(primary_provider)
+        else "no API key"
+    )
+
+    for fallback_provider in fallback_chain:
+        if fallback_provider == primary_provider:
+            continue  # already tried
+        if not _provider_has_key(fallback_provider, profile):
+            logger.debug(
+                "select_model | skipping {} — no API key found", fallback_provider
+            )
+            continue
+        if not budgets.can_afford(fallback_provider, estimated_tokens):
+            logger.debug(
+                "select_model | skipping {} — budget exhausted", fallback_provider
+            )
+            continue
+
+        fallback_model = fallback_models.get(fallback_provider, "")
+        if not fallback_model:
+            continue
+
+        logger.warning(
+            "Falling back from {} to {} for job {}: {} "
+            "(estimated tokens for this call: {:,})",
+            primary_provider, fallback_provider,
+            job_id or "unknown", exhausted_reason, estimated_tokens,
+        )
+        budgets.record_fallback(fallback_provider)
+        return fallback_provider, fallback_model
+
+    # All providers exhausted
+    raise RoutingExhaustedError(
+        f"All providers in fallback chain exhausted for job {job_id}. "
+        f"Primary provider: {primary_provider} ({exhausted_reason}). "
+        f"Chain tried: {fallback_chain}"
+    )

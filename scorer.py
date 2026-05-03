@@ -10,6 +10,7 @@ Active provider and model are set in config.yaml under the `llm` key.
 No code changes needed to switch providers.
 """
 
+import copy
 import json
 import os
 import re
@@ -39,7 +40,7 @@ from db import (
     write_score_error,
 )
 from candidate_profile import build_structured_profile, confirm_profile, print_profile_summary
-from llm_utils import parse_llm_response, safe_structured_call
+from llm_utils import estimate_tokens, is_rate_limit_error, parse_llm_response, safe_structured_call
 from models import ScoreResult, StructuredProfile
 
 class RateLimitReached(Exception):
@@ -790,9 +791,12 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
     _quality_config: Dict[str, Any] = config
     _fast_llm_call: Optional[LlmCall] = None
     _quality_llm_call: Optional[LlmCall] = None
+    _provider_budget = None
+    _llm_client_cache: Dict[str, LlmCall] = {}
+    _primary_provider = config.get("llm", {}).get("provider", "groq")
 
     if config.get("routing", {}).get("enabled", False):
-        from selective_routing import SelectiveRouter
+        from selective_routing import SelectiveRouter, ProviderBudget
         router = SelectiveRouter(config, profile)
         config = router.apply_model_override(config)
         _match_query = router.build_match_query()
@@ -800,7 +804,18 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
             "Selective routing enabled | threshold={:.2f} | quality_mode={} | model={}",
             router.threshold, router.quality_mode, router.get_effective_llm_model(),
         )
+
+        # Initialize per-run provider budget when rate_limit_budget is configured.
+        budget_cfg = config.get("routing", {}).get("rate_limit_budget")
+        if budget_cfg:
+            _provider_budget = ProviderBudget(budget_cfg)
+            logger.info(
+                "Provider budget tracking enabled | providers: {}",
+                ", ".join(budget_cfg.keys()),
+            )
+
         # Pre-create LLM clients for each tier so we don't reconstruct per job.
+        # These are used by the legacy quality_mode path when no budget config is set.
         try:
             _fast_config    = router.apply_model_override_for_mode(config, "fast")
             _quality_config = router.apply_model_override_for_mode(config, "quality")
@@ -918,9 +933,134 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
                         job.id, _effective, router.threshold,
                         "skipped_llm", "below_threshold", profile,
                     )
-                else:
+                elif _provider_budget:
+                    # ── Budget-aware provider fallback path ──────────────────
+                    from selective_routing import select_model_with_fallback, RoutingExhaustedError
+
                     tier = router.compute_tier(_effective, job.raw_text or "", title_matched)
-                    # Route to the pre-created client matching this tier's quality mode
+
+                    # Pre-estimate tokens so can_afford() has a realistic number.
+                    _profile_text = json.dumps(structured_profile) if structured_profile else ""
+                    _job_text     = job.raw_text or ""
+                    _est_tokens   = estimate_tokens(
+                        _profile_text, _job_text,
+                        tier["max_tokens"],
+                        tier.get("primary_model", ""),
+                    )
+
+                    result = None
+                    _max_provider_attempts = len(
+                        config.get("routing", {}).get("fallback_chain", [])
+                    ) + 2
+
+                    for _provider_attempt in range(_max_provider_attempts):
+                        # Select provider (falls back on each iteration if previous was exhausted)
+                        try:
+                            _sel_provider, _sel_model = select_model_with_fallback(
+                                tier, tier["tier"],
+                                config.get("routing", {}),
+                                _provider_budget,
+                                _est_tokens,
+                                job.id,
+                                profile,
+                            )
+                        except RoutingExhaustedError as _exhausted:
+                            logger.error(
+                                "routing | job={} ALL providers exhausted — using synthetic score. {}",
+                                job.id, _exhausted,
+                            )
+                            result = router.create_synthetic_score(
+                                job, _routing_score, title_matched=title_matched
+                            )
+                            log_routing_decision(
+                                job.id, _effective, router.threshold,
+                                "skipped_llm", "all_providers_exhausted", profile,
+                            )
+                            break
+
+                        # Build a config copy for this provider/model so score_dimensions
+                        # uses the right model name in logs and instructor calls.
+                        _tier_cfg = copy.deepcopy(config)
+                        _tier_cfg["llm"]["provider"] = _sel_provider
+                        _tier_cfg["llm"].setdefault("model", {})[_sel_provider] = _sel_model
+
+                        # Cache LLM clients by (provider, model) to avoid re-init overhead.
+                        _client_key = f"{_sel_provider}/{_sel_model}"
+                        if _client_key not in _llm_client_cache:
+                            try:
+                                _llm_client_cache[_client_key] = get_llm_client(_tier_cfg)
+                            except Exception as _ce:
+                                logger.warning(
+                                    "routing | could not build client for {}: {}", _client_key, _ce
+                                )
+                                _provider_budget.force_exhaust(_sel_provider)
+                                continue
+                        _tier_llm = _llm_client_cache[_client_key]
+
+                        # Instructor is only valid for the primary configured provider.
+                        _tier_instr = (
+                            instructor_client
+                            if _sel_provider == _primary_provider
+                            else None
+                        )
+
+                        # Reserve budget before the call (optimistic spend).
+                        _provider_budget.spend(_sel_provider, _est_tokens)
+
+                        router.record_llm_call()
+                        _is_fallback = _sel_provider != (
+                            tier.get("primary_model", "/").split("/")[0]
+                        )
+                        if router.log_decisions:
+                            logger.info(
+                                "routing | job={} company={} tier={} model={}/{} "
+                                "fallback={} routing_score={:.3f} effective={:.3f} "
+                                "title_match={} est_tokens={}",
+                                job.id, job.company, tier["tier"],
+                                _sel_provider, _sel_model,
+                                _is_fallback, _routing_score, _effective,
+                                title_matched, _est_tokens,
+                            )
+
+                        try:
+                            result = score_job(
+                                job, _tier_cfg, _tier_llm,
+                                structured_profile, _tier_instr,
+                                max_tokens=tier["max_tokens"],
+                            )
+                            # Correct the ledger with actual token usage.
+                            _actual_tokens = result.get("tokens_used", _est_tokens)
+                            _provider_budget.update_actual(
+                                _sel_provider, _est_tokens, _actual_tokens
+                            )
+                            log_routing_decision(
+                                job.id, _effective, router.threshold,
+                                "llm_called", f"tier:{tier['tier']}", profile,
+                            )
+                            break  # success — stop retrying
+
+                        except Exception as _call_exc:
+                            if is_rate_limit_error(_call_exc):
+                                # Correct the optimistic spend before marking exhausted.
+                                _provider_budget.update_actual(_sel_provider, _est_tokens, 0)
+                                _provider_budget.force_exhaust(_sel_provider)
+                                logger.warning(
+                                    "routing | job={} rate-limit from {} — "
+                                    "marking exhausted, trying next provider",
+                                    job.id, _sel_provider,
+                                )
+                                continue
+                            raise  # non-rate-limit error: let outer handler record it
+
+                    if result is None:
+                        # Defensive fallback — should not happen if RoutingExhaustedError is raised
+                        result = router.create_synthetic_score(
+                            job, _routing_score, title_matched=title_matched
+                        )
+
+                else:
+                    # ── Legacy quality_mode path (no budget config) ──────────
+                    tier = router.compute_tier(_effective, job.raw_text or "", title_matched)
                     if tier["quality_mode"] == "quality":
                         tier_llm    = _quality_llm_call
                         tier_config = _quality_config
@@ -994,6 +1134,9 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
 
     if router:
         router.log_summary()
+
+    if _provider_budget:
+        _provider_budget.log_summary()
 
     return sorted(results, key=lambda r: r["fit_score"], reverse=True)
 

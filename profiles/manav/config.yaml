@@ -181,20 +181,55 @@ routing:
   log_routing_decisions: true
   # Three-tier routing: high-confidence jobs use a cheap fast model;
   # uncertain/low-confidence jobs get the quality model for deeper analysis.
+  # primary_model selects the first-choice provider/model for each tier.
+  # quality_mode is kept for backwards compatibility with non-budget code paths.
   tiers:
     high:
       min_reranker: 0.40
       require_title_match: true
+      primary_model: "groq/llama-3.1-8b-instant"
       quality_mode: fast
       max_tokens: 500
     medium:
       min_reranker: 0.25
+      primary_model: "groq/llama-4-scout-17b-16e-instruct"
       quality_mode: fast
-      max_tokens: 700
+      max_tokens: 800
     low:
-      min_reranker: 0.0
+      min_reranker: 0.18
+      primary_model: "gemini/gemini-2.5-flash"
       quality_mode: quality
-      max_tokens: 900
+      max_tokens: 1200
+
+  # Provider fallback chain — when a tier's primary_model budget is exhausted or
+  # the provider returns a 429, the router tries these providers in order.
+  # openai is included but skipped at runtime if OPENAI_API_KEY is not set.
   fallback_chain:
-    - groq/llama-3.1-8b-instant
-    - groq/llama-4-scout-17b
+    - groq
+    - gemini
+    - cerebras
+    - openai
+    - openrouter
+    - mistral
+
+  # Per-run budget caps — conservative limits that fit comfortably within each
+  # provider's free-tier daily quota, leaving headroom for other uses of the key.
+  rate_limit_budget:
+    groq:
+      max_requests_per_run: 15
+      max_tokens_per_run: 75000
+    gemini:
+      max_requests_per_run: 12
+      max_tokens_per_run: 100000
+    cerebras:
+      max_requests_per_run: 10
+      max_tokens_per_run: 80000
+    openai:
+      max_requests_per_run: 5
+      max_tokens_per_run: 40000
+    openrouter:
+      max_requests_per_run: 15
+      max_tokens_per_run: 100000
+    mistral:
+      max_requests_per_run: 3
+      max_tokens_per_run: 20000
