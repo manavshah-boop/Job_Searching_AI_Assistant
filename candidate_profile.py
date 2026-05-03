@@ -191,6 +191,44 @@ Rules:
     if is_intern:
         profile_dict["intern_pay_preference"] = _normalize_intern_pay_preference(prefs.get("compensation", {}))
 
+    # Name fallback — LLM tool_use recovery sometimes returns "" for name.
+    if not str(profile_dict.get("name") or "").strip():
+        profile_dict["name"] = profile_cfg.get("name") or "Candidate"
+
+    # Enrich with deterministic skill extraction from the resume text. The LLM
+    # output is unreliable on Groq tool_use (recovery is non-deterministic and
+    # often returns bio-flavored phrases like "Cloud-native systems" instead of
+    # crisp tokens). Running a regex pass over the resume guarantees the profile
+    # carries concrete skills the scoring prompt and ATS matcher can actually use.
+    try:
+        from skill_extraction import extract_skills
+        extracted = extract_skills(resume_text or "")
+
+        def _merge(existing: list, additions: list) -> list:
+            seen = {str(item).strip().lower() for item in existing if item}
+            merged = list(existing or [])
+            for item in additions:
+                if item and item.lower() not in seen:
+                    merged.append(item)
+                    seen.add(item.lower())
+            return merged
+
+        profile_dict["languages"]  = _merge(profile_dict.get("languages") or [],  extracted["languages"])
+        profile_dict["frameworks"] = _merge(profile_dict.get("frameworks") or [], extracted["frameworks"])
+        profile_dict["cloud"]      = _merge(profile_dict.get("cloud") or [],      extracted["cloud"] + extracted["databases"])
+        # Promote concrete tokens into core_skills as well — the scoring prompt
+        # uses core_skills heavily for stack_match reasoning.
+        concrete_core = (
+            extracted["languages"]
+            + extracted["frameworks"]
+            + extracted["cloud"]
+            + extracted["databases"]
+            + extracted["concepts"]
+        )
+        profile_dict["core_skills"] = _merge(profile_dict.get("core_skills") or [], concrete_core)
+    except Exception as exc:
+        logger.warning("candidate_profile | skill enrichment failed ({}); using LLM-only profile", exc)
+
     return profile_dict
 
 
