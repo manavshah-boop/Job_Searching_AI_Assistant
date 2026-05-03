@@ -28,6 +28,15 @@ from typing import Any, Optional, Type
 from loguru import logger
 from pydantic import BaseModel
 
+try:
+    import tiktoken as _tiktoken
+    _HAS_TIKTOKEN = True
+except ImportError:
+    _HAS_TIKTOKEN = False
+
+# Cache tiktoken encoders — construction is expensive (downloads vocab on first use).
+_ENCODERS: dict[str, Any] = {}
+
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
@@ -86,6 +95,43 @@ def is_rate_limit_error(exc: Exception) -> bool:
     """Return True if the exception looks like a provider rate-limit (429 / RESOURCE_EXHAUSTED)."""
     msg = str(exc)
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate_limit" in msg.lower()
+
+
+def estimate_tokens(
+    profile_text: str,
+    job_text: str,
+    max_output: int,
+    model: str = "",
+) -> int:
+    """
+    Estimate the total tokens for one LLM scoring call (input + output).
+
+    Uses tiktoken when available. Falls back to a character-count heuristic
+    (~4 chars per token) if tiktoken is not installed.
+
+    Conservative multipliers keep the estimate safely above reality so
+    ProviderBudget.can_afford() does not grant a call we cannot actually afford:
+      - input:  1.3× (covers system-prompt overhead and tokenizer rounding)
+      - output: 1.2× (max_output is a ceiling, actual output is usually less)
+    """
+    if _HAS_TIKTOKEN:
+        if "gpt" in model or "openai" in model:
+            encoding_name = "o200k_base"
+        else:
+            encoding_name = "cl100k_base"
+
+        if encoding_name not in _ENCODERS:
+            _ENCODERS[encoding_name] = _tiktoken.get_encoding(encoding_name)
+
+        enc = _ENCODERS[encoding_name]
+        try:
+            input_tokens = len(enc.encode(profile_text + " " + job_text))
+        except Exception:
+            input_tokens = (len(profile_text) + len(job_text)) // 4
+    else:
+        input_tokens = (len(profile_text) + len(job_text)) // 4
+
+    return int(input_tokens * 1.3 + max_output * 1.2)
 
 
 # ---------------------------------------------------------------------------
