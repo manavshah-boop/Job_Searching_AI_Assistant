@@ -27,7 +27,10 @@ _DEFAULT_MLFLOW_CONFIG: Dict[str, Any] = {
 
 _DEFAULT_ROUTING_CONFIG: Dict[str, Any] = {
     "enabled": False,
-    "threshold": 0.65,
+    # Matches selective_routing._DEFAULT_THRESHOLD. The ms-marco-MiniLM-L-6-v2
+    # cross-encoder emits compressed scores — 0.18 lets plausible jobs reach the
+    # LLM while a title-match boost lifts obvious roles above this floor.
+    "threshold": 0.18,
     "quality_mode": "fast",
     "log_routing_decisions": True,
 }

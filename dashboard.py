@@ -3032,18 +3032,27 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 key=f"routing_enabled_{slug}",
                 help="When on, jobs below the threshold skip the LLM and get a synthetic score.",
             )
+            # The cross-encoder ms-marco-MiniLM-L-6-v2 emits compressed scores
+            # (good matches land around 0.20–0.45). llm_threshold (per-profile) overrides
+            # the legacy threshold field; show llm_threshold if present so users can tune
+            # the value the router actually uses.
+            current_threshold = float(
+                routing_cfg.get("llm_threshold")
+                if routing_cfg.get("llm_threshold") is not None
+                else routing_cfg.get("threshold", 0.18)
+            )
             routing_threshold = st.slider(
                 "Routing threshold",
-                min_value=0.40,
+                min_value=0.05,
                 max_value=0.90,
-                value=float(routing_cfg.get("threshold", 0.65)),
-                step=0.05,
+                value=max(0.05, min(0.90, current_threshold)),
+                step=0.01,
                 key=f"routing_threshold_{slug}",
                 help=(
                     "Jobs whose cross-encoder score is below this value skip the LLM. "
                     "Lower = more LLM calls (higher quality, higher cost). "
                     "Higher = fewer LLM calls (lower cost, may miss edge cases). "
-                    "Start at 0.65 and adjust after a sanity check."
+                    "Default 0.18 works well with the ms-marco reranker."
                 ),
                 disabled=not routing_enabled_val,
             )
@@ -3126,12 +3135,15 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 callout("error", "At least one source is required", "Enable at least one source before saving.")
                 return
 
-            editable["routing"] = {
-                "enabled": routing_enabled_val,
-                "threshold": round(float(routing_threshold), 2),
-                "quality_mode": routing_quality,
-                "log_routing_decisions": routing_log,
-            }
+            existing_routing = dict(editable.get("routing") or {})
+            existing_routing["enabled"] = routing_enabled_val
+            # Write llm_threshold (the per-profile override the router actually reads
+            # when both fields are present); leave any legacy threshold field intact
+            # so other tooling that still reads it keeps working.
+            existing_routing["llm_threshold"] = round(float(routing_threshold), 2)
+            existing_routing["quality_mode"] = routing_quality
+            existing_routing["log_routing_decisions"] = routing_log
+            editable["routing"] = existing_routing
             _write_profile_config(slug, editable)
             _set_notice(slug, "success", "Settings saved for this profile.")
             invalidate_dashboard_caches()

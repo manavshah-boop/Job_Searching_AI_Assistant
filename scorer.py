@@ -541,9 +541,9 @@ Score each dimension 0–10:
 - role_fit:     How well does the job title and core responsibilities match the candidate's target roles and experience?
 - stack_match:  How well do required/preferred technologies match the candidate's skills?
 - seniority:    {seniority_desc}
-- location:     How well does the job's location/remote policy match the candidate's preferences?
+- location:     How well does the job's location/remote policy match the candidate's preferences? See location scoring rules below.
 - growth:       How strong are the growth signals? (AI-native, early-stage, interesting domain)
-- compensation: {compensation_desc}
+- compensation: {compensation_desc} See compensation scoring rules below.
 
 Scoring rules:
 - Score each dimension independently before arriving at a number. Do not let one dimension bias another.
@@ -552,6 +552,20 @@ Scoring rules:
 - Compensation below the candidate's minimum is a flag, not a disqualifier — it is often negotiable.
 - You may only score based on information explicitly present in the job posting. Do not assume or invent details.
 - reasons must contain exactly 2 to 4 short strings, never more than 4. If you have more than 4, combine the least important ones.
+
+Location scoring rules:
+- A job's office is in one of the candidate's preferred_locations (city, state, or region) → score 7–10. Treat US states broadly: e.g. San Francisco, Palo Alto, Mountain View all satisfy "California"; Brooklyn satisfies "New York"; Bellevue/Redmond satisfy "Seattle, WA" or "Washington".
+- The job offers remote and remote_ok=True → score 8–10.
+- Onsite-only in a preferred location is NOT a penalty — score the same as remote in a preferred location.
+- Onsite-only outside any preferred location → score 2–4.
+- Hybrid in a preferred location → score 7–9.
+- Only score 0–2 when the job explicitly forbids the candidate's region (e.g. EU-only, requires relocation to a country the candidate is not eligible for).
+
+Compensation scoring rules:
+- The job posting clearly states a salary/comp range that meets or exceeds the candidate's minimum → score 8–10.
+- The salary range is below the candidate's minimum → score 2–4 and flag it.
+- The job posting does NOT mention compensation at all → score 5 (neutral / unknown). Do NOT penalize for missing data — top-tier US tech companies routinely pay above minimum even when the range is unstated. Add a brief note in flags such as "Compensation not stated".
+- The posting hints at equity/perks but no base salary → score 5 (neutral) and note in flags.
 
 Return only valid JSON. No markdown fences. No preamble. No explanation.
 
@@ -877,15 +891,35 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         max_rpd=rate_config.get("max_rpd"),
     )
 
-    # Build structured profile once — counts as 1 API call toward rate limiter
+    # Build structured profile once — counts as 1 API call toward rate limiter.
+    # Use the quality-tier model when routing is enabled: the profile extraction is
+    # a one-time call and the fast tier (e.g. llama-3.1-8b-instant) fails instructor
+    # tool_use schema validation, forcing a degraded raw-text fallback that returns
+    # a weak skills list.
     logger.info("Building structured profile from resume...")
-    if instructor_client:
+    if router is not None:
+        _profile_model = router.get_model_for_quality_mode("quality") or model
+        _profile_cfg = router.apply_model_override_for_mode(config, "quality")
+        try:
+            _profile_llm_call = get_llm_client(_profile_cfg)
+        except Exception:
+            _profile_llm_call = llm_call
+        try:
+            _profile_instructor, _, _ = get_instructor_client(_profile_cfg)
+        except Exception:
+            _profile_instructor = instructor_client
+    else:
+        _profile_model = model
+        _profile_llm_call = llm_call
+        _profile_instructor = instructor_client
+
+    if _profile_instructor:
         structured_profile = build_structured_profile(
-            config, llm_call, instructor_client, 
-            model=model, temperature=config["llm"].get("temperature", 0)
+            config, _profile_llm_call, _profile_instructor,
+            model=_profile_model, temperature=config["llm"].get("temperature", 0)
         )
     else:
-        structured_profile = build_structured_profile(config, llm_call)
+        structured_profile = build_structured_profile(config, _profile_llm_call)
     limiter.record(1000)
     print_profile_summary(structured_profile)
     logger.info(
@@ -922,8 +956,9 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
             if router and _match_query:
                 _routing_score = router.compute_routing_score(job, _match_query)
                 _title_boost   = router.compute_title_boost(job)
+                _skills_boost  = router.compute_skills_boost(job)
                 title_matched  = _title_boost > 0
-                _effective     = _routing_score + _title_boost
+                _effective     = _routing_score + _title_boost + _skills_boost
 
                 if not router.should_call_llm(_effective):
                     result = router.create_synthetic_score(
