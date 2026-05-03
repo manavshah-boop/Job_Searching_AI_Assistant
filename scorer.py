@@ -523,16 +523,17 @@ CANDIDATE PROFILE:
 {job.raw_text}
 
 --- TASK ---
-Step 1 — Hard disqualifier check.
+Step 1 — Hard disqualifier check. Be CONSERVATIVE — only disqualify when the posting EXPLICITLY contains the disqualifying language. Do not infer or assume.
 Set "disqualified" to true and fill "disqualify_reason" if ANY of the following apply:
-- Requires a security clearance (TS/SCI, government clearance, etc.)
-- Explicitly requires on-site relocation with no remote option
-- Requires a master's degree or PhD as a hard requirement (not just preferred)
+- Requires a security clearance — only when the JD literally mentions one of: "security clearance", "TS/SCI", "Top Secret", "government clearance", "DoD clearance", "ITAR", "polygraph". If none of those phrases appear verbatim, do NOT disqualify on this ground.
+- Explicitly requires on-site relocation with no remote option — only when the JD says "no remote", "must be on-site only", "relocation required", or similar.
+- Requires a master's degree or PhD as a hard requirement (not just preferred) — phrases like "MS required", "PhD required", "graduate degree required". Do NOT disqualify when the JD says "MS preferred" or "PhD a plus".
 - Requires more than {max_yoe} years of experience as a hard minimum{disqualifier_intern_rule}
 
 Important interpretation notes:
 - Do NOT treat "currently pursuing", "working toward", or "enrolled in" a bachelor's/master's degree as an advanced-degree disqualifier for internship candidates.
 - Do NOT disqualify internship postings just because they mention students, graduation dates, or being in school.
+- When unsure, prefer disqualified=false. A bad disqualification wastes a real candidate; a missed disqualification is a small annoyance.
 
 If disqualified, set all dimension scores to 0 and skip Step 2.
 
@@ -613,6 +614,29 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
             raise  # re-raise so score_all_jobs can record the error
 
     if dims.get("disqualified"):
+        reason = str(dims.get("disqualify_reason", "unknown disqualifier") or "")
+        # Post-validation: smaller fast-tier models (e.g. llama-3.1-8b-instant)
+        # occasionally hallucinate a "security clearance" disqualifier on JDs that
+        # don't mention one. Require the JD to contain at least one explicit
+        # clearance phrase before trusting it. If unsupported, override to not
+        # disqualified and let the LLM's actual dimension scores apply.
+        job_lower_check = (job.raw_text or "").lower()
+        clearance_phrases = (
+            "security clearance", "ts/sci", "top secret", "government clearance",
+            "dod clearance", "itar", "polygraph",
+        )
+        reason_l = reason.lower()
+        if "clearance" in reason_l or "ts/sci" in reason_l or "polygraph" in reason_l:
+            if not any(p in job_lower_check for p in clearance_phrases):
+                logger.warning(
+                    "scorer | hallucinated security-clearance disqualifier suppressed for job={} (JD has no clearance keywords)",
+                    job.id,
+                )
+                dims["disqualified"] = False
+                dims["disqualify_reason"] = ""
+                # Fall through to normal scoring below.
+
+    if dims.get("disqualified"):
         reason = dims.get("disqualify_reason", "unknown disqualifier")
         return {
             "disqualified": True,
@@ -623,9 +647,9 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
                 "role_fit": 0, "stack_match": 0, "seniority": 0,
                 "location": 0, "growth": 0, "compensation": 0,
             },
-            "reasons": [],
-            "flags": [f"disqualified: {reason}"],
-            "one_liner": "",
+            "reasons": [f"Hard disqualifier: {reason}"],
+            "flags": [f"Disqualified — {reason}"],
+            "one_liner": f"Disqualified: {reason}",
         }
 
     # Weighted fit score computed in Python — not by the LLM
@@ -678,27 +702,50 @@ def compute_ats_score(
 
     Falls back to word-level resume matching when no structured profile is given.
     """
-    job_lower = (job.raw_text or "").lower()
-    des_skills = [s.lower() for s in config["preferences"].get("desired_skills", [])]
+    from skill_extraction import extract_skills, text_has_skill
+
+    job_text  = job.raw_text or ""
+    job_lower = job_text.lower()
+    des_skills = [s for s in config["preferences"].get("desired_skills", [])]
 
     if structured_profile:
-        all_skills: list[str] = (
-            [s.lower() for s in structured_profile.get("core_skills", [])]
-            + [s.lower() for s in structured_profile.get("languages", [])]
-            + [s.lower() for s in structured_profile.get("frameworks", [])]
-            + [s.lower() for s in structured_profile.get("cloud", [])]
-        )
-        if not all_skills:
+        # Build the candidate's canonical skill set (deduped, lowercased).
+        candidate_set: set[str] = set()
+        for bucket in ("core_skills", "languages", "frameworks", "cloud"):
+            for item in structured_profile.get(bucket, []) or []:
+                k = str(item).strip().lower()
+                if k:
+                    candidate_set.add(k)
+
+        if not candidate_set:
             return {"ats_score": 0, "skill_misses": []}
 
-        found_count = sum(1 for s in all_skills if s in job_lower)
-        all_skills_set = set(all_skills)
-        # Skills the job wants that didn't appear in the structured profile
+        # Run the same extractor over the JD to find canonical skills it asks for.
+        # This makes the ATS metric "what fraction of skills the JD wants does the
+        # candidate have?" — independent of how rich the candidate's profile is.
+        jd_extracted = extract_skills(job_text)
+        jd_canon: list[str] = (
+            jd_extracted["languages"] + jd_extracted["frameworks"]
+            + jd_extracted["cloud"] + jd_extracted["databases"]
+            + jd_extracted["concepts"]
+        )
+
+        if not jd_canon:
+            # JD has no extractable skill tokens — fall back to coverage of the
+            # configured desired_skills list so we still produce a meaningful number.
+            wanted = [s for s in des_skills if text_has_skill(job_text, s)]
+            covered = [s for s in wanted if text_has_skill(" ".join(candidate_set), s)]
+            ats_score = min(100, int(len(covered) / max(1, len(wanted) or 1) * 100)) if wanted else 0
+        else:
+            covered = [s for s in jd_canon if s.lower() in candidate_set]
+            ats_score = min(100, int(len(covered) / max(1, len(jd_canon)) * 100))
+
+        # Skills the JD wants that the candidate doesn't have (canonical view).
         skill_misses = [
-            s for s in des_skills
-            if s in job_lower and s not in all_skills_set
+            s for s in (jd_canon if jd_canon else des_skills)
+            if (s.lower() not in candidate_set if jd_canon
+                else text_has_skill(job_text, s) and not text_has_skill(" ".join(candidate_set), s))
         ][:5]
-        ats_score = min(100, int(found_count / max(1, len(all_skills)) * 100))
         return {"ats_score": ats_score, "skill_misses": skill_misses}
 
     # Fallback: word-level overlap between job description and raw resume text
