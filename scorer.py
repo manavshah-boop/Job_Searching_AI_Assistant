@@ -748,9 +748,24 @@ def compute_ats_score(
         ][:5]
         return {"ats_score": ats_score, "skill_misses": skill_misses}
 
-    # Fallback: word-level overlap between job description and raw resume text
-    resume_text = (config["profile"].get("resume") or "").lower()
+    # Fallback: word-level overlap between job description and raw resume text.
+    # Defensive .get on "profile" — tests construct configs without it, and the
+    # synthetic-score path may call this before the dashboard has populated one.
+    resume_text = (config.get("profile", {}).get("resume") or "").lower()
     job_text = job_lower
+
+    # Last-resort path: no structured profile AND no resume. Score against the
+    # candidate's desired_skills list using canonical text_has_skill so that
+    # multi-word configured phrases (e.g. "Machine Learning") match JD aliases
+    # like "ML" or "machine-learning". Without this branch ATS would silently
+    # be 0 whenever no resume is loaded.
+    if not resume_text:
+        if not des_skills:
+            return {"ats_score": 0, "skill_misses": []}
+        present = [s for s in des_skills if text_has_skill(job_text, s)]
+        ats_score = min(100, int(len(present) / max(1, len(des_skills)) * 100))
+        # No "skill_misses" notion here — we don't know what the candidate has.
+        return {"ats_score": ats_score, "skill_misses": []}
 
     stopwords = {
         "and", "or", "the", "a", "an", "to", "of", "in",
@@ -804,10 +819,16 @@ def score_job(
         base["flags"] = [f"scrape_filtered: {job.scrape_filter_reason}"]
         return base
 
-    # Stage 1: keyword pre-score — skip LLM call if no skill overlap
-    if keyword_prescore(job, config) < 0.15:
-        base["flags"] = ["no skill overlap"]
-        return base
+    # Stage 1: keyword pre-score — only meaningful when selective routing is OFF.
+    # When routing is enabled, the cross-encoder + title/skills boosts already make
+    # a much better LLM-vs-skip decision, and this gate uses naive `s.lower() in text`
+    # substring matching that mis-fires on multi-word desired_skills phrases like
+    # "Machine learning infrastructure" — silently zeroing genuinely good matches
+    # the router has already approved (CRIT-3 in the audit).
+    if not config.get("routing", {}).get("enabled", False):
+        if keyword_prescore(job, config) < 0.15:
+            base["flags"] = ["no skill overlap"]
+            return base
 
     # Stage 2: merged disqualifier + dimension scoring (single LLM call)
     result = score_dimensions(
@@ -968,6 +989,13 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
     else:
         structured_profile = build_structured_profile(config, _profile_llm_call)
     limiter.record(1000)
+
+    # Hand the structured profile to the router so the synthetic path's _quick_ats
+    # can use canonical-skill matching (otherwise multi-word skill phrases like
+    # "Machine learning infrastructure" never match real JDs and ATS scores deflate).
+    if router is not None:
+        router.set_structured_profile(structured_profile)
+
     print_profile_summary(structured_profile)
     logger.info(
         f"Profile: {structured_profile.get('name')} | "
@@ -1090,9 +1118,13 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
                         _provider_budget.spend(_sel_provider, _est_tokens)
 
                         router.record_llm_call()
-                        _is_fallback = _sel_provider != (
-                            tier.get("primary_model", "/").split("/")[0]
+                        _tier_primary = tier.get("primary_model", "")
+                        _tier_primary_provider = (
+                            _tier_primary.split("/", 1)[0] if "/" in _tier_primary else ""
                         )
+                        _is_fallback = bool(
+                            _tier_primary_provider
+                        ) and _sel_provider != _tier_primary_provider
                         if router.log_decisions:
                             logger.info(
                                 "routing | job={} company={} tier={} model={}/{} "

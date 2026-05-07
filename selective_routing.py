@@ -26,7 +26,19 @@ from loguru import logger
 
 from db import Job
 
-# ── Cross-encoder model cache (module-level; separate from reranker._MODEL_CACHE) ─
+# ── Cross-encoder model cache ─────────────────────────────────────────────────
+# Shared with reranker so we don't load the same ~150MB model twice on the
+# 1GB e2-micro deployment. Importing reranker._MODEL_CACHE directly would
+# create a hard import-time dependency; we rebind through a lazy accessor.
+def _shared_model_cache() -> dict[str, Any]:
+    try:
+        from reranker import _MODEL_CACHE as _RERANKER_CACHE
+        return _RERANKER_CACHE
+    except Exception:
+        # Fallback to module-local cache if reranker is unavailable
+        # (e.g. tests that import selective_routing in isolation).
+        return _MODEL_CACHE
+
 
 _MODEL_CACHE: dict[str, Any] = {}
 
@@ -119,7 +131,8 @@ def _sigmoid(x: float) -> float:
 
 
 def _load_cross_encoder(model_name: str) -> Any:
-    if model_name not in _MODEL_CACHE:
+    cache = _shared_model_cache()
+    if model_name not in cache:
         try:
             from sentence_transformers import CrossEncoder
         except ImportError as exc:
@@ -131,8 +144,8 @@ def _load_cross_encoder(model_name: str) -> Any:
         model = CrossEncoder(model_name, device="cpu")
         if hasattr(model, "max_length"):
             model.max_length = 512
-        _MODEL_CACHE[model_name] = model
-    return _MODEL_CACHE[model_name]
+        cache[model_name] = model
+    return cache[model_name]
 
 
 # ── Config dataclass ──────────────────────────────────────────────────────────
@@ -178,8 +191,15 @@ class SelectiveRouter:
         )
         self._encoder: Any = None
         self._match_query: str = ""
+        # Structured profile (LLM-extracted canonical skills) for canonical ATS
+        # matching in _quick_ats. Populated by score_all_jobs after build_structured_profile.
+        self._structured_profile: Optional[dict[str, Any]] = None
         self._counts: dict[str, int] = {"llm": 0, "skipped": 0, "error": 0}
         self._synthetic_routing_scores: list[float] = []  # for domain suitability diagnostic
+
+    def set_structured_profile(self, profile: Optional[dict[str, Any]]) -> None:
+        """Cache the LLM-extracted candidate profile so synthetic scoring can do canonical ATS."""
+        self._structured_profile = profile
 
     # ── Encoder ───────────────────────────────────────────────────────────────
 
@@ -335,10 +355,25 @@ class SelectiveRouter:
           medium — moderate score → standard fast model
           low    — low score or complex job → quality model for deeper analysis
 
-        Returns {'tier': str, 'quality_mode': str, 'max_tokens': int}.
+        Returns the full tier config so downstream code (notably
+        select_model_with_fallback) can read primary_model and require_title_match
+        without re-reading raw config. Keys returned:
+          tier, quality_mode, max_tokens, primary_model, require_title_match
         """
         tiers = self._config.get("routing", {}).get("tiers", _DEFAULT_TIERS)
         complexity = self.compute_complexity_score(job_text)
+
+        def _resolved(name: str, defaults: dict[str, Any]) -> dict[str, Any]:
+            cfg = tiers.get(name, defaults)
+            return {
+                "tier": name,
+                "quality_mode": cfg.get("quality_mode", defaults.get("quality_mode", "fast")),
+                "max_tokens": cfg.get("max_tokens", defaults.get("max_tokens", 500)),
+                "primary_model": cfg.get("primary_model", defaults.get("primary_model", "")),
+                "require_title_match": cfg.get(
+                    "require_title_match", defaults.get("require_title_match", False)
+                ),
+            }
 
         high = tiers.get("high", _DEFAULT_TIERS["high"])
         if (
@@ -346,26 +381,13 @@ class SelectiveRouter:
             and (not high.get("require_title_match", True) or title_matched)
             and complexity <= 0.7
         ):
-            return {
-                "tier": "high",
-                "quality_mode": high.get("quality_mode", "fast"),
-                "max_tokens": high.get("max_tokens", 500),
-            }
+            return _resolved("high", _DEFAULT_TIERS["high"])
 
         medium = tiers.get("medium", _DEFAULT_TIERS["medium"])
         if effective_score >= medium.get("min_reranker", 0.25):
-            return {
-                "tier": "medium",
-                "quality_mode": medium.get("quality_mode", "fast"),
-                "max_tokens": medium.get("max_tokens", 700),
-            }
+            return _resolved("medium", _DEFAULT_TIERS["medium"])
 
-        low = tiers.get("low", _DEFAULT_TIERS["low"])
-        return {
-            "tier": "low",
-            "quality_mode": low.get("quality_mode", "quality"),
-            "max_tokens": low.get("max_tokens", 900),
-        }
+        return _resolved("low", _DEFAULT_TIERS["low"])
 
     # ── Section detection ─────────────────────────────────────────────────────
 
@@ -551,14 +573,37 @@ class SelectiveRouter:
         }
 
     def _quick_ats(self, job: Job) -> int:
-        """Cheap ATS keyword count without the full compute_ats_score logic."""
-        prefs = self._config.get("preferences", {})
-        skills = prefs.get("desired_skills", [])
-        if not skills or not job.raw_text:
+        """
+        ATS score for the synthetic path. Delegates to scorer.compute_ats_score so
+        synthetic and LLM-scored jobs use the same canonical-skill matching logic.
+
+        Falling back to a naive `s.lower() in raw_text` check would understate the
+        score for any multi-word skill phrase (e.g. "Machine learning infrastructure"
+        rarely appears verbatim in JDs even when the role is a perfect fit) — that
+        was CRIT-2 in the audit.
+        """
+        if not job.raw_text:
             return 0
-        raw_lower = job.raw_text.lower()
-        hits = sum(1 for s in skills if s.lower() in raw_lower)
-        return min(100, int(hits / max(1, len(skills)) * 100))
+        try:
+            from scorer import compute_ats_score  # lazy: avoid circular import at module load
+        except Exception as exc:
+            logger.warning(
+                "_quick_ats | could not import compute_ats_score ({}); using fallback", exc,
+            )
+            prefs = self._config.get("preferences", {})
+            skills = prefs.get("desired_skills", [])
+            if not skills:
+                return 0
+            raw_lower = job.raw_text.lower()
+            hits = sum(1 for s in skills if s.lower() in raw_lower)
+            return min(100, int(hits / max(1, len(skills)) * 100))
+
+        try:
+            result = compute_ats_score(job, self._config, self._structured_profile)
+            return int(result.get("ats_score", 0))
+        except Exception as exc:
+            logger.warning("_quick_ats | compute_ats_score failed ({}); returning 0", exc)
+            return 0
 
     # ── Model override ────────────────────────────────────────────────────────
 

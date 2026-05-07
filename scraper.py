@@ -546,11 +546,26 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
                         # If we can't parse the date, continue processing (don't skip)
                         pass
                 
-                job_id = job_posting.get('id')
-                title = job_posting.get('title', '')
-                location = job_posting.get('location', {}).get('name', 'Unknown')
-                url = job_posting.get('absolute_url', '')
-                
+                raw_id = job_posting.get('id')
+                title = (job_posting.get('title') or '').strip()
+                location = (job_posting.get('location') or {}).get('name', 'Unknown') or 'Unknown'
+                url = (job_posting.get('absolute_url') or '').strip()
+
+                # HIGH-1: Greenhouse occasionally returns postings without an `id`.
+                # The previous code did `job_posting["id"]` → unhandled KeyError → entire
+                # company scrape aborts. Skip the row and keep going instead.
+                # HIGH-3: also drop rows with empty title or URL — both are required
+                # downstream (title filtering, dashboard click-through).
+                if raw_id in (None, "", 0):
+                    logger.warning("greenhouse | %s skipped row with missing id", company_slug)
+                    continue
+                if not title:
+                    logger.warning("greenhouse | %s skipped row id=%s with empty title", company_slug, raw_id)
+                    continue
+                if not url:
+                    logger.warning("greenhouse | %s skipped row id=%s with empty url", company_slug, raw_id)
+                    continue
+
                 # Skip if title doesn't match
                 if not title_matches(title, preferred_titles):
                     continue
@@ -581,7 +596,7 @@ Description:
                     continue
 
                 # Pre-filter (title blocklist, YOE, US location)
-                job_id = make_id("greenhouse", str(job_posting["id"]))
+                job_id = make_id("greenhouse", str(raw_id))
                 passed, filter_reason = passes_filters(full_text, title, location, config, source="greenhouse", debug=True)
                 if not passed:
                     jobs_filtered += 1
@@ -675,11 +690,24 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 if _is_posted_at_older_than(posting.get('createdAt'), max_age):
                     continue
 
-                title = posting.get('text', '')
-                categories = posting.get('categories', {})
-                location = categories.get('location', 'Unknown')
-                workplace_type = posting.get('workplaceType', '')
-                url = posting.get('hostedUrl', '')
+                raw_id = posting.get('id')
+                title = (posting.get('text') or '').strip()
+                categories = posting.get('categories', {}) or {}
+                location = categories.get('location', 'Unknown') or 'Unknown'
+                workplace_type = posting.get('workplaceType', '') or ''
+                url = (posting.get('hostedUrl') or '').strip()
+
+                # HIGH-1/3: skip rows with missing required fields rather than
+                # crashing the whole company scrape on a KeyError.
+                if raw_id in (None, "", 0):
+                    logger.warning("lever | %s skipped row with missing id", slug)
+                    continue
+                if not title:
+                    logger.warning("lever | %s skipped row id=%s with empty title", slug, raw_id)
+                    continue
+                if not url:
+                    logger.warning("lever | %s skipped row id=%s with empty url", slug, raw_id)
+                    continue
 
                 # Skip if title doesn't match
                 if not title_matches(title, preferred_titles):
@@ -715,7 +743,7 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 ):
                     effective_location = "Remote"
 
-                job_id = make_id("lever", posting["id"])
+                job_id = make_id("lever", str(raw_id))
                 passed, filter_reason = passes_filters(full_text, title, effective_location, config, source="lever", debug=True)
                 if not passed:
                     jobs_filtered += 1
@@ -1057,9 +1085,17 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 if _is_posted_at_older_than(published_at, max_age):
                     continue
 
-                title = posting.get("title", "")
+                title = (posting.get("title") or "").strip()
                 location = _ashby_location(posting)
-                job_url = posting.get("jobUrl", "")
+                job_url = (posting.get("jobUrl") or "").strip()
+
+                # HIGH-3: skip rows missing title or URL — both are required downstream.
+                if not title:
+                    logger.warning("ashby | %s skipped row with empty title", resolved_slug)
+                    continue
+                if not job_url:
+                    logger.warning("ashby | %s skipped row title=%r with empty url", resolved_slug, title)
+                    continue
 
                 if not title_matches(title, preferred_titles):
                     continue
@@ -1247,11 +1283,19 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
                 if _is_posted_at_older_than(posted_at, max_age):
                     continue
 
-                title = posting.get("title", "")
+                title = (posting.get("title") or "").strip()
                 telecommuting = bool(posting.get("telecommuting"))
                 location = _workable_location(posting)
 
-                job_url = posting.get("url") or posting.get("shortlink") or posting.get("application_url") or ""
+                job_url = (posting.get("url") or posting.get("shortlink") or posting.get("application_url") or "").strip()
+
+                # HIGH-3: skip rows missing required title or URL.
+                if not title:
+                    logger.warning("workable | %s skipped row with empty title", slug)
+                    continue
+                if not job_url:
+                    logger.warning("workable | %s skipped row title=%r with empty url", slug, title)
+                    continue
 
                 if not title_matches(title, preferred_titles):
                     continue
@@ -1403,10 +1447,18 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
             if _is_posted_at_older_than(posting.get("pubDate"), max_age):
                 continue
 
-            title = posting.get("title", "")
+            title = (posting.get("title") or "").strip()
             company_name = _himalayas_company(posting)
             location = _himalayas_location(posting)
-            job_url = _himalayas_url(posting)
+            job_url = (_himalayas_url(posting) or "").strip()
+
+            # HIGH-3: skip rows missing required title or URL.
+            if not title:
+                logger.warning("himalayas | skipped row with empty title")
+                continue
+            if not job_url:
+                logger.warning("himalayas | skipped row title=%r with empty url", title)
+                continue
 
             if not title_matches(title, preferred_titles):
                 jobs_filtered += 1
