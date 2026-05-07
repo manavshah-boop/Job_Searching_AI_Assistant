@@ -9,6 +9,8 @@ import html as html_module
 import httpx
 import re
 import sys
+import time
+from email.utils import parsedate_to_datetime
 
 # Ensure Unicode output works on Windows terminals (cp1252 -> utf-8)
 if hasattr(sys.stdout, "reconfigure"):
@@ -24,6 +26,119 @@ from theirstack import get_or_discover_slugs
 
 GREENHOUSE_API_BASE = "https://boards-api.greenhouse.io/v1/boards"
 HN_ALGOLIA_URL = "https://hn.algolia.com/api/v1/search"
+
+
+# ---------------------------------------------------------------------------
+# HIGH-2: Retry-with-backoff for transient HTTP failures
+# ---------------------------------------------------------------------------
+
+# Module-level sleep alias so tests can monkey-patch scraper._sleep to a no-op
+# instead of waiting through real exponential backoff during retry tests.
+_sleep = time.sleep
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header value (delta-seconds or HTTP-date) → seconds."""
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        target = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if target is None:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    delta = (target - datetime.now(tz=timezone.utc)).total_seconds()
+    return max(0.0, delta)
+
+
+def _get_with_retry(
+    client: httpx.Client,
+    url: str,
+    *,
+    max_attempts: int = 3,
+    base_backoff: float = 1.0,
+    max_backoff: float = 30.0,
+    **kwargs: Any,
+) -> httpx.Response:
+    """
+    GET with exponential-backoff retry on transient HTTP failures.
+
+    Retries on:
+      - network errors (httpx.HTTPError, including ReadTimeout / ConnectError)
+      - HTTP 5xx
+      - HTTP 429 (rate limit). Honors `Retry-After` header if present;
+        otherwise backs off twice as long as a normal 5xx retry.
+
+    Does NOT retry on other 4xx (403/404 are permanent for the caller).
+
+    Returns the final httpx.Response so the existing per-call non-200 handling
+    in each scraper (errors.append + continue) stays in charge of the
+    "permanent failure" path. Re-raises the last httpx.HTTPError if every
+    attempt failed at the network layer.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.get(url, **kwargs)
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                raise
+            backoff = min(base_backoff * (2 ** (attempt - 1)), max_backoff)
+            logger.warning(
+                "GET %s attempt %d/%d failed (%s) — retrying in %.1fs",
+                url, attempt, max_attempts, exc, backoff,
+            )
+            _sleep(backoff)
+            continue
+
+        status = response.status_code
+
+        if status == 429:
+            if attempt >= max_attempts:
+                logger.warning("GET %s — HTTP 429 after %d attempts, giving up", url, attempt)
+                return response
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            if retry_after is not None:
+                backoff = min(retry_after, max_backoff)
+                reason = f"Retry-After={retry_after:.1f}s"
+            else:
+                # No header → back off twice as long as a normal retry
+                backoff = min(base_backoff * (2 ** attempt), max_backoff)
+                reason = "no Retry-After"
+            logger.warning(
+                "GET %s — HTTP 429 (%s) attempt %d/%d, retrying in %.1fs",
+                url, reason, attempt, max_attempts, backoff,
+            )
+            _sleep(backoff)
+            continue
+
+        if 500 <= status < 600:
+            if attempt >= max_attempts:
+                logger.warning("GET %s — HTTP %d after %d attempts, giving up", url, status, attempt)
+                return response
+            backoff = min(base_backoff * (2 ** (attempt - 1)), max_backoff)
+            logger.warning(
+                "GET %s — HTTP %d attempt %d/%d, retrying in %.1fs",
+                url, status, attempt, max_attempts, backoff,
+            )
+            _sleep(backoff)
+            continue
+
+        # 2xx, 3xx, or non-429 4xx (incl. 403/404): not transient, return as-is.
+        return response
+
+    # Loop exit without return — only reachable if max_attempts < 1.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("retry loop exited without response")
 
 
 def strip_html(html_text: str) -> str:
@@ -318,6 +433,22 @@ def _is_posted_at_older_than(value: Any, max_age: timedelta) -> bool:
     return datetime.now(tz=timezone.utc) - posted_at > max_age
 
 
+def _truncate_with_log(text: str, max_chars: int, job_id: Optional[str] = None) -> str:
+    """
+    Wrap extract_job_context() with a debug log when truncation actually shortened
+    the text (MED-8). Lets users see when scoring may be operating on partial data.
+    """
+    truncated = extract_job_context(text, max_chars=max_chars)
+    if text and len(truncated) < len(text):
+        logger.debug(
+            "description truncated | job_id=%s | %d -> %d chars",
+            job_id or "?",
+            len(text),
+            len(truncated),
+        )
+    return truncated
+
+
 def _build_raw_text(
     *,
     title: str,
@@ -326,6 +457,7 @@ def _build_raw_text(
     url: str,
     description: str,
     max_chars: int = 2000,
+    job_id: Optional[str] = None,
 ) -> str:
     raw_text = f"""Title: {title}
 Company: {company}
@@ -334,7 +466,7 @@ URL: {url}
 
 Description:
 {description}""".strip()
-    return extract_job_context(raw_text, max_chars=max_chars)
+    return _truncate_with_log(raw_text, max_chars, job_id=job_id)
 
 
 def _insert_scraped_job(
@@ -518,10 +650,10 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
         companies_checked += 1
         try:
             url = f"{GREENHOUSE_API_BASE}/{company_slug}/jobs?content=true"
-            
+
             with httpx.Client(timeout=10.0) as client:
-                response = client.get(url)
-            
+                response = _get_with_retry(client, url)
+
             if response.status_code != 200:
                 errors.append(f"[!] {company_slug}: HTTP {response.status_code}")
                 continue
@@ -545,7 +677,7 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
                     except (ValueError, TypeError):
                         # If we can't parse the date, continue processing (don't skip)
                         pass
-                
+
                 raw_id = job_posting.get('id')
                 title = (job_posting.get('title') or '').strip()
                 location = (job_posting.get('location') or {}).get('name', 'Unknown') or 'Unknown'
@@ -575,7 +707,9 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
                 description = job_posting.get('content', '') or job_posting.get('description', '')
                 description_clean = strip_html(description)
 
-                # Cap raw_text at ~3500 chars
+                job_id = make_id("greenhouse", str(raw_id))
+
+                # Cap raw_text at ~2000 chars (MED-8: log when truncation actually shortened it)
                 raw_text = f"""
 Title: {title}
 Company: {company_slug.upper()}
@@ -586,7 +720,7 @@ Description:
 {description_clean}
 """.strip()
 
-                raw_text = extract_job_context(raw_text, max_chars=2000)
+                raw_text = _truncate_with_log(raw_text, 2000, job_id=job_id)
 
                 # Check for hard no keywords in full posting
                 full_text = title + " " + description_clean
@@ -596,7 +730,6 @@ Description:
                     continue
 
                 # Pre-filter (title blocklist, YOE, US location)
-                job_id = make_id("greenhouse", str(raw_id))
                 passed, filter_reason = passes_filters(full_text, title, location, config, source="greenhouse", debug=True)
                 if not passed:
                     jobs_filtered += 1
@@ -672,7 +805,7 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
         companies_checked += 1
         try:
             with httpx.Client(timeout=10.0) as client:
-                response = client.get(f"{LEVER_API_BASE}/{slug}?mode=json")
+                response = _get_with_retry(client, f"{LEVER_API_BASE}/{slug}?mode=json")
 
             if response.status_code != 200:
                 errors.append(f"[!] {slug}: HTTP {response.status_code}")
@@ -720,6 +853,8 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 )
                 description_clean = strip_html(description_html + ' ' + lists_html)
 
+                job_id = make_id("lever", str(raw_id))
+
                 workplace_note = f"\nWorkplace: {workplace_type}" if workplace_type else ""
                 raw_text = _build_raw_text(
                     title=title,
@@ -727,6 +862,7 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     location=f"{location}{workplace_note}",
                     url=url,
                     description=description_clean,
+                    job_id=job_id,
                 )
 
                 full_text = title + " " + description_clean
@@ -742,8 +878,6 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     signal in location.lower() for signal in NON_US_SIGNALS
                 ):
                     effective_location = "Remote"
-
-                job_id = make_id("lever", str(raw_id))
                 passed, filter_reason = passes_filters(full_text, title, effective_location, config, source="lever", debug=True)
                 if not passed:
                     jobs_filtered += 1
@@ -807,6 +941,16 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
     preferred_titles = _preferred_titles(config)
     hard_no_keywords = preferences.get('hard_no_keywords', [])
 
+    # MED-9: configurable HN top-level-comment cap. Threads regularly exceed
+    # 100 comments; the previous hard-coded slice silently dropped the rest.
+    hn_cfg = config.get("sources", {}).get("hn", {}) or {}
+    try:
+        max_comments = int(hn_cfg.get("max_comments", 100))
+    except (TypeError, ValueError):
+        max_comments = 100
+    if max_comments <= 0:
+        max_comments = 100
+
     new_jobs_saved = 0
     jobs_scraped = 0
     jobs_filtered = 0
@@ -821,7 +965,7 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             # Step 1: Find the latest "Who is Hiring?" thread from last 45 days
             forty_five_days_ago = datetime.now() - timedelta(days=45)
             forty_five_days_ago_unix = int(forty_five_days_ago.timestamp())
-            
+
             search_params = {
                 "query": "Who is Hiring?",
                 "tags": "story",
@@ -829,8 +973,8 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
                 "numericFilters": f"created_at_i>{forty_five_days_ago_unix}"
             }
 
-            response = client.get(HN_ALGOLIA_URL, params=search_params)
-            
+            response = _get_with_retry(client, HN_ALGOLIA_URL, params=search_params)
+
             if response.status_code != 200:
                 errors.append(f"[!] HN search failed: HTTP {response.status_code}")
                 return {
@@ -843,10 +987,10 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
 
             data = response.json()
             hits = data.get('hits', [])
-            
+
             # Filter for whoishiring posts and find the latest
             whoishiring_posts = [hit for hit in hits if hit.get('author') == 'whoishiring']
-            
+
             if not whoishiring_posts:
                 logger.warning("No 'Who is Hiring?' threads found in the last 45 days")
                 logger.warning("This might mean the monthly thread hasn't been posted yet, or there could be an issue with the HN API.")
@@ -863,17 +1007,17 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             thread = whoishiring_posts[0]
             thread_id = thread['objectID']
             thread_title = thread['title']
-            
+
             logger.info("Found thread: %s", thread_title)
             logger.info("Thread ID: %s", thread_id)
 
             # Step 2: Fetch top-level comments using HN Firebase API
             hn_api_base = "https://hacker-news.firebaseio.com/v0"
-            
+
             # Get thread details to find comment IDs
             thread_url = f"{hn_api_base}/item/{thread_id}.json"
-            response = client.get(thread_url)
-            
+            response = _get_with_retry(client, thread_url)
+
             if response.status_code != 200:
                 errors.append(f"[!] HN thread fetch failed: HTTP {response.status_code}")
                 return {
@@ -886,16 +1030,26 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
 
             thread_data = response.json()
             comment_ids = thread_data.get('kids', [])
-            
+
             logger.info("Found %d top-level comments", len(comment_ids))
 
-            for comment_id in comment_ids[:100]:  # Limit to first 100 to avoid too many requests
+            # MED-9: warn when the configured cap drops posts. Default cap is 100;
+            # threads near the end of the month frequently exceed it.
+            if len(comment_ids) > max_comments:
+                logger.warning(
+                    "HN cap hit: thread has %d comments, processing first %d "
+                    "(set sources.hn.max_comments to raise the cap)",
+                    len(comment_ids),
+                    max_comments,
+                )
+
+            for comment_id in comment_ids[:max_comments]:
                 comment_url = f"{hn_api_base}/item/{comment_id}.json"
-                response = client.get(comment_url)
-                
+                response = _get_with_retry(client, comment_url)
+
                 if response.status_code != 200:
                     continue  # Skip failed comment fetches
-                    
+
                 comment_data = response.json()
                 comment_text = strip_html(comment_data.get('text', '').strip())
 
@@ -918,6 +1072,8 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
                     jobs_filtered += 1
                     continue
 
+                job_id = make_id("hackernews", str(comment_id))
+
                 # Build raw_text for Claude (include full comment)
                 raw_text = f"""
 HN Job Posting
@@ -927,7 +1083,7 @@ Thread: {thread_title}
 {comment_text}
 """.strip()
 
-                raw_text = extract_job_context(raw_text, max_chars=2000)
+                raw_text = _truncate_with_log(raw_text, 2000, job_id=job_id)
 
                 # Check for hard no keywords in full posting
                 if contains_hard_no_keyword(comment_text, hard_no_keywords):
@@ -935,7 +1091,6 @@ Thread: {thread_title}
                     continue
 
                 # Pre-filter (title blocklist, YOE, hiring intent, US location)
-                job_id = make_id("hackernews", str(comment_id))
                 hn_url = f"https://news.ycombinator.com/item?id={comment_id}"
                 passed, filter_reason = passes_filters(comment_text, title, "", config, source="hackernews", debug=True)
                 if not passed:
@@ -1019,13 +1174,18 @@ def _fetch_ashby_board(
     client: httpx.Client,
     company_slug: str,
 ) -> tuple[Optional[httpx.Response], str, Optional[str]]:
-    """Fetch an Ashby board, trying exact and normalized slug variants."""
+    """Fetch an Ashby board, trying exact and normalized slug variants.
+
+    Each variant call goes through _get_with_retry so transient 5xx/429/network
+    errors on a real slug recover before we fall through to the next variant.
+    404 is not retried, so the variant loop's "try next slug on 404" still works.
+    """
     last_response = None
     last_error = None
 
     for slug_variant in _ashby_slug_variants(company_slug):
         try:
-            response = client.get(f"{ASHBY_API_BASE}/{slug_variant}")
+            response = _get_with_retry(client, f"{ASHBY_API_BASE}/{slug_variant}")
         except httpx.HTTPError as exc:
             last_error = str(exc)
             continue
@@ -1101,12 +1261,14 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     continue
 
                 description_clean = _ashby_description(posting)
+                job_id = make_id("ashby", str(posting.get("id") or job_url))
                 raw_text = _build_raw_text(
                     title=title,
                     company=resolved_slug.upper(),
                     location=location,
                     url=job_url,
                     description=description_clean,
+                    job_id=job_id,
                 )
                 full_text = title + " " + description_clean
                 jobs_scraped += 1
@@ -1114,8 +1276,6 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 if contains_hard_no_keyword(full_text, hard_no_keywords):
                     jobs_filtered += 1
                     continue
-
-                job_id = make_id("ashby", str(posting.get("id") or job_url))
                 passed, filter_reason = passes_filters(full_text, title, location, config, source="ashby", debug=True)
                 if not passed:
                     jobs_filtered += 1
@@ -1264,7 +1424,7 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
         try:
             url = f"{WORKABLE_WIDGET_API_BASE}/{slug}"
             with httpx.Client(timeout=10.0) as client:
-                response = client.get(url)
+                response = _get_with_retry(client, url)
 
             if response.status_code != 200:
                 errors.append(f"[!] {slug}: HTTP {response.status_code}")
@@ -1301,6 +1461,7 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
                     continue
 
                 description_clean = _workable_description(posting)
+                job_id = make_id("workable", _workable_job_id(posting))
 
                 workplace_note = "\nWorkplace: Remote" if telecommuting else ""
                 raw_text = _build_raw_text(
@@ -1309,6 +1470,7 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
                     location=f"{location}{workplace_note}",
                     url=job_url,
                     description=description_clean,
+                    job_id=job_id,
                 )
 
                 full_text = title + " " + description_clean
@@ -1317,8 +1479,6 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
                 if contains_hard_no_keyword(full_text, hard_no_keywords):
                     jobs_filtered += 1
                     continue
-
-                job_id = make_id("workable", _workable_job_id(posting))
                 passed, filter_reason = passes_filters(full_text, title, location, config, source="workable", debug=True)
                 if not passed:
                     jobs_filtered += 1
@@ -1427,7 +1587,7 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
 
     try:
         with httpx.Client(timeout=10.0) as client:
-            response = client.get(HIMALAYAS_API_URL)
+            response = _get_with_retry(client, HIMALAYAS_API_URL)
 
         if response.status_code != 200:
             errors.append(f"[!] Himalayas: HTTP {response.status_code}")
@@ -1467,12 +1627,14 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
             description = posting.get("description", "") or ""
             description_clean = strip_html(description)
 
+            job_id = make_id("himalayas", str(posting.get("id", job_url)))
             raw_text = _build_raw_text(
                 title=title,
                 company=company_name,
                 location=location,
                 url=job_url,
                 description=description_clean,
+                job_id=job_id,
             )
 
             full_text = title + " " + description_clean
@@ -1481,8 +1643,6 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
             if contains_hard_no_keyword(full_text, hard_no_keywords):
                 jobs_filtered += 1
                 continue
-
-            job_id = make_id("himalayas", str(posting.get("id", job_url)))
             passed, filter_reason = passes_filters(full_text, title, location, config, source="himalayas", debug=True)
             if not passed:
                 jobs_filtered += 1
