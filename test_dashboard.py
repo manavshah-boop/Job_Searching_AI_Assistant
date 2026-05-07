@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import dashboard
 import dashboard_semantic
 from progress_tracker import ProgressTracker
@@ -232,6 +234,37 @@ def test_dashboard_section_uses_private_widget_state(monkeypatch):
     state[dashboard.SECTION_WIDGET_KEY] = "Activity"
     dashboard._sync_dashboard_section_from_widget()
     assert state["dashboard_section"] == "Activity"
+
+
+def test_last_run_is_stale_when_finished_at_older_than_threshold():
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+    last_run = {
+        "status": "success",
+        "finished_at": (now - timedelta(hours=31)).isoformat(timespec="seconds"),
+    }
+    assert dashboard._last_run_is_stale(last_run, now=now) is True
+
+
+def test_last_run_not_stale_when_finished_at_is_fresh():
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+    last_run = {
+        "status": "success",
+        "finished_at": (now - timedelta(hours=12)).isoformat(timespec="seconds"),
+    }
+    assert dashboard._last_run_is_stale(last_run, now=now) is False
+
+
+def test_last_run_not_stale_when_payload_missing_or_unparsable():
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+    assert dashboard._last_run_is_stale(None, now=now) is False
+    assert dashboard._last_run_is_stale({}, now=now) is False
+    assert dashboard._last_run_is_stale({"finished_at": "not-a-date"}, now=now) is False
+
+
+def test_last_run_stale_at_exact_threshold_boundary():
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+    last_run = {"finished_at": (now - timedelta(hours=30)).isoformat(timespec="seconds")}
+    assert dashboard._last_run_is_stale(last_run, now=now) is True
 
 
 def test_render_semantic_match_panel_handles_disabled_vector_store(monkeypatch):

@@ -2,6 +2,15 @@
 Description=Job Agent Daily Worker — %i
 After=network.target
 Wants=network-online.target
+# Active alerting channel: dashboard-banner-only. The dashboard reads
+# profiles/%i/.last_run on load and surfaces a banner when the last
+# successful run is more than 30 hours old, so no external notifier is
+# wired. To enable an out-of-band channel (webhook, email, etc.):
+#   1. Set JOBAGENT_NOTIFY_WEBHOOK in /home/ubuntu/job-agent/.env
+#   2. Drop a jobagent-failure-notify@.service unit alongside this one
+#      that runs `worker/notify.py --profile %i`.
+#   3. Uncomment the OnFailure= line below.
+# OnFailure=jobagent-failure-notify@%i.service
 
 [Service]
 Type=oneshot
