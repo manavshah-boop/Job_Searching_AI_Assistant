@@ -13,6 +13,7 @@ Profile support:
 
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,12 +25,23 @@ from config import load_config  # noqa: F401
 
 _PROFILES_DIR = Path(__file__).parent / "profiles"
 _ACTIVE_PROFILE: Optional[str] = None
+# Guards reads/writes of _ACTIVE_PROFILE. The Streamlit dashboard re-runs the
+# whole script per interaction, and progress callbacks can fire from background
+# threads — without this lock two threads can clobber the active profile.
+_ACTIVE_PROFILE_LOCK = threading.Lock()
 
 
 def set_active_profile(profile: Optional[str]) -> None:
     """Set the module-level active profile for all subsequent DB operations."""
     global _ACTIVE_PROFILE
-    _ACTIVE_PROFILE = profile
+    with _ACTIVE_PROFILE_LOCK:
+        _ACTIVE_PROFILE = profile
+
+
+def get_active_profile() -> Optional[str]:
+    """Return the currently active profile (thread-safe read)."""
+    with _ACTIVE_PROFILE_LOCK:
+        return _ACTIVE_PROFILE
 
 
 def get_db_path(profile: Optional[str] = None) -> Path:
@@ -37,7 +49,11 @@ def get_db_path(profile: Optional[str] = None) -> Path:
     Returns the DB path for the given profile.
     Resolution order: explicit arg → _ACTIVE_PROFILE → root jobs.db
     """
-    resolved = profile or _ACTIVE_PROFILE
+    if profile:
+        resolved = profile
+    else:
+        with _ACTIVE_PROFILE_LOCK:
+            resolved = _ACTIVE_PROFILE
     if resolved:
         return _PROFILES_DIR / resolved / "jobs.db"
     return Path(__file__).parent / "jobs.db"
@@ -176,6 +192,61 @@ def _migrate_db(db_path: Path) -> None:
     conn.close()
 
 
+def _apply_pragmas(conn: sqlite3.Connection) -> None:
+    """
+    Apply persistent PRAGMAs that improve concurrency and durability:
+      - journal_mode=WAL — readers don't block the writer; safe for the daily
+        worker writing while the dashboard reads (HIGH-5).
+      - synchronous=NORMAL — durable enough for non-financial data; faster than FULL.
+    These survive across connections once set on the file.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.DatabaseError:
+        # WAL is unavailable on read-only filesystems / some network mounts.
+        # The error is informational; fall back to the default journal mode silently.
+        pass
+
+
+_STALE_RUN_HOURS = 6  # runs left in 'running' for longer than this are treated as crashed
+
+
+def _mark_stale_running_runs_crashed(db_path: Path) -> None:
+    """
+    On startup, mark any scrape_runs row that has been 'running' for more than
+    _STALE_RUN_HOURS as 'crashed'. Without this sweep, a SIGKILL'd worker leaves
+    its run row in 'running' forever, polluting the dashboard's recent-runs view
+    and confusing the staleness-detection heuristics.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        # scrape_runs table may not exist yet on first init; guard with a check.
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scrape_runs'"
+        ).fetchone()
+        if not exists:
+            conn.close()
+            return
+        conn.execute(
+            f"""
+            UPDATE scrape_runs
+            SET status = 'crashed',
+                finished_at = ?,
+                errors = COALESCE(NULLIF(errors, ''), '[]')
+            WHERE status = 'running'
+              AND started_at IS NOT NULL
+              AND (julianday('now') - julianday(started_at)) * 24 > {int(_STALE_RUN_HOURS)}
+            """,
+            (_now_utc(),),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.DatabaseError:
+        # Don't let a maintenance sweep break startup.
+        pass
+
+
 def init_db(profile: Optional[str] = None) -> None:
     """
     Creates the jobs table if it doesn't exist. Safe to call on every run.
@@ -185,6 +256,7 @@ def init_db(profile: Optional[str] = None) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(db_path)
+    _apply_pragmas(conn)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id             TEXT PRIMARY KEY,
@@ -203,6 +275,7 @@ def init_db(profile: Optional[str] = None) -> None:
     conn.commit()
     conn.close()
     _migrate_db(db_path)
+    _mark_stale_running_runs_crashed(db_path)
 
 
 # ── Write operations ──────────────────────────────────────────────────────────

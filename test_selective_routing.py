@@ -99,10 +99,11 @@ def test_router_init_threshold_clamped_high():
 
 
 def test_router_init_invalid_threshold_uses_default():
+    from selective_routing import _DEFAULT_THRESHOLD
     cfg = make_config()
     cfg["routing"]["threshold"] = "not_a_number"
     router = SelectiveRouter(cfg)
-    assert router.threshold == 0.25  # updated to match new _DEFAULT_THRESHOLD
+    assert router.threshold == _DEFAULT_THRESHOLD
 
 
 def test_router_init_quality_mode():
@@ -199,18 +200,36 @@ def test_create_synthetic_score_increments_count():
     assert router._counts["skipped"] == 1
 
 
-def test_create_synthetic_score_match_reason_in_one_liner():
+def test_create_synthetic_score_one_liner_flags_estimate():
+    """one_liner must always make clear the score is keyword-based, not LLM-verified."""
     router = SelectiveRouter(make_config(threshold=0.65))
     result = router.create_synthetic_score(make_job(), 0.60)
-    # one_liner should reference routing score
-    assert "0.60" in result["one_liner"] or "reranker" in result["one_liner"].lower()
+    text = result["one_liner"].lower()
+    assert "estimate" in text or "manual check" in text or "keyword" in text
 
 
-def test_create_synthetic_score_uses_match_reason():
-    """When match_reason is provided, it becomes the one_liner."""
+def test_create_synthetic_score_uses_match_reason_when_no_evidence():
+    """
+    create_synthetic_score uses the supplied match_reason as the one_liner only
+    when there is NO title match and NO tech-overlap evidence; otherwise the
+    extracted evidence (skills found in the JD) takes precedence — that's the
+    actual contract today.
+    """
     router = SelectiveRouter(make_config())
-    result = router.create_synthetic_score(make_job(), 0.60, match_reason="Good Python fit")
+    bare_job = make_job(raw_text="Generic role with no matching tech keywords here.")
+    result = router.create_synthetic_score(bare_job, 0.60, match_reason="Good Python fit")
     assert result["one_liner"] == "Good Python fit"
+
+
+def test_create_synthetic_score_includes_skills_when_present():
+    """When tech overlaps exist, one_liner surfaces the matching skill names."""
+    router = SelectiveRouter(make_config())
+    result = router.create_synthetic_score(
+        make_job(raw_text="Python AWS Machine Learning role"), 0.60,
+    )
+    # Job and config share Python and AWS; one_liner must mention at least one.
+    text = result["one_liner"]
+    assert ("Python" in text) or ("AWS" in text)
 
 
 def test_create_synthetic_score_uses_matched_sections():
@@ -403,6 +422,121 @@ def test_quick_ats_skill_matching():
     assert 0 <= ats_with <= 100
 
 
+def test_quick_ats_uses_canonical_matching_for_multi_word_skills():
+    """
+    CRIT-2 regression: when the candidate has structured-profile skills, _quick_ats
+    must score JDs using canonical aliases rather than literal substring of multi-word
+    skill phrases. A candidate with "AWS" and "Python" should score high on a JD that
+    mentions "Amazon Web Services" and "python", even though neither appears verbatim
+    in a desired_skills list of multi-word phrases.
+    """
+    cfg = make_config()
+    cfg["preferences"]["desired_skills"] = [
+        "Machine learning infrastructure",
+        "Authentication and authorization",
+        "Cloud architecture",
+    ]
+    router = SelectiveRouter(cfg)
+    router.set_structured_profile({
+        "core_skills": ["Python"],
+        "languages": ["Python"],
+        "frameworks": [],
+        "cloud": ["AWS", "Docker"],
+    })
+    job = make_job(
+        raw_text=(
+            "We are hiring a backend engineer. Required skills: Python, Amazon Web Services, "
+            "Docker. Experience with REST APIs and CI/CD pipelines preferred."
+        ),
+    )
+    score = router._quick_ats(job)
+    # Canonical extractor catches Python (language), AWS (alias of Amazon Web Services),
+    # Docker. With naive substring matching of the desired_skills list this would be 0
+    # because none of the configured phrases appear verbatim.
+    assert score > 30, f"expected canonical match score > 30, got {score}"
+
+
+def test_quick_ats_handles_missing_structured_profile():
+    """Without a structured profile, _quick_ats must still return a non-error value."""
+    router = SelectiveRouter(make_config())
+    score = router._quick_ats(make_job(raw_text="Python role at Acme"))
+    assert isinstance(score, int)
+    assert 0 <= score <= 100
+
+
+# ── score_job: keyword_prescore is bypassed when routing enabled (CRIT-3) ─────
+
+def test_score_job_skips_keyword_prescore_when_routing_enabled():
+    """
+    CRIT-3 regression: when routing is enabled, score_job MUST NOT short-circuit
+    on keyword_prescore. The router has already decided the job is worth an LLM call;
+    keyword_prescore uses naive substring matching of multi-word desired_skills phrases
+    that silently zeros good matches.
+    """
+    from scorer import score_job
+
+    cfg = make_config()
+    cfg["routing"]["enabled"] = True
+    # Multi-word phrases that will NOT substring-match a real-looking JD.
+    cfg["preferences"]["desired_skills"] = [
+        "Machine learning infrastructure",
+        "Authentication and authorization",
+        "Distributed systems",
+    ]
+    cfg["preferences"]["titles"] = []  # disable the title shortcut so prescore would otherwise fire
+    cfg["profile"] = {"resume": ""}
+
+    job = make_job(
+        raw_text=(
+            "Backend engineer wanted. We use Python, Postgres and Docker. "
+            "Strong CI/CD culture. Required: REST APIs, k8s."
+        ),
+    )
+
+    fake_llm_called = {"count": 0}
+
+    def fake_llm(prompt: str, max_tokens: int = 700):
+        fake_llm_called["count"] += 1
+        return (
+            '{"disqualified": false, "disqualify_reason": "", "role_fit": 7, '
+            '"stack_match": 7, "seniority": 7, "location": 7, "growth": 6, '
+            '"compensation": 5, "reasons": ["good fit","python"], "flags": [], '
+            '"one_liner": "good fit"}',
+            300,
+        )
+
+    result = score_job(job, cfg, fake_llm, structured_profile=None, instructor_client=None)
+
+    # The LLM call must have happened — proving keyword_prescore did not gate it.
+    assert fake_llm_called["count"] == 1
+    assert result["fit_score"] > 0
+    assert "no skill overlap" not in result["flags"]
+
+
+def test_score_job_keeps_keyword_prescore_when_routing_disabled():
+    """When routing is disabled, the legacy keyword_prescore gate must still run."""
+    from scorer import score_job
+
+    cfg = make_config(enabled=False)
+    cfg["preferences"]["desired_skills"] = [
+        "Quantum cryptography",
+        "Embedded firmware",
+        "Driver development",
+    ]
+    cfg["preferences"]["titles"] = []
+    cfg["profile"] = {"resume": ""}
+
+    # JD has no overlap with any of the (deliberately niche) desired_skills.
+    job = make_job(raw_text="We are hiring a marketing copywriter for our brand team.")
+
+    def must_not_be_called(prompt: str, max_tokens: int = 700):
+        raise AssertionError("LLM must not be called when prescore zeros out the job")
+
+    result = score_job(job, cfg, must_not_be_called, structured_profile=None, instructor_client=None)
+    assert result["fit_score"] == 0
+    assert result["flags"] == ["no skill overlap"]
+
+
 # ── detect_matched_sections() ─────────────────────────────────────────────────
 
 def test_detect_matched_sections_empty_text():
@@ -458,3 +592,108 @@ def test_detect_matched_sections_stores_query():
     # Not empty because _match_query is used as fallback
     # (result may or may not have "requirements" depending on hit count — just verify no crash)
     assert isinstance(result, list)
+
+
+# ── compute_tier returns full tier config (regression for CRIT-1) ────────────
+
+def _config_with_tiers() -> dict:
+    cfg = make_config()
+    cfg["routing"]["tiers"] = {
+        "high": {
+            "min_reranker": 0.40,
+            "require_title_match": True,
+            "primary_model": "groq/llama-3.1-8b-instant",
+            "quality_mode": "fast",
+            "max_tokens": 500,
+        },
+        "medium": {
+            "min_reranker": 0.25,
+            "primary_model": "groq/llama-4-scout-17b-16e-instruct",
+            "quality_mode": "fast",
+            "max_tokens": 800,
+        },
+        "low": {
+            "min_reranker": 0.18,
+            "primary_model": "gemini/gemini-2.5-flash",
+            "quality_mode": "quality",
+            "max_tokens": 1200,
+        },
+    }
+    cfg["routing"]["fallback_chain"] = ["groq", "gemini", "openai"]
+    cfg["routing"]["rate_limit_budget"] = {
+        "groq": {"max_requests_per_run": 10, "max_tokens_per_run": 50_000},
+        "gemini": {"max_requests_per_run": 10, "max_tokens_per_run": 50_000},
+        "openai": {"max_requests_per_run": 5, "max_tokens_per_run": 20_000},
+    }
+    return cfg
+
+
+def test_compute_tier_high_includes_primary_model():
+    """compute_tier must propagate primary_model so select_model_with_fallback reads it."""
+    router = SelectiveRouter(_config_with_tiers())
+    tier = router.compute_tier(effective_score=0.95, job_text="short", title_matched=True)
+    assert tier["tier"] == "high"
+    assert tier["primary_model"] == "groq/llama-3.1-8b-instant"
+    assert tier["require_title_match"] is True
+
+
+def test_compute_tier_medium_includes_primary_model():
+    router = SelectiveRouter(_config_with_tiers())
+    tier = router.compute_tier(effective_score=0.30, job_text="short", title_matched=False)
+    assert tier["tier"] == "medium"
+    assert tier["primary_model"] == "groq/llama-4-scout-17b-16e-instruct"
+
+
+def test_compute_tier_low_includes_primary_model():
+    router = SelectiveRouter(_config_with_tiers())
+    tier = router.compute_tier(effective_score=0.10, job_text="short", title_matched=False)
+    assert tier["tier"] == "low"
+    assert tier["primary_model"] == "gemini/gemini-2.5-flash"
+
+
+def test_select_model_with_fallback_uses_per_tier_primary(monkeypatch):
+    """
+    Configured per-tier primary_model must be honored — not silently overridden
+    by the default groq/llama-3.1-8b-instant fallback. (CRIT-1 regression.)
+    """
+    from selective_routing import ProviderBudget, select_model_with_fallback
+
+    cfg = _config_with_tiers()
+    router = SelectiveRouter(cfg)
+
+    # Pretend gemini and groq both have keys + budget.
+    monkeypatch.setattr(
+        "selective_routing._provider_has_key",
+        lambda provider, profile=None: provider in {"groq", "gemini", "openai"},
+    )
+    budgets = ProviderBudget(cfg["routing"]["rate_limit_budget"])
+
+    tier = router.compute_tier(effective_score=0.10, job_text="short", title_matched=False)
+    provider, model = select_model_with_fallback(
+        tier, tier["tier"], cfg["routing"], budgets,
+        estimated_tokens=500, job_id="job_test", profile=None,
+    )
+    assert provider == "gemini"
+    assert model == "gemini-2.5-flash"
+
+
+def test_select_model_with_fallback_falls_through_when_primary_exhausted(monkeypatch):
+    """If the configured tier primary is exhausted, walk fallback_chain in order."""
+    from selective_routing import ProviderBudget, select_model_with_fallback
+
+    cfg = _config_with_tiers()
+    router = SelectiveRouter(cfg)
+    monkeypatch.setattr(
+        "selective_routing._provider_has_key",
+        lambda provider, profile=None: provider in {"groq", "gemini", "openai"},
+    )
+    budgets = ProviderBudget(cfg["routing"]["rate_limit_budget"])
+    budgets.force_exhaust("gemini")  # tier-low primary blown
+
+    tier = router.compute_tier(effective_score=0.10, job_text="short", title_matched=False)
+    provider, _ = select_model_with_fallback(
+        tier, tier["tier"], cfg["routing"], budgets,
+        estimated_tokens=500, job_id="job_test", profile=None,
+    )
+    # fallback_chain order: groq, gemini, openai → next viable after gemini is groq
+    assert provider == "groq"

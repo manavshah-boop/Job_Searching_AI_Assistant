@@ -74,7 +74,16 @@ def _dedupe(values: list[str]) -> list[str]:
 
 
 # Raw internal flag prefixes that must never reach user-facing text
-_INTERNAL_FLAG_PREFIXES = ("score_source:", "matched_sections:", "parse error")
+_INTERNAL_FLAG_PREFIXES = (
+    "score_source:",
+    "matched_sections:",
+    "parse error",
+    # scorer.score_job emits flags like "scrape_filtered: title_blocklist: Staff"
+    # for jobs admitted to the DB only for dedup. The raw key leaks implementation
+    # detail into the dashboard — strip it (the disqualified state is already
+    # surfaced through MatchExplanation.recommended_action).
+    "scrape_filtered:",
+)
 
 
 def _clean_flags(flags: list[str]) -> list[str]:

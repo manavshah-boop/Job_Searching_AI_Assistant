@@ -14,6 +14,7 @@ import pytest
 
 from scraper import (
     scrape_ashby,
+    scrape_greenhouse,
     scrape_himalayas,
     scrape_workable,
     strip_html,
@@ -533,3 +534,68 @@ def test_scrape_himalayas_filters_title_mismatch(mock_client, mock_insert, mock_
 
     assert result["new_jobs_saved"] == 0
     assert result["jobs_filtered"] >= 1
+
+
+# ── scrape_greenhouse — required-field validation (HIGH-1, HIGH-3) ────────────
+
+def _greenhouse_posting(posting_id="123", title="Software Engineer", url="https://example.com/jobs/123"):
+    return {
+        "id": posting_id,
+        "title": title,
+        "absolute_url": url,
+        "location": {"name": "Remote"},
+        "content": "<p>We need a Python developer.</p>",
+        "updated_at": _now_iso(),
+    }
+
+
+@patch("scraper.init_db")
+@patch("scraper.insert_job", return_value=True)
+@patch("scraper.httpx.Client")
+def test_scrape_greenhouse_skips_missing_id_does_not_crash(mock_client, mock_insert, mock_init):
+    """HIGH-1 regression: postings missing `id` must be skipped, not crash the company."""
+    bad = _greenhouse_posting()
+    del bad["id"]
+    good = _greenhouse_posting(posting_id="ok-456")
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"jobs": [bad, good]}
+    mock_client.return_value.__enter__.return_value.get.return_value = resp
+
+    result = scrape_greenhouse(_base_config(), slugs=["acme"])
+
+    # The good posting is saved; the bad row was skipped quietly.
+    assert result["new_jobs_saved"] == 1
+    assert result["errors"] == []
+
+
+@patch("scraper.init_db")
+@patch("scraper.insert_job", return_value=True)
+@patch("scraper.httpx.Client")
+def test_scrape_greenhouse_skips_empty_title(mock_client, mock_insert, mock_init):
+    """HIGH-3 regression: postings with empty title must not reach the DB."""
+    bad = _greenhouse_posting(title="")
+    good = _greenhouse_posting(posting_id="ok-456")
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"jobs": [bad, good]}
+    mock_client.return_value.__enter__.return_value.get.return_value = resp
+
+    result = scrape_greenhouse(_base_config(), slugs=["acme"])
+    assert result["new_jobs_saved"] == 1
+
+
+@patch("scraper.init_db")
+@patch("scraper.insert_job", return_value=True)
+@patch("scraper.httpx.Client")
+def test_scrape_greenhouse_skips_empty_url(mock_client, mock_insert, mock_init):
+    """HIGH-3 regression: postings with empty url must not reach the DB."""
+    bad = _greenhouse_posting(url="")
+    good = _greenhouse_posting(posting_id="ok-456")
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"jobs": [bad, good]}
+    mock_client.return_value.__enter__.return_value.get.return_value = resp
+
+    result = scrape_greenhouse(_base_config(), slugs=["acme"])
+    assert result["new_jobs_saved"] == 1
