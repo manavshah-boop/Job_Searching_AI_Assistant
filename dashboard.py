@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -170,7 +171,11 @@ def _prepare_dashboard_section_widget() -> None:
 
 _WORKER_LOCKFILE  = ".worker_running"
 _WORKER_PROGRESS  = ".run_progress.json"
+_WORKER_STATUS    = ".last_run"
 _WORKER_STALE_SEC = 3 * 3600  # match worker/run_pipeline.py
+# If the worker hasn't finished a run in this many hours, surface a banner.
+# The cron fires daily at 04:00 UTC; 30h gives one missed window of slack.
+_LAST_RUN_STALE_HOURS = 30
 
 
 def _worker_lockfile(slug: str) -> Path:
@@ -206,6 +211,60 @@ def _read_progress_json(slug: str) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _last_run_path(slug: str) -> Path:
+    return PROFILES_DIR / slug / _WORKER_STATUS
+
+
+def _read_last_run(slug: str) -> dict[str, Any] | None:
+    path = _last_run_path(slug)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _hours_since_last_run(
+    last_run: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Hours elapsed since `finished_at` in the .last_run payload.
+
+    Returns None when the payload is missing, has no `finished_at`, or the
+    timestamp is unparsable — callers treat that as "no signal", not stale.
+    """
+    if not last_run:
+        return None
+    finished = last_run.get("finished_at")
+    if not finished:
+        return None
+    try:
+        finished_dt = datetime.fromisoformat(str(finished))
+    except (TypeError, ValueError):
+        return None
+    if finished_dt.tzinfo is None:
+        finished_dt = finished_dt.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now - finished_dt).total_seconds() / 3600
+
+
+def _last_run_is_stale(
+    last_run: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+    threshold_hours: float = _LAST_RUN_STALE_HOURS,
+) -> bool:
+    hours = _hours_since_last_run(last_run, now=now)
+    if hours is None:
+        return False
+    return hours >= threshold_hours
 
 
 def _profile_config_path(slug: str) -> Path:
@@ -817,6 +876,21 @@ def _render_notice(slug: str) -> None:
     message = notice.get("message", "")
     callout(kind, kind.title(), message)
     st.session_state.dashboard_notice = None
+
+
+def _render_staleness_banner(slug: str) -> None:
+    last_run = _read_last_run(slug)
+    hours = _hours_since_last_run(last_run)
+    if hours is None or hours < _LAST_RUN_STALE_HOURS:
+        return
+    callout(
+        "warning",
+        "Cron may have stalled",
+        (
+            f"Last successful run was {int(hours)} hours ago. "
+            "Check the worker journal — the daily timer may have failed or the host was offline."
+        ),
+    )
 
 
 def _render_sidebar_nav(
@@ -3254,6 +3328,8 @@ def _render_profile_dashboard(slug: str) -> None:
         st.session_state[was_running_key] = True
 
     _render_notice(slug)
+    if not worker_running:
+        _render_staleness_banner(slug)
     sidebar_action = _render_sidebar_nav(slug, profile_name, config, metrics, worker_running=worker_running)
     if sidebar_action == "run_search" and not worker_running:
         missing = _check_api_key(config)
