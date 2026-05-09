@@ -25,24 +25,12 @@ DEFAULT_TOP_K_CHUNKS = 50
 DEFAULT_TOP_K_JOBS = 30
 DEFAULT_DISTANCE_METRIC = "cosine"
 MIN_CHUNK_SIMILARITY = 0.05
-SECTION_WEIGHTS = {
-    "requirements": 1.10,
-    "responsibilities": 1.05,
-    "summary": 1.00,
-    "compensation": 0.90,
-    "benefits": 0.80,
-}
-COMPENSATION_QUERY_TERMS = (
-    "salary",
-    "compensation",
-    "pay",
-    "benefits",
-    "equity",
-    "bonus",
-    "pto",
-    "401k",
-    "medical",
-)
+# Section weighting deliberately lives only in reranker.py (the precision pass).
+# The vector store is the *recall* pass — it should return chunks ranked by raw
+# semantic similarity so the reranker sees an unbiased candidate set. Weighting
+# both passes was double-counting the same section-priority signal and biased
+# `final_score`'s 5% vector_aggregate contribution toward sections the reranker
+# was already over-weighting.
 
 
 @dataclass
@@ -203,15 +191,6 @@ def _sanitize_metadata(row: dict[str, Any], model_name: str, dimensions: int) ->
         "status": _string(row.get("status")),
         "created_at": _string(row.get("created_at")),
     }
-
-
-def _section_weights_for_query(query: str) -> dict[str, float]:
-    weights = dict(SECTION_WEIGHTS)
-    lowered = query.lower()
-    if any(term in lowered for term in COMPENSATION_QUERY_TERMS):
-        weights["compensation"] = 1.05
-        weights["benefits"] = 1.00
-    return weights
 
 
 def _resolve_model_name(profile: str, explicit_model_name: Optional[str] = None) -> str:
@@ -476,7 +455,6 @@ def query_similar_jobs(
     if not chunk_results:
         return []
 
-    weights = _section_weights_for_query(query)
     by_job: dict[str, list[VectorChunkResult]] = {}
     for chunk in chunk_results:
         by_job.setdefault(chunk.job_id, []).append(chunk)
@@ -484,21 +462,21 @@ def query_similar_jobs(
     job_results: list[VectorJobResult] = []
     for job_id, chunks in by_job.items():
         ordered_chunks = sorted(chunks, key=lambda item: item.similarity, reverse=True)
+        # MatchedChunkScore.weighted_similarity is preserved for API/test
+        # back-compat; it now carries the raw similarity (no per-section
+        # multiplier). See module-level comment above SECTION_WEIGHTS removal.
         scored_chunks = [
             MatchedChunkScore(
                 chunk_key=chunk.chunk_key,
                 chunk_order=chunk.chunk_order,
                 similarity=round(chunk.similarity, 4),
-                weighted_similarity=round(
-                    min(1.0, chunk.similarity * weights.get(chunk.chunk_key, 1.0)),
-                    4,
-                ),
+                weighted_similarity=round(chunk.similarity, 4),
             )
             for chunk in ordered_chunks
         ]
-        weighted_values = [chunk.weighted_similarity for chunk in scored_chunks]
-        best = weighted_values[0]
-        top_average = sum(weighted_values[:3]) / min(3, len(weighted_values))
+        similarity_values = [chunk.similarity for chunk in scored_chunks]
+        best = similarity_values[0]
+        top_average = sum(similarity_values[:3]) / min(3, len(similarity_values))
         coverage = _coverage_bonus(scored_chunks)
         aggregate = min(1.0, best * 0.75 + top_average * 0.20 + coverage * 0.05)
         top_chunk = ordered_chunks[0]

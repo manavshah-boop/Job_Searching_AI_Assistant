@@ -32,7 +32,11 @@ from vector_store import (
     vector_store_enabled,
 )
 
-DEFAULT_RERANKING_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# BGE-reranker-base is trained on a wider domain mix (incl. job descriptions and
+# resumes via MS-MARCO + general retrieval data) and outputs a wider logit range,
+# so post-sigmoid scores spread across [0,1] instead of compressing into ~0.2–0.35
+# the way ms-marco-MiniLM-L-6-v2 did. Same ~150MB footprint on disk.
+DEFAULT_RERANKING_MODEL = "BAAI/bge-reranker-base"
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_TOP_K_VECTOR_CHUNKS = 80
 DEFAULT_TOP_K_VECTOR_JOBS = 40
@@ -521,12 +525,24 @@ def rerank_chunks(
 
 
 def _coverage_bonus(section_scores: dict[str, float]) -> float:
-    bonus = 0.0
-    if section_scores.get("requirements", 0.0) >= 0.55 and section_scores.get("responsibilities", 0.0) >= 0.55:
-        bonus += 0.07
-    if section_scores.get("summary", 0.0) >= 0.50:
-        bonus += 0.03
-    return min(0.10, bonus)
+    """Bonus for matching multiple distinct high-signal sections.
+
+    The original version only awarded a bonus when ``requirements`` AND
+    ``responsibilities`` both crossed 0.55 — so a job with strong matches in
+    ``requirements`` + ``summary`` (or ``responsibilities`` + ``summary``) got
+    the same ``summary``-only bonus as a one-section match. That under-rewarded
+    breadth of evidence.
+
+    The replacement counts how many of the three high-signal sections cross
+    the 0.55 threshold and scales the bonus accordingly: 1 → 0.03, 2 → 0.07,
+    3 → 0.10. Mirrors ``vector_store._coverage_bonus`` which counts distinct
+    chunk_keys.
+    """
+    strong = sum(
+        1 for key in ("requirements", "responsibilities", "summary")
+        if section_scores.get(key, 0.0) >= 0.55
+    )
+    return {0: 0.0, 1: 0.03, 2: 0.07, 3: 0.10}[strong]
 
 
 def _query_terms(match_query: str) -> list[str]:
