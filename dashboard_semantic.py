@@ -8,11 +8,13 @@ from typing import Any
 
 import streamlit as st
 
+from dashboard_ratings import factor_with_badge, render_rating_panel
 from db import get_job_with_score
 from match_explainer import build_match_explanation
 from profile_intent import normalize_profile_intent
 from reranker import build_profile_match_query, reranking_enabled, semantic_match_jobs
 from ui_shell import panel
+from user_ratings import attach_role_family_from_config
 from vector_store import query_similar_jobs, vector_store_enabled, vector_top_k_chunks, vector_top_k_jobs
 
 
@@ -82,17 +84,17 @@ def _render_explanation_card(explanation) -> None:
             st.write("Strengths")
             for factor in explanation.strengths[:4]:
                 details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
-                st.write(f"- {factor.name}: {factor.explanation}{details}")
+                st.write(f"- {factor_with_badge(factor)}: {factor.explanation}{details}")
         if explanation.concerns:
             st.write("Concerns")
             for factor in explanation.concerns[:4]:
                 details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
-                st.write(f"- {factor.name}: {factor.explanation}{details}")
+                st.write(f"- {factor_with_badge(factor)}: {factor.explanation}{details}")
         if explanation.unknowns:
             st.write("Unknowns")
             for factor in explanation.unknowns[:3]:
                 details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
-                st.write(f"- {factor.name}: {factor.explanation}{details}")
+                st.write(f"- {factor_with_badge(factor)}: {factor.explanation}{details}")
 
 
 def render_semantic_match_panel(slug: str, config: dict[str, Any]) -> None:
@@ -162,6 +164,7 @@ def render_semantic_match_panel(slug: str, config: dict[str, Any]) -> None:
         st.caption("Showing profile-aware reranked semantic matches.")
 
     profile_intent = normalize_profile_intent(config)
+    rating_role_family = attach_role_family_from_config(slug, config)
     for index, result in enumerate(results[:5], start=1):
         if hasattr(result, "final_score"):
             subtitle = f"{result.company} · {result.source} · Final score {round(result.final_score * 100)}%"
@@ -179,3 +182,12 @@ def render_semantic_match_panel(slug: str, config: dict[str, Any]) -> None:
                 st.write(result.retrieval_reason)
             if result.url:
                 st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")
+            st.divider()
+            st.caption("**Rate this match** — feeds the eval suite.")
+            render_rating_panel(
+                slug,
+                str(result.job_id),
+                role_family=rating_role_family,
+                key_prefix=f"rate_semantic_{slug}",
+                show_helper=False,
+            )

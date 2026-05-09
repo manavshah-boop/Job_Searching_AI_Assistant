@@ -564,3 +564,16 @@ scoring:
     location: 0.1
     growth: 0.1
     compensation: 0.05
+
+embeddings:
+  enabled: true
+  model: sentence-transformers/all-MiniLM-L6-v2
+  batch_size: 8
+  vector_store:
+    enabled: true
+    provider: chromadb
+    persist_directory: null
+    collection_name: job_chunks
+    top_k_chunks: 50
+    top_k_jobs: 30
+    strict: false
