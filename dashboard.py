@@ -3141,9 +3141,10 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                 key=f"routing_enabled_{slug}",
                 help="When on, jobs below the threshold skip the LLM and get a synthetic score.",
             )
-            # The cross-encoder ms-marco-MiniLM-L-6-v2 emits compressed scores
-            # (good matches land around 0.20–0.45). llm_threshold (per-profile) overrides
-            # the legacy threshold field; show llm_threshold if present so users can tune
+            # BGE-reranker-base spreads post-sigmoid scores across [0,1] more
+            # uniformly than the prior ms-marco model did (which compressed into
+            # ~0.20–0.45). llm_threshold (per-profile) overrides the legacy
+            # threshold field; show llm_threshold if present so users can tune
             # the value the router actually uses.
             current_threshold = float(
                 routing_cfg.get("llm_threshold")
@@ -3161,7 +3162,8 @@ def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str
                     "Jobs whose cross-encoder score is below this value skip the LLM. "
                     "Lower = more LLM calls (higher quality, higher cost). "
                     "Higher = fewer LLM calls (lower cost, may miss edge cases). "
-                    "Default 0.18 works well with the ms-marco reranker."
+                    "Default 0.18 is permissive under BGE; 0.25–0.35 is a "
+                    "reasonable range to tighten for fewer LLM calls."
                 ),
                 disabled=not routing_enabled_val,
             )

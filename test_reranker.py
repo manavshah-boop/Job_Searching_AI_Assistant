@@ -5,11 +5,14 @@ test_reranker.py - Unit tests for profile-aware cross-encoder reranking.
 from __future__ import annotations
 
 from reranker import (
+    DEFAULT_RERANKING_MODEL,
     MatchEvidence,
     RerankedJobResult,
+    _coverage_bonus,
     build_profile_match_query,
     rerank_chunks,
     rerank_jobs,
+    reranking_model_name,
     select_chunks_for_reranking,
     select_jobs_for_llm_scoring,
     semantic_match_jobs,
@@ -505,3 +508,90 @@ def test_select_jobs_for_llm_scoring_returns_top_ids_by_threshold():
     selected = select_jobs_for_llm_scoring(ranked_jobs, threshold=0.70, top_k=2)
 
     assert selected == ["job-1", "job-2"]
+
+
+# ── Default model + reranker calibration tests ────────────────────────────────
+
+
+def test_default_reranking_model_is_bge_reranker_base():
+    """MED-3: default reranker swapped from ms-marco to BGE for wider score range."""
+    assert DEFAULT_RERANKING_MODEL == "BAAI/bge-reranker-base"
+    assert reranking_model_name({}) == "BAAI/bge-reranker-base"
+
+
+def test_explicit_reranker_model_overrides_default():
+    """Profile configs that explicitly pin a reranker model still win over the default."""
+    config = {"reranking": {"model": "cross-encoder/ms-marco-MiniLM-L-6-v2"}}
+    assert reranking_model_name(config) == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+
+# ── Coverage bonus rewrite tests (HIGH-7) ─────────────────────────────────────
+
+
+def test_coverage_bonus_zero_strong_sections_returns_zero():
+    assert _coverage_bonus({}) == 0.0
+    assert _coverage_bonus({"requirements": 0.20, "responsibilities": 0.30}) == 0.0
+
+
+def test_coverage_bonus_one_strong_section_returns_small_bonus():
+    """Single strong section (any of req/resp/summary) earns 0.03."""
+    assert _coverage_bonus({"requirements": 0.70}) == 0.03
+    assert _coverage_bonus({"responsibilities": 0.60}) == 0.03
+    assert _coverage_bonus({"summary": 0.55}) == 0.03
+
+
+def test_coverage_bonus_two_strong_sections_returns_mid_bonus():
+    """Any two of req/resp/summary above 0.55 earn 0.07 — the original code
+    only awarded this for the specific req+resp pair."""
+    assert _coverage_bonus({"requirements": 0.70, "responsibilities": 0.65}) == 0.07
+    # The case the original code under-rewarded:
+    assert _coverage_bonus({"requirements": 0.70, "summary": 0.60}) == 0.07
+    assert _coverage_bonus({"responsibilities": 0.65, "summary": 0.60}) == 0.07
+
+
+def test_coverage_bonus_three_strong_sections_returns_max_bonus():
+    assert _coverage_bonus({
+        "requirements": 0.70,
+        "responsibilities": 0.65,
+        "summary": 0.60,
+    }) == 0.10
+
+
+def test_coverage_bonus_below_threshold_section_does_not_count():
+    """Section must clear 0.55 to count, matching the strong-match bar in _match_reason."""
+    bonus = _coverage_bonus({
+        "requirements": 0.70,        # strong
+        "responsibilities": 0.54,    # below bar
+        "summary": 0.40,             # below bar
+    })
+    assert bonus == 0.03  # only one section qualifies
+
+
+# ── Vector-store duplicate weighting removal (HIGH-7) ─────────────────────────
+
+
+def test_vector_store_query_does_not_apply_section_weighting(monkeypatch):
+    """HIGH-7: query_similar_jobs used to multiply chunk similarities by a
+    section-priority weight table. That double-counted the same signal the
+    reranker already applies in its precision pass. After the fix, the
+    `weighted_similarity` field on returned chunks equals the raw similarity."""
+    from vector_store import query_similar_jobs
+
+    # Two chunks at identical similarity but different section priorities.
+    # Under the old code, requirements would be lifted (×1.10) and benefits
+    # would be suppressed (×0.80). Under the fix, they should be equal.
+    fake_chunks = [
+        _chunk("job-1", "requirements", 0.70, "Requirements: Python AWS", title="Backend"),
+        _chunk("job-1", "benefits", 0.70, "Benefits: PTO 401k", title="Backend"),
+    ]
+    monkeypatch.setattr(
+        "vector_store.query_similar_chunks",
+        lambda profile, query, top_k_chunks=50, filters=None: fake_chunks,
+    )
+
+    results = query_similar_jobs("default", "python backend role")
+
+    assert len(results) == 1
+    chunk_scores = {cs.chunk_key: cs.weighted_similarity for cs in results[0].chunk_scores}
+    # weighted_similarity now mirrors raw similarity — no per-section lift/dampening
+    assert chunk_scores["requirements"] == chunk_scores["benefits"] == 0.70

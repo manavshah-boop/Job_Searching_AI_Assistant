@@ -27,9 +27,10 @@ _DEFAULT_MLFLOW_CONFIG: Dict[str, Any] = {
 
 _DEFAULT_ROUTING_CONFIG: Dict[str, Any] = {
     "enabled": False,
-    # Matches selective_routing._DEFAULT_THRESHOLD. The ms-marco-MiniLM-L-6-v2
-    # cross-encoder emits compressed scores — 0.18 lets plausible jobs reach the
-    # LLM while a title-match boost lifts obvious roles above this floor.
+    # Matches selective_routing._DEFAULT_THRESHOLD. BGE-reranker-base spreads
+    # scores across [0,1] more uniformly than the prior ms-marco cross-encoder;
+    # 0.18 remains a permissive default and per-profile `llm_threshold` (e.g.
+    # 0.25–0.35) is the right knob for tightening to reduce LLM cost.
     "threshold": 0.18,
     "quality_mode": "fast",
     "log_routing_decisions": True,

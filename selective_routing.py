@@ -42,10 +42,13 @@ def _shared_model_cache() -> dict[str, Any]:
 
 _MODEL_CACHE: dict[str, Any] = {}
 
-_DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-# ms-marco-MiniLM-L-6-v2 outputs logits in a compressed range (0.2-0.35 for decent
-# matches). 0.18 lets most plausible jobs reach the LLM; title-match boost (+0.15)
-# lifts obvious roles over this floor without touching the stored score. Was 0.65.
+_DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
+# BGE-reranker-base post-sigmoid scores spread across [0,1] more uniformly than
+# ms-marco-MiniLM-L-6-v2 did (which compressed into ~0.2-0.35 for decent matches).
+# 0.18 was originally tuned for the ms-marco compression — kept here as a
+# permissive default that still routes plausible jobs to the LLM under BGE.
+# Per-profile `routing.llm_threshold` (e.g. 0.30) is the right knob for re-tuning
+# now that the underlying score distribution is wider.
 _DEFAULT_THRESHOLD = 0.18
 _DEFAULT_QUALITY_MODE = "fast"
 
@@ -271,9 +274,10 @@ class SelectiveRouter:
         """
         Return 0.25 when the job title contains any configured target role.
         Applied to the effective score for the routing/tier decision only —
-        never stored in the final score record. ms-marco emits compressed scores
-        (great matches still land at ~0.30), so a single +0.25 boost reliably
-        clears the 0.18 floor for any title-matched role.
+        never stored in the final score record. The boost was originally
+        sized for ms-marco's compressed output (great matches landed near
+        ~0.30); it remains a useful ~+0.25 lift under BGE's wider distribution
+        and reliably clears the 0.18 floor for any title-matched role.
         """
         target_roles = self._config.get("preferences", {}).get("titles", [])
         if not target_roles or not job.title:
@@ -668,16 +672,18 @@ class SelectiveRouter:
             pct_saved,
         )
 
-        # Step 5 diagnostic: warn if many synthetically-scored jobs had very low reranker scores,
-        # which suggests the ms-marco model is poorly calibrated for job-matching queries.
+        # Diagnostic: warn if many synthetically-scored jobs had very low
+        # reranker scores. With BGE-reranker-base most plausible matches now
+        # land at ≥0.30, so persistent sub-0.35 routing scores suggest either
+        # a profile/role mismatch or a calibration issue worth investigating.
         scores = self._synthetic_routing_scores
         if len(scores) >= 5:
             below_threshold = sum(1 for s in scores[:5] if s < 0.35)
             if below_threshold >= 3:
                 logger.warning(
-                    "Reranker may be undertuned for this domain. "
-                    "Consider swapping to cross-encoder/stsb-roberta-base "
-                    "or fine-tuning on feedback data."
+                    "Reranker scoring many jobs <0.35 — profile may be "
+                    "mismatched to scraped roles, or consider fine-tuning "
+                    "the reranker on feedback labels."
                 )
 
 
