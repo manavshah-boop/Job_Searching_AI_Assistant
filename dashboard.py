@@ -61,7 +61,9 @@ from dashboard_ui import (
     render_source_progress,
 )
 from logging_config import configure_logging
+from dashboard_ratings import factor_with_badge, render_rating_panel
 from match_explainer import build_match_explanation
+from user_ratings import attach_role_family_from_config, rating_counts
 from onboarding import render_onboarding, sanitize_slug
 from profile_intent import normalize_profile_intent
 from progress_tracker import ProgressTracker
@@ -553,6 +555,7 @@ def _render_semantic_search_results(slug: str, config: dict[str, Any]) -> None:
     else:
         st.caption("Showing profile-aware reranked semantic matches.")
 
+    rating_role_family = attach_role_family_from_config(slug, config)
     for index, result in enumerate(results[:5], start=1):
         if hasattr(result, "final_score"):
             score_pct = round(result.final_score * 100)
@@ -581,6 +584,15 @@ def _render_semantic_search_results(slug: str, config: dict[str, Any]) -> None:
                     st.caption(f"_{snippet}_")
             if result.url:
                 st.link_button("Open posting", result.url, key=f"semantic_result_{slug}_{result.job_id}")
+            st.divider()
+            st.caption("**Rate this match** — feeds the eval suite.")
+            render_rating_panel(
+                slug,
+                str(result.job_id),
+                role_family=rating_role_family,
+                key_prefix=f"rate_main_semantic_{slug}",
+                show_helper=False,
+            )
 
 
 def _job_filter_state_keys(slug: str) -> dict[str, str]:
@@ -2258,8 +2270,9 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
         if clicked == "open_posting_detail":
             return
 
+    profile_config_for_rating = load_config(profile=slug)
     if record.get("fit_score") is not None:
-        profile_intent = normalize_profile_intent(load_config(profile=slug))
+        profile_intent = normalize_profile_intent(profile_config_for_rating)
         explanation = build_match_explanation(record, record, None, profile_intent)
         with panel("Factor-wise explanation", subtitle="Deterministic reasoning built from stored score evidence"):
             st.caption(f"Recommended action: {explanation.recommended_action}")
@@ -2268,17 +2281,28 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
                 st.write("Top strengths")
                 for factor in explanation.strengths[:3]:
                     details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
-                    st.write(f"- {factor.name}: {factor.explanation}{details}")
+                    st.write(f"- {factor_with_badge(factor)}: {factor.explanation}{details}")
             if explanation.concerns:
                 st.write("Top concerns")
                 for factor in explanation.concerns[:3]:
                     details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
-                    st.write(f"- {factor.name}: {factor.explanation}{details}")
+                    st.write(f"- {factor_with_badge(factor)}: {factor.explanation}{details}")
             elif explanation.unknowns:
                 st.write("Needs more information")
                 for factor in explanation.unknowns[:2]:
                     details = f" Evidence: {' | '.join(factor.evidence[:2])}." if factor.evidence else ""
-                    st.write(f"- {factor.name}: {factor.explanation}{details}")
+                    st.write(f"- {factor_with_badge(factor)}: {factor.explanation}{details}")
+
+    with panel(
+        "Rate this match",
+        subtitle="Your rating builds the eval ground-truth for this profile",
+    ):
+        render_rating_panel(
+            slug,
+            str(record["id"]),
+            role_family=attach_role_family_from_config(slug, profile_config_for_rating),
+            key_prefix="rate_detail",
+        )
 
     dims = {key: value for key, value in record["dimension_scores"].items() if value is not None}
     if dims:
@@ -2744,11 +2768,22 @@ def _render_evaluation_card(slug: str, config: dict[str, Any]) -> None:
     labels_path = _eval_labels_path(slug)
     labels = load_eval_labels(labels_path)
     last_result = load_last_eval_result(slug)
+    counts = rating_counts(slug)
 
     with panel("Evaluation", subtitle="Measure whether semantic ranking is improving for this profile"):
-        st.caption("Label a small set of jobs as great/good/okay/bad/skip to measure ranking quality.")
+        st.caption(
+            "Rate jobs as Great / Good / Okay / Not relevant / Skip from any job card. "
+            "Those ratings ARE the eval ground truth — the more you rate, the more reliable the metrics below."
+        )
         st.write(f"Labels file: {'available' if labels_path.exists() else 'not created yet'}")
         st.write(f"Labeled jobs: {len(labels)}")
+        if any(counts.values()):
+            distribution = " · ".join(
+                f"{label.replace('_match', '').replace('_', ' ').title()}: {count}"
+                for label, count in counts.items()
+                if count
+            )
+            st.caption(f"Rating distribution — {distribution}")
 
         action_cols = st.columns(2, gap="small")
         if action_cols[0].button("Export eval template", key=f"export_eval_template_{slug}", use_container_width=True):

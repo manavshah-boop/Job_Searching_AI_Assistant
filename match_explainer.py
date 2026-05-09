@@ -14,6 +14,7 @@ from profile_intent import ProfileIntent
 from reranker import RerankedJobResult
 
 FactorStatus = Literal["strong", "medium", "weak", "concern", "unknown"]
+FactorSource = Literal["llm", "semantic"]
 
 _ROLE_LABELS = {
     "software_engineering": "engineering stack",
@@ -36,6 +37,10 @@ class FactorExplanation:
     score: float | int | None
     evidence: list[str] = field(default_factory=list)
     explanation: str = ""
+    # "llm" = factor came from a real LLM-scored dimension; "semantic" = factor
+    # came from semantic retrieval / reranker synthesis (no LLM verification).
+    # Surfaced in the dashboard so users can tell verified facts from estimates.
+    source: FactorSource = "llm"
 
 
 @dataclass
@@ -231,6 +236,10 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
     # Filter out raw internal keys before they reach any user-facing evidence field
     flags = _clean_flags(raw_flags)
     skill_misses = list(score_record.get("skill_misses") or [])
+    # Synthetic scoring (reranker fallback when LLM was skipped) populates the
+    # same fields as a real LLM pass; tag the factors with the actual source so
+    # the dashboard can distinguish verified facts from estimates.
+    source: FactorSource = "semantic" if _is_llm_skipped(score_record) else "llm"
 
     factors = [
         FactorExplanation(
@@ -239,6 +248,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=_dimension_score(score_record, "role_fit"),
             evidence=reasons[:2],
             explanation="Stored role-fit score from the LLM scoring pass.",
+            source=source,
         ),
         FactorExplanation(
             name="Skills/tools match",
@@ -246,6 +256,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=_dimension_score(score_record, "stack_match"),
             evidence=(reasons + skill_misses[:2])[:3],
             explanation="Combines the LLM stack/skills dimension with saved skill gaps.",
+            source=source,
         ),
         FactorExplanation(
             name="Seniority fit",
@@ -253,6 +264,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=_dimension_score(score_record, "seniority"),
             evidence=flags[:2],  # cleaned — no raw internal keys here
             explanation="How well the posting level lines up with the profile's target seniority.",
+            source=source,
         ),
         FactorExplanation(
             name="Location/remote fit",
@@ -260,6 +272,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=_dimension_score(score_record, "location"),
             evidence=[flag for flag in flags if "location" in flag.lower()][:2],
             explanation="Uses the saved location dimension and any explicit location watchouts.",
+            source=source,
         ),
         FactorExplanation(
             name="Growth/company fit",
@@ -267,6 +280,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=_dimension_score(score_record, "growth"),
             evidence=reasons[2:4],
             explanation="Reflects the company/growth dimension from the scoring pass.",
+            source=source,
         ),
         FactorExplanation(
             name="Compensation fit",
@@ -274,6 +288,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=_dimension_score(score_record, "compensation"),
             evidence=[flag for flag in flags if any(token in flag.lower() for token in ("salary", "compensation", "pay"))][:2],
             explanation="Based on the saved compensation dimension and any comp-related warnings.",
+            source=source,
         ),
         FactorExplanation(
             name="ATS/resume keyword fit",
@@ -281,6 +296,7 @@ def explain_score_dimensions(score_record: Optional[dict]) -> list[FactorExplana
             score=score_record.get("ats_score"),
             evidence=skill_misses[:3],
             explanation="ATS score and saved missing-skill notes estimate resume keyword coverage.",
+            source=source,
         ),
     ]
     return [factor for factor in factors if factor.score is not None or factor.evidence]
@@ -307,6 +323,7 @@ def explain_semantic_evidence(
             score=round(reranked_result.final_score * 100),
             evidence=_dedupe(positive[:2] + [reranked_result.match_reason]),
             explanation="Semantic retrieval and reranking both point to a close role match.",
+            source="semantic",
         )
     )
 
@@ -320,6 +337,7 @@ def explain_semantic_evidence(
             score=round(reranked_result.rerank_score * 100),
             evidence=_dedupe(skill_evidence)[:4],
             explanation=f"Semantic evidence lines up with the profile's {skill_label.lower()}.",
+            source="semantic",
         )
     )
 
@@ -331,6 +349,7 @@ def explain_semantic_evidence(
                 score=round(reranked_result.section_scores.get("responsibilities", 0.0) * 100),
                 evidence=[reranked_result.match_reason],
                 explanation="The responsibilities section contains strong overlap with the target profile.",
+                source="semantic",
             )
         )
     if "requirements" in matched_sections:
@@ -341,6 +360,7 @@ def explain_semantic_evidence(
                 score=round(reranked_result.section_scores.get("requirements", 0.0) * 100),
                 evidence=matched_keywords[:4],
                 explanation="Requirements text matched the candidate intent closely enough to survive reranking.",
+                source="semantic",
             )
         )
 
@@ -352,6 +372,7 @@ def explain_semantic_evidence(
                 score=None,
                 evidence=[item for item in positive if "remote" in item.lower() or "location" in item.lower()][:2],
                 explanation="Semantic evidence includes a direct remote or location alignment signal.",
+                source="semantic",
             )
         )
 
@@ -363,6 +384,7 @@ def explain_semantic_evidence(
                 score=round(reranked_result.section_scores.get("compensation", 0.0) * 100),
                 evidence=["Compensation section was part of the semantic match."],
                 explanation="Pay details were surfaced in matched sections, which can support review decisions.",
+                source="semantic",
             )
         )
 
@@ -374,6 +396,7 @@ def explain_semantic_evidence(
                 score=None,
                 evidence=profile_intent.credentials[:3],
                 explanation="The profile includes credentials and no credential mismatch was detected in semantic evidence.",
+                source="semantic",
             )
         )
 
@@ -410,6 +433,7 @@ def explain_concerns(
                 score=None,
                 evidence=[item],
                 explanation=item,
+                source="semantic",
             )
         )
 
@@ -421,6 +445,7 @@ def explain_concerns(
                 score=None,
                 evidence=missing_or_unclear[:3],
                 explanation="The job appears to require credentials that are not confirmed in the profile.",
+                source="semantic",
             )
         )
 
@@ -434,6 +459,7 @@ def explain_concerns(
                     score=None,
                     evidence=["Paid status was not surfaced in the matched sections."],
                     explanation="Internship compensation may need manual review before applying.",
+                    source="semantic",
                 )
             )
 
@@ -454,6 +480,7 @@ def _build_unknowns(
                 score=None,
                 evidence=["No stored fit score is available for this job yet."],
                 explanation="Semantic evidence exists, but the LLM scoring pass has not populated dimension scores.",
+                source="llm",
             )
         )
     if reranked_result is None:
@@ -464,6 +491,7 @@ def _build_unknowns(
                 score=None,
                 evidence=["No reranked semantic result was provided."],
                 explanation="Only stored score data is available, so section-level match evidence is limited.",
+                source="semantic",
             )
         )
     elif profile_intent.remote_ok and "Location/remote fit" not in {factor.name for factor in explain_semantic_evidence(reranked_result, profile_intent)}:
@@ -474,6 +502,7 @@ def _build_unknowns(
                 score=None,
                 evidence=["Remote or preferred location language did not appear in the strongest matched sections."],
                 explanation="The role may still fit, but location specifics were not strongly evidenced.",
+                source="semantic",
             )
         )
     if profile_intent.compensation and reranked_result is not None and "compensation" not in reranked_result.matched_sections:
@@ -484,6 +513,7 @@ def _build_unknowns(
                 score=None,
                 evidence=["Compensation details were not part of the strongest semantic match."],
                 explanation="Pay fit may require opening the posting and checking the full compensation details.",
+                source="semantic",
             )
         )
     return unknowns

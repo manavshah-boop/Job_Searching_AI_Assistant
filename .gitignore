@@ -49,6 +49,10 @@ Thumbs.db
 # Profiles
 profiles/default
 profiles/test
+# Per-profile runtime artifacts (Chroma vector indices, MLflow runs)
+profiles/*/chroma/
+profiles/*/mlruns/
+profiles/*/eval_last_result.json
 
 # Logs
 *.log

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from match_explainer import build_match_explanation, recommend_action, summarize_match
+from match_explainer import (
+    FactorExplanation,
+    build_match_explanation,
+    explain_score_dimensions,
+    recommend_action,
+    summarize_match,
+)
 from profile_intent import normalize_profile_intent
 from reranker import MatchEvidence, RerankedJobResult
 
@@ -235,3 +241,88 @@ def test_recommended_action_is_deterministic():
     explanation = build_match_explanation(_score_record(), _score_record(), _reranked_result(title="Backend Engineer"), intent)
 
     assert recommend_action(explanation) == explanation.recommended_action
+
+
+# --- MED-5: FactorExplanation.source distinguishes LLM-verified vs synthetic factors ---
+
+
+def test_factor_explanation_default_source_is_llm():
+    factor = FactorExplanation(name="Role fit", status="strong", score=80, evidence=[])
+    assert factor.source == "llm"
+
+
+def test_llm_scored_record_produces_llm_source_factors():
+    record = _score_record()  # no synthetic flag
+    factors = explain_score_dimensions(record)
+    assert factors, "expected at least one factor for an LLM-scored record"
+    assert all(f.source == "llm" for f in factors), (
+        f"expected all factors source=llm, got {[(f.name, f.source) for f in factors]}"
+    )
+
+
+def test_synthetic_score_record_produces_semantic_source_factors():
+    # Reranker fallback emits flags like 'estimate' or 'not reviewed' to mark synthetic scores.
+    record = _score_record(flags=["AI verification skipped (auto-estimate)"])
+    factors = explain_score_dimensions(record)
+    assert factors
+    assert all(f.source == "semantic" for f in factors), (
+        f"expected all factors source=semantic for synthetic record, got "
+        f"{[(f.name, f.source) for f in factors]}"
+    )
+
+
+def test_build_match_explanation_tags_semantic_factors():
+    intent = normalize_profile_intent(
+        _config("software_engineering", title="Backend Engineer", skills=["Python", "AWS"])
+    )
+    explanation = build_match_explanation(
+        _score_record(),
+        _score_record(),
+        _reranked_result(title="Backend Engineer"),
+        intent,
+    )
+    semantic_only_names = {"Responsibilities match", "Requirements match"}
+    semantic_factors = [f for f in explanation.strengths if f.name in semantic_only_names]
+    assert semantic_factors, "expected semantic-derived strengths in this scenario"
+    assert all(f.source == "semantic" for f in semantic_factors)
+
+
+def test_build_match_explanation_tags_llm_factors_when_score_is_real():
+    """When no reranked result is present, all surfaced factors come from the LLM path."""
+    intent = normalize_profile_intent(
+        _config("software_engineering", title="Backend Engineer", skills=["Python", "AWS"])
+    )
+    explanation = build_match_explanation(_score_record(), _score_record(), None, intent)
+
+    # With no reranked_result, the only synthetic-source factor that gets injected is
+    # the "Semantic evidence" unknown placeholder. Filter it out and assert the rest
+    # are tagged "llm".
+    factors = [
+        f
+        for f in explanation.strengths + explanation.concerns + explanation.unknowns
+        if f.name != "Semantic evidence"
+    ]
+    assert factors, "expected at least one factor from the LLM-scored record"
+    assert all(f.source == "llm" for f in factors), (
+        f"expected source=llm for non-semantic factors; got "
+        f"{[(f.name, f.source) for f in factors]}"
+    )
+
+
+def test_build_match_explanation_tags_llm_factors_as_semantic_when_synthetic():
+    intent = normalize_profile_intent(
+        _config("software_engineering", title="Backend Engineer", skills=["Python", "AWS"])
+    )
+    synthetic = _score_record(flags=["AI verification skipped (auto-estimate)"])
+    explanation = build_match_explanation(
+        synthetic,
+        synthetic,
+        _reranked_result(title="Backend Engineer"),
+        intent,
+    )
+    # Both semantic-derived and synthetic-LLM-derived factors should report semantic.
+    all_factors = explanation.strengths + explanation.concerns + explanation.unknowns
+    sources = {factor.source for factor in all_factors}
+    assert sources == {"semantic"}, (
+        f"expected only semantic-source factors when score is synthetic, got {sources}"
+    )
