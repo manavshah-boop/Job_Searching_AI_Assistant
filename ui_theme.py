@@ -3043,6 +3043,160 @@ def _global_css() -> str:
         letter-spacing: 0.08em;
         margin-top: 5px;
     }}
+
+    /* ── Onboarding (chunk 4) ───────────────────────────────────────────── */
+    .onb-wrap {{
+        max-width: 980px;
+        margin: 8px auto 24px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--r-lg);
+        box-shadow: var(--shadow-2);
+        overflow: hidden;
+    }}
+    .onb-side {{
+        padding: 6px 4px 12px;
+    }}
+    .onb-side .onb-side-takes {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        margin-top: 18px;
+        letter-spacing: 0.04em;
+    }}
+    .onb-steps {{ display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }}
+    .onb-step {{
+        display: grid;
+        grid-template-columns: 22px 1fr;
+        gap: 10px;
+        align-items: flex-start;
+        padding: 10px 8px;
+        border-radius: 8px;
+    }}
+    .onb-step .num {{
+        width: 22px; height: 22px;
+        border-radius: 50%;
+        border: 1.5px solid var(--line-2);
+        background: var(--surface);
+        display: grid; place-items: center;
+        font-family: var(--font-mono); font-size: 10px; color: var(--muted);
+    }}
+    .onb-step.done .num {{ background: var(--ink); color: var(--accent-ink); border-color: var(--ink); }}
+    .onb-step.active {{ background: var(--bg-2); border: 1px solid var(--line); }}
+    .onb-step.active .num {{ border-color: var(--ink); color: var(--ink); background: var(--surface); font-weight: 700; }}
+    .onb-step .nm {{ font-size: 13px; font-weight: 600; line-height: 1.2; }}
+    .onb-step .ds {{ font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.4; }}
+    .onb-step:not(.active) .nm {{ color: var(--ink-2); }}
+
+    .onb-eyebrow {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }}
+    .onb-h2 {{
+        font-family: var(--font-display);
+        font-size: 26px;
+        letter-spacing: -0.03em;
+        line-height: 1.15;
+        margin: 4px 0 6px;
+        color: var(--ink);
+    }}
+    .onb-hint {{
+        color: var(--muted);
+        font-size: 13.5px;
+        line-height: 1.55;
+        max-width: 56ch;
+    }}
+    .onb-foot-pg {{
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--muted);
+        text-align: center;
+        padding-top: 10px;
+    }}
+
+    /* Value-prop cards (Welcome step) */
+    .onb-value-card {{
+        border: 1px solid var(--line);
+        background: var(--bg-2);
+        border-radius: var(--r-md);
+        padding: 14px 16px;
+        height: 100%;
+    }}
+    .onb-value-card .t {{ font-weight: 600; font-size: 13.5px; color: var(--ink); }}
+    .onb-value-card .d {{ color: var(--muted); font-size: 12.5px; line-height: 1.55; margin-top: 6px; }}
+
+    /* Choice cards (Sources / Cadence steps) */
+    .choice {{
+        display: block;
+        border: 1px solid var(--line-2);
+        border-radius: var(--r-md);
+        padding: 14px 16px;
+        background: var(--surface);
+    }}
+    .choice.on {{ border-color: var(--ink); background: var(--bg-2); box-shadow: 0 0 0 3px rgba(22,23,15,0.05); }}
+    body.theme-dark .choice.on {{ box-shadow: 0 0 0 3px rgba(241,239,230,0.06); }}
+    .choice .top {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }}
+    .choice h4 {{ font-size: 14px; font-weight: 600; margin: 0; color: var(--ink); }}
+    .choice p {{ margin: 4px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }}
+    .choice .meta {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }}
+
+    /* Drop-zone for resume (Resume step) */
+    .onb-dropzone {{
+        border: 1.5px dashed var(--line-2);
+        border-radius: 14px;
+        padding: 24px;
+        text-align: center;
+        background: var(--bg-2);
+    }}
+    .onb-dropzone .lbl {{
+        font-family: var(--font-mono);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+    }}
+    .onb-dropzone .h {{
+        font-family: var(--font-display);
+        font-size: 18px;
+        font-weight: 600;
+        margin-top: 6px;
+        color: var(--ink);
+    }}
+    .onb-dropzone .s {{ color: var(--muted); font-size: 12.5px; margin-top: 4px; }}
+
+    /* Theme toggle (segmented Day / Night) */
+    .theme-toggle {{
+        display: inline-flex;
+        border: 1px solid var(--line);
+        border-radius: 99px;
+        background: var(--surface);
+        overflow: hidden;
+        padding: 2px;
+        gap: 1px;
+    }}
+    .theme-toggle button {{
+        padding: 4px 10px;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        border-radius: 99px;
+        line-height: 1.4;
+        background: transparent;
+        border: 0;
+    }}
+    .theme-toggle button.on {{ background: var(--ink); color: var(--accent-ink); }}
+    body.theme-dark .theme-toggle button.on {{ background: var(--accent); color: var(--accent-ink); }}
     </style>
     """
 
@@ -3055,9 +3209,9 @@ def inject_theme_class(theme: str = "mono") -> None:
     """Set the active theme class on the parent document body.
 
     Beacon's design tokens default to the editorial light "mono" theme via
-    `:root`. The `body.theme-dark` override exists; chunk 4 will ship the
-    runtime toggle. For now this just stamps `body.theme-mono` so future
-    swaps are a single class flip.
+    `:root`. The `body.theme-dark` override switches the palette in place.
+    The `render_theme_toggle()` widget below drives the active theme via
+    `st.session_state["beacon_theme"]`; this function just stamps the class.
     """
     safe = "dark" if theme == "dark" else "mono"
     components.html(
@@ -3074,6 +3228,40 @@ def inject_theme_class(theme: str = "mono") -> None:
         height=0,
         width=0,
     )
+
+
+def render_theme_toggle(*, key: str = "beacon_theme_toggle") -> None:
+    """Render the Day / Night segmented control. Persists to st.session_state["beacon_theme"].
+
+    Apply the resulting class on the next rerun via `inject_theme_class()`,
+    which `apply_page_scaffold()` already calls. The toggle is intentionally
+    minimal — Streamlit doesn't give us a true topbar to dock it into, so the
+    caller decides where it appears (typically the right edge of a thin row at
+    the top of the main panel).
+    """
+    current = st.session_state.get("beacon_theme", "mono")
+    label_to_value = {"Day": "mono", "Night": "dark"}
+    value_to_label = {v: k for k, v in label_to_value.items()}
+
+    st.markdown(
+        "<div class='theme-toggle-host'>"
+        "<style>.theme-toggle-host [data-testid='stHorizontalBlock'] {gap:0;}"
+        ".theme-toggle-host div[role='radiogroup'] {gap:0 !important;}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+    new_label = st.segmented_control(
+        "Theme",
+        list(label_to_value.keys()),
+        default=value_to_label.get(current, "Day"),
+        key=key,
+        label_visibility="collapsed",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    new_value = label_to_value.get(new_label or "Day", "mono")
+    if new_value != current:
+        st.session_state["beacon_theme"] = new_value
+        st.rerun()
 
 
 def inject_sidebar_scroll_guard() -> None:
@@ -3257,7 +3445,7 @@ def apply_page_scaffold(
         _PAGE_CONFIG_APPLIED = True
 
     inject_global_css()
-    inject_theme_class("mono")
+    inject_theme_class(st.session_state.get("beacon_theme", "mono"))
     inject_sidebar_scroll_guard()
 
     if header_title:

@@ -36,6 +36,14 @@ _DEFAULT_ROUTING_CONFIG: Dict[str, Any] = {
     "log_routing_decisions": True,
 }
 
+# Cadence is consumed by the dashboard onboarding/settings UI today; the
+# scheduler hookup is intentionally left to a future chunk. Existing configs
+# without a `schedule` block default to "manual" so behavior matches what shipped
+# before this field existed.
+_DEFAULT_SCHEDULE_CONFIG: Dict[str, Any] = {
+    "cadence": "manual",
+}
+
 
 def apply_config_defaults(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Fill in optional config defaults without changing normal app behavior."""
@@ -47,6 +55,9 @@ def apply_config_defaults(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     routing_cfg = normalized.setdefault("routing", {})
     for key, value in _DEFAULT_ROUTING_CONFIG.items():
         routing_cfg.setdefault(key, value)
+    schedule_cfg = normalized.setdefault("schedule", {})
+    for key, value in _DEFAULT_SCHEDULE_CONFIG.items():
+        schedule_cfg.setdefault(key, value)
     return normalized
 
 
