@@ -20,10 +20,11 @@ import copy
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -3779,6 +3780,487 @@ def _render_jobs_tab(
     _maybe_open_drawer(slug)
 
 
+_ACTIVITY_STAGES: list[tuple[Stage, str]] = [
+    (Stage.DISCOVERING, "Discovery"),
+    (Stage.FETCHING,    "Job board fetch"),
+    (Stage.SCRAPING,    "Scraping"),
+    (Stage.SCORING,     "Scoring & filtering"),
+    (Stage.EMBEDDING,   "Embeddings"),
+    (Stage.FINALIZING,  "Finalize"),
+]
+
+_ACTIVITY_SOURCE_ORDER: list[tuple[str, str]] = [
+    ("greenhouse", "greenhouse"),
+    ("lever",      "lever"),
+    ("ashby",      "ashby"),
+    ("workable",   "workable"),
+    ("hn",         "hn"),
+    ("himalayas",  "himalayas"),
+]
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_history_runs(slug: str, limit: int = 200) -> list[dict[str, Any]]:
+    return get_recent_runs(limit=limit, profile=slug)
+
+
+def _cancel_worker_lockfile(slug: str) -> bool:
+    """Mark the running worker as cancel-requested by removing its lockfile.
+
+    The worker process is not killed; the dashboard simply stops treating it
+    as live. Next render the run banner reflects idle state. Returns True if a
+    lockfile was actually removed.
+    """
+    lf = _worker_lockfile(slug)
+    try:
+        if lf.exists():
+            lf.unlink()
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _render_activity_run_card(
+    slug: str,
+    runs: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+    raw_config: dict[str, Any],
+    *,
+    worker_running: bool,
+) -> None:
+    """Card 1: latest/current run header — title, actions, stages | sources."""
+    progress_data = _read_progress_json(slug) if worker_running else None
+    tracker: ProgressTracker | None = None
+    if progress_data:
+        try:
+            tracker = ProgressTracker.from_dict(progress_data)
+        except Exception:
+            tracker = None
+
+    latest_run = runs[0] if runs else None
+    if worker_running:
+        run_id = latest_run.get("run_id") if latest_run else None
+        run_title = f"Run #{run_id} · in progress" if run_id else "Run · in progress"
+        if tracker:
+            running_stage = next(
+                (label for stage, label in _ACTIVITY_STAGES
+                 if tracker.stages.get(stage) and tracker.stages[stage].status == StageStatus.RUNNING),
+                "starting",
+            )
+            mins, secs = divmod(int(tracker.elapsed_time.total_seconds()), 60)
+            sub = f"started {mins:02d}:{secs:02d} ago · {running_stage} stage"
+        else:
+            sub = "worker is starting up"
+    elif latest_run:
+        run_id = latest_run.get("run_id") or "?"
+        status = str(latest_run.get("status") or "complete").lower()
+        run_title = f"Run #{run_id} · {status}"
+        rel = _format_relative(latest_run.get("finished_at") or latest_run.get("started_at"))
+        rel_text = f"{rel} ago" if rel not in {"—", "just now"} else rel
+        duration = _format_run_duration(latest_run.get("started_at"), latest_run.get("finished_at"))
+        sub = f"finished {rel_text} · {duration}"
+    else:
+        run_title = "No runs yet"
+        sub = "Run the pipeline to populate this panel."
+
+    head_cols = st.columns([6.4, 1.3, 1.3], gap="small")
+    with head_cols[0]:
+        st.markdown(
+            (
+                "<div class='beacon-card-head' style='border:1px solid var(--line);"
+                "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+                "background:var(--surface);padding:14px 18px'>"
+                "<div>"
+                f"<div class='beacon-card-title'>{html.escape(run_title)}</div>"
+                f"<div class='beacon-card-sub'>{html.escape(sub)}</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with head_cols[1]:
+        json_disabled = latest_run is None
+        run_payload = json.dumps(latest_run or {}, indent=2, default=str)
+        st.download_button(
+            "View JSON",
+            data=run_payload.encode("utf-8"),
+            file_name=f"run_{(latest_run or {}).get('run_id', 'none')}.json",
+            mime="application/json",
+            key=f"activity_run_json_{slug}",
+            use_container_width=True,
+            disabled=json_disabled,
+        )
+    with head_cols[2]:
+        cancel_disabled = not worker_running
+        if st.button(
+            "Cancel",
+            key=f"activity_run_cancel_{slug}",
+            use_container_width=True,
+            disabled=cancel_disabled,
+        ):
+            if _cancel_worker_lockfile(slug):
+                st.toast("Cancel requested. The worker will finish its current step then stop refreshing the lockfile.")
+            else:
+                st.toast("No live worker to cancel.")
+            st.rerun()
+
+    stages_html_parts: list[str] = []
+    for stage, label in _ACTIVITY_STAGES:
+        prog = tracker.stages.get(stage) if tracker else None
+        status = prog.status if prog else None
+        cls = "queue"
+        if status == StageStatus.COMPLETE:
+            cls = "done"
+        elif status == StageStatus.RUNNING:
+            cls = "run"
+        elif status == StageStatus.FAILED:
+            cls = "fail"
+        count_html = ""
+        if prog and prog.metrics:
+            metric_str = " · ".join(f"{k}: {v}" for k, v in list(prog.metrics.items())[:2])
+            count_html = f"<span class='stg-count'>{html.escape(metric_str)}</span>"
+        stages_html_parts.append(
+            "<div class='activity-stage " + cls + "'>"
+            "<span class='stg-icon'></span>"
+            f"<span class='stg-name'>{html.escape(label)}</span>"
+            f"{count_html}"
+            "</div>"
+        )
+    stages_html = "<div class='activity-stage-list'>" + "".join(stages_html_parts) + "</div>"
+
+    enabled_sources = _enabled_sources(raw_config)
+    source_counts: dict[str, int] = {}
+    for record in records:
+        key = str(record.get("source") or "").lower()
+        if key:
+            source_counts[key] = source_counts.get(key, 0) + 1
+
+    if worker_running and latest_run and latest_run.get("jobs_scraped"):
+        max_count = max(int(latest_run.get("jobs_scraped") or 0), 1)
+    else:
+        max_count = max(max(source_counts.values(), default=0), 1)
+
+    rendered_sources: list[str] = []
+    for source_key, label_key in _ACTIVITY_SOURCE_ORDER:
+        flag_key = "hackernews" if source_key == "hn" else source_key
+        on = bool(enabled_sources.get(flag_key, False))
+        count = source_counts.get(label_key, 0)
+        pct = max(0, min(100, int(round(100 * count / max_count)))) if on else 0
+        bar_color = "var(--signal)" if on else "var(--muted)"
+        rendered_sources.append(
+            "<div class='activity-source-row'>"
+            f"<span class='nm'>{html.escape(label_key)}</span>"
+            "<div class='progress'>"
+            f"<div style='width:{pct}%;background:{bar_color}'></div>"
+            "</div>"
+            f"<span class='ct'>{count}</span>"
+            "</div>"
+        )
+    sources_html = "<div class='activity-source-list'>" + "".join(rendered_sources) + "</div>"
+
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px'>"
+            "<div class='activity-run-grid'>"
+            "<div>"
+            "<div class='col-eyebrow'>Stages</div>"
+            f"{stages_html}"
+            "</div>"
+            "<div>"
+            "<div class='col-eyebrow'>Sources</div>"
+            f"{sources_html}"
+            "</div>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _build_activity_feed_events(
+    runs: list[dict[str, Any]],
+    *,
+    worker_running: bool,
+    tracker: ProgressTracker | None,
+) -> list[dict[str, Any]]:
+    """Synthesize a reverse-chronological feed from runs + live tracker state."""
+    events: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+
+    if worker_running and tracker:
+        for stage, label in _ACTIVITY_STAGES:
+            prog = tracker.stages.get(stage)
+            if not prog:
+                continue
+            if prog.status == StageStatus.RUNNING:
+                metric_str = ""
+                if prog.metrics:
+                    metric_str = " · " + ", ".join(
+                        f"{k}: {v}" for k, v in list(prog.metrics.items())[:2]
+                    )
+                events.append({
+                    "ts_dt": _seconds_to_dt(prog.started_at) or now,
+                    "kind": "info",
+                    "body": f"<b>{html.escape(label)}</b> stage in progress{html.escape(metric_str)}",
+                    "right": "running",
+                })
+            elif prog.status == StageStatus.COMPLETE and prog.completed_at:
+                duration_str = _seconds_duration(prog.duration)
+                events.append({
+                    "ts_dt": _seconds_to_dt(prog.completed_at) or now,
+                    "kind": "success",
+                    "body": f"<b>{html.escape(label)}</b> stage finished",
+                    "right": duration_str,
+                })
+
+    for run in runs[:14]:
+        run_id = run.get("run_id") or "?"
+        status = str(run.get("status") or "").lower()
+        finished_at = run.get("finished_at")
+        started_at = run.get("started_at")
+        duration_str = _format_run_duration(started_at, finished_at)
+        scraped = int(run.get("jobs_scraped") or 0)
+        scored = int(run.get("jobs_scored") or 0)
+        saved = int(run.get("jobs_saved") or 0)
+        errors = run.get("errors") or []
+
+        if started_at:
+            events.append({
+                "ts_dt": _parse_iso(started_at),
+                "kind": "info",
+                "body": f"Run <b>#{html.escape(str(run_id))}</b> started · source <b>{html.escape(str(run.get('source') or 'pipeline'))}</b>",
+                "right": "—",
+            })
+
+        for err in errors[:3]:
+            err_text = str(err).strip().splitlines()[0][:160]
+            events.append({
+                "ts_dt": _parse_iso(finished_at or started_at),
+                "kind": "danger",
+                "body": f"Run #{html.escape(str(run_id))} error: {html.escape(err_text)}",
+                "right": "error",
+            })
+
+        if finished_at and status not in {"running", ""}:
+            if status in {"failed", "error", "crashed"}:
+                kind = "danger"
+                body = f"Run <b>#{html.escape(str(run_id))}</b> failed"
+            elif errors:
+                kind = "warn"
+                body = (
+                    f"Run <b>#{html.escape(str(run_id))}</b> finished with "
+                    f"<b>{len(errors)} error{'s' if len(errors) != 1 else ''}</b> · "
+                    f"scraped {scraped}, scored {scored}, saved {saved}"
+                )
+            else:
+                kind = "success"
+                body = (
+                    f"Run <b>#{html.escape(str(run_id))}</b> complete · "
+                    f"scraped <b>{scraped}</b>, scored <b>{scored}</b>, saved <b>{saved}</b>"
+                )
+            events.append({
+                "ts_dt": _parse_iso(finished_at),
+                "kind": kind,
+                "body": body,
+                "right": duration_str,
+            })
+
+    events = [e for e in events if e["ts_dt"] is not None]
+    events.sort(key=lambda e: e["ts_dt"], reverse=True)
+    return events
+
+
+def _seconds_to_dt(value: float | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _seconds_duration(value: float | None) -> str:
+    if value is None:
+        return "—"
+    total = max(int(value), 0)
+    minutes, seconds = divmod(total, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _render_activity_feed_card(
+    slug: str,
+    runs: list[dict[str, Any]],
+    *,
+    worker_running: bool,
+) -> None:
+    """Card 2: activity feed (most recent first)."""
+    progress_data = _read_progress_json(slug) if worker_running else None
+    tracker: ProgressTracker | None = None
+    if progress_data:
+        try:
+            tracker = ProgressTracker.from_dict(progress_data)
+        except Exception:
+            tracker = None
+
+    events = _build_activity_feed_events(runs, worker_running=worker_running, tracker=tracker)
+
+    head_cols = st.columns([6.4, 2.6], gap="small")
+    with head_cols[0]:
+        st.markdown(
+            (
+                "<div class='beacon-card-head' style='border:1px solid var(--line);"
+                "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+                "background:var(--surface);padding:14px 18px'>"
+                "<div>"
+                "<div class='beacon-card-title'>Activity feed</div>"
+                "<div class='beacon-card-sub'>Most recent first</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with head_cols[1]:
+        if events:
+            log_lines: list[str] = []
+            for ev in events:
+                ts_iso = ev["ts_dt"].astimezone(timezone.utc).isoformat(timespec="seconds")
+                clean_body = re.sub(r"<[^>]+>", "", ev["body"])
+                log_lines.append(f"{ts_iso}  [{ev['kind']:<7}]  {clean_body}  ({ev['right']})")
+            log_blob = "\n".join(log_lines).encode("utf-8")
+        else:
+            log_blob = b"# No activity yet."
+        st.download_button(
+            "Export log",
+            data=log_blob,
+            file_name=f"activity_{slug}.log",
+            mime="text/plain",
+            key=f"activity_feed_export_{slug}",
+            use_container_width=True,
+        )
+
+    if not events:
+        st.markdown(
+            (
+                "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+                "border-top:0;margin-top:-1px;padding:24px'>"
+                "<div class='beacon-empty'>"
+                "<div class='ic'>·</div>"
+                "<div class='h'>No activity yet.</div>"
+                "<div class='s'>Run the pipeline once to populate the feed.</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    rows_html: list[str] = []
+    for ev in events[:50]:
+        ts_label = _format_relative(ev["ts_dt"].astimezone(timezone.utc).isoformat())
+        rows_html.append(
+            f"<div class='feed-row {html.escape(ev['kind'])}'>"
+            f"<span class='ts'>{html.escape(ts_label)}</span>"
+            "<span class='dot'></span>"
+            f"<div class='body'>{ev['body']}</div>"
+            f"<span class='right'>{html.escape(ev['right'])}</span>"
+            "</div>"
+        )
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px'>"
+            "<div class='feed'>"
+            + "".join(rows_html)
+            + "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_run_history_chart(slug: str) -> None:
+    """Card 3: 14-day vertical bar chart of new high-fit per day."""
+    history = _cached_history_runs(slug)
+
+    today_utc = datetime.now(timezone.utc).date()
+    by_day: dict[Any, list[dict[str, Any]]] = {}
+    for run in history:
+        finished = run.get("finished_at") or run.get("started_at")
+        dt = _parse_iso(finished)
+        if dt is None:
+            continue
+        day = dt.astimezone(timezone.utc).date()
+        by_day.setdefault(day, []).append(run)
+
+    days: list[Any] = []
+    counts: list[int] = []
+    durations: list[int] = []
+    for offset in range(13, -1, -1):
+        day = today_utc - timedelta(days=offset)
+        runs_for_day = by_day.get(day, [])
+        day_high = sum(int(r.get("jobs_saved") or 0) for r in runs_for_day)
+        days.append(day)
+        counts.append(day_high)
+        for r in runs_for_day:
+            s = _parse_iso(r.get("started_at"))
+            f = _parse_iso(r.get("finished_at"))
+            if s and f:
+                durations.append(max(int((f - s).total_seconds()), 0))
+
+    total_runs_14d = sum(len(by_day.get(today_utc - timedelta(days=o), [])) for o in range(14))
+    if durations:
+        avg_secs = sum(durations) // len(durations)
+        m, s = divmod(avg_secs, 60)
+        avg_label = f"{m}m {s:02d}s"
+    else:
+        avg_label = "—"
+
+    max_count = max(counts) if max(counts, default=0) > 0 else 1
+    bars_html: list[str] = []
+    for idx, (day, count) in enumerate(zip(days, counts)):
+        is_today = idx == len(counts) - 1
+        height_pct = max(5, int(round(100 * count / max_count))) if count else 5
+        cls = "bar today" if is_today else "bar"
+        title_attr = f"{day.isoformat()} · {count} new saved jobs"
+        bars_html.append(
+            f"<div class='{cls}' style='height:{height_pct}%' title='{html.escape(title_attr)}'></div>"
+        )
+
+    start_label = days[0].strftime("%b %d") if days else ""
+    end_label = "today"
+
+    st.markdown(
+        (
+            "<div class='beacon-card-head' style='border:1px solid var(--line);"
+            "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+            "background:var(--surface);padding:14px 18px'>"
+            "<div>"
+            "<div class='beacon-card-title'>Run history · last 14 days</div>"
+            "<div class='beacon-card-sub'>One bar per day · taller = more new saved jobs</div>"
+            "</div>"
+            f"<span style='font-family:var(--font-mono);font-size:11px;color:var(--muted)'>"
+            f"{total_runs_14d} runs · avg {html.escape(avg_label)}"
+            "</span>"
+            "</div>"
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px'>"
+            "<div class='history-chart'>"
+            + "".join(bars_html)
+            + "</div>"
+            "<div class='history-axis'>"
+            f"<span>{html.escape(start_label)}</span>"
+            f"<span>{html.escape(end_label)}</span>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _render_activity_tab(
     slug: str,
     runs: list[dict[str, Any]],
@@ -3786,61 +4268,80 @@ def _render_activity_tab(
     raw_config: dict[str, Any],
     config: dict[str, Any],
 ) -> None:
-    with section_shell("Activity", SECTION_COPY["Activity"]):
-        left, right = st.columns([1.18, 0.82], gap="large")
-        with left:
-            with panel("Latest run", subtitle="Most recent activity, simplified to the essentials"):
-                _render_last_run_summary(runs, history_expander_label="View all runs")
+    worker_running = _worker_is_running(slug)
+    records = _cached_fetch_job_summaries(slug)
 
-        with right:
-            _render_review_status_card(slug, metrics, raw_config)
-            _render_evaluation_card(slug, config)
+    head_cols = st.columns([6.4, 2.6], gap="medium")
+    with head_cols[0]:
+        _render_beacon_page_header(
+            "Activity · Pipeline runs",
+            "Everything the agent did, in order.",
+            "A timeline of every fetch, score, and decision. Click any run to inspect its inputs and outputs.",
+        )
+    with head_cols[1]:
+        action_cols = st.columns(2, gap="small")
+        with action_cols[0]:
+            if st.button(
+                "Filter",
+                key=f"activity_filter_{slug}",
+                use_container_width=True,
+                help="Filtering arrives in a follow-up; the feed below already shows everything in chronological order.",
+            ):
+                st.toast("Filter UI is coming soon — the feed below is already chronological.")
+        with action_cols[1]:
+            if st.button(
+                "Run now ⌘R",
+                key=f"activity_run_now_{slug}",
+                use_container_width=True,
+                type="primary",
+                disabled=worker_running,
+            ):
+                _queue_pipeline_run(slug)
 
-        disq_count = metrics.get("disqualified_count", 0)
-        if disq_count > 0:
-            disq_label = f"Filtered out ({disq_count} job{'s' if disq_count != 1 else ''} hidden by scoring rules)"
-            with st.expander(disq_label, expanded=False):
+    _render_activity_run_card(slug, runs, records, raw_config, worker_running=worker_running)
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    _render_activity_feed_card(slug, runs, worker_running=worker_running)
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    _render_run_history_chart(slug)
+
+    disq_count = metrics.get("disqualified_count", 0)
+    scrape_rej_count = metrics.get("scrape_rejected_count", 0)
+    if disq_count or scrape_rej_count:
+        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+        with st.expander("Filtered out · breakdown", expanded=False):
+            if disq_count:
                 st.caption(
-                    "These jobs were disqualified by hard-no rules during scoring (e.g. "
-                    "intern-only, location mismatch, YOE mismatch, or title blocklist). "
-                    "They are stored in the database but excluded from the review queue and metrics."
+                    f"{disq_count} job{'s' if disq_count != 1 else ''} hidden by hard-no scoring rules. "
+                    "Stored in the database but excluded from the review queue."
                 )
                 by_reason = metrics.get("disqualified_by_reason", {})
                 if by_reason:
                     rows = sorted(by_reason.items(), key=lambda kv: -kv[1])
                     _render_summary_list([(reason, f"{count}×") for reason, count in rows])
-                else:
-                    st.write("No breakdown available.")
-
-        scrape_rej_count = metrics.get("scrape_rejected_count", 0)
-        if scrape_rej_count > 0:
-            rej_label = f"Scrape-filtered ({scrape_rej_count} job{'s' if scrape_rej_count != 1 else ''} rejected before scoring)"
-            with st.expander(rej_label, expanded=False):
+            if scrape_rej_count:
                 st.caption(
-                    "These jobs were rejected during scraping by pre-LLM filters (title blocklist, "
-                    "YOE limits, location check). They are stored in the database for auditability "
-                    "but never sent to the LLM. Enable 'Show scrape-filtered jobs' in the Jobs tab to inspect them."
+                    f"{scrape_rej_count} job{'s' if scrape_rej_count != 1 else ''} rejected pre-LLM by scrape filters."
                 )
                 rej_by_reason = metrics.get("scrape_rejected_by_reason", {})
                 if rej_by_reason:
                     rows = sorted(rej_by_reason.items(), key=lambda kv: -kv[1])
                     _render_summary_list([(reason, f"{count}×") for reason, count in rows])
-                else:
-                    st.write("No breakdown available.")
 
-        with st.expander("Advanced details", expanded=False):
-            gh_slugs  = load_discovered_slugs(ats="greenhouse", profile=slug)
-            lv_slugs  = load_discovered_slugs(ats="lever",      profile=slug)
-            ash_slugs = load_discovered_slugs(ats="ashby",      profile=slug)
-            wl_slugs  = load_discovered_slugs(ats="workable",   profile=slug)
-            _render_summary_list(
-                [
-                    ("Greenhouse cache", len(gh_slugs)),
-                    ("Lever cache",      len(lv_slugs)),
-                    ("Ashby cache",      len(ash_slugs)),
-                    ("Workable cache",   len(wl_slugs)),
-                ]
-            )
+    with st.expander("Debug · cache & evaluation", expanded=False):
+        st.caption("Discovery cache snapshots (read-only) and the evaluation tooling that used to live on this tab.")
+        gh_slugs  = load_discovered_slugs(ats="greenhouse", profile=slug)
+        lv_slugs  = load_discovered_slugs(ats="lever",      profile=slug)
+        ash_slugs = load_discovered_slugs(ats="ashby",      profile=slug)
+        wl_slugs  = load_discovered_slugs(ats="workable",   profile=slug)
+        _render_summary_list(
+            [
+                ("Greenhouse cache", len(gh_slugs)),
+                ("Lever cache",      len(lv_slugs)),
+                ("Ashby cache",      len(ash_slugs)),
+                ("Workable cache",   len(wl_slugs)),
+            ]
+        )
+        _render_evaluation_card(slug, config)
 
 
 def _render_evaluation_card(slug: str, config: dict[str, Any]) -> None:
@@ -3913,475 +4414,1257 @@ def _render_evaluation_card(slug: str, config: dict[str, Any]) -> None:
             st.caption(last_result.notes)
 
 
-def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any]) -> None:
-    profile_cfg = config.get("profile", {})
-    prefs = config.get("preferences", {})
-    loc = prefs.get("location", {})
-    compensation = prefs.get("compensation", {})
-    job_type = profile_cfg.get("job_type", "fulltime")
-    is_intern = job_type == "internship"
-    with section_shell("Profile", SECTION_COPY["Profile"]):
-        stat_row(
-            [
-                ("Profile type", job_type.replace("_", " ").title(), "Current search mode"),
-                ("Target titles", len(prefs.get("titles", [])), "Roles the system prioritizes"),
-                ("Desired skills", len(prefs.get("desired_skills", [])), "Skills used for matching"),
-                ("Sources enabled", sum(1 for cfg in raw_config.get("sources", {}).values() if cfg.get("enabled", False)), "Providers actively searched"),
-            ],
-            columns_count=2,
+_PROFILE_DRAFT_STATE_KEY = "_beacon_profile_draft"
+_STRUCTURED_PROFILE_FILENAME = "structured_profile.json"
+
+
+def _structured_profile_cache_path(slug: str) -> Path:
+    return PROFILES_DIR / slug / _STRUCTURED_PROFILE_FILENAME
+
+
+def _read_structured_profile_cache(slug: str) -> dict[str, Any] | None:
+    path = _structured_profile_cache_path(slug)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_structured_profile_cache(slug: str, profile: dict[str, Any]) -> None:
+    path = _structured_profile_cache_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile, indent=2, default=str), encoding="utf-8")
+
+
+def _profile_draft_key(slug: str) -> str:
+    return f"{_PROFILE_DRAFT_STATE_KEY}_{slug}"
+
+
+def _ensure_profile_draft(slug: str, raw_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the live edit-buffer for the Profile tab, seeded from raw_config."""
+    key = _profile_draft_key(slug)
+    if key not in st.session_state:
+        profile_cfg = raw_config.get("profile", {}) or {}
+        prefs = raw_config.get("preferences", {}) or {}
+        location = prefs.get("location", {}) or {}
+        compensation = prefs.get("compensation", {}) or {}
+        st.session_state[key] = {
+            "name":          str(profile_cfg.get("name") or ""),
+            "email":         str(profile_cfg.get("email") or ""),
+            "location":      str(profile_cfg.get("location") or ""),
+            "timezone":      str(profile_cfg.get("timezone") or ""),
+            "auth_status":   str(profile_cfg.get("auth_status") or ""),
+            "titles":        list(prefs.get("titles") or []),
+            "skills":        list(prefs.get("desired_skills") or []),
+            "remote_ok":     bool(location.get("remote_ok", True)),
+            "preferred_locations": list(location.get("preferred_locations") or []),
+            "min_salary":    int(compensation.get("min_salary") or 0),
+            "sponsorship":   str(prefs.get("sponsorship") or ""),
+            "excluded":      list(prefs.get("excluded_industries") or []),
+        }
+    return st.session_state[key]
+
+
+def _reset_profile_draft(slug: str) -> None:
+    st.session_state.pop(_profile_draft_key(slug), None)
+
+
+def _save_profile_draft(slug: str, raw_config: dict[str, Any], draft: dict[str, Any]) -> None:
+    """Merge the draft back into raw_config and persist."""
+    updated = copy.deepcopy(raw_config)
+    profile_cfg = updated.setdefault("profile", {})
+    profile_cfg["name"]        = draft["name"].strip() or profile_cfg.get("name", "")
+    profile_cfg["email"]       = draft["email"].strip()
+    profile_cfg["location"]    = draft["location"].strip()
+    profile_cfg["timezone"]    = draft["timezone"].strip()
+    profile_cfg["auth_status"] = draft["auth_status"].strip()
+    prefs = updated.setdefault("preferences", {})
+    prefs["titles"]         = list(draft["titles"])
+    prefs["desired_skills"] = list(draft["skills"])
+    prefs["sponsorship"]    = draft["sponsorship"].strip()
+    prefs["excluded_industries"] = list(draft["excluded"])
+    location = prefs.setdefault("location", {})
+    location["remote_ok"] = bool(draft["remote_ok"])
+    location["preferred_locations"] = list(draft["preferred_locations"])
+    compensation = prefs.setdefault("compensation", {})
+    if int(draft["min_salary"] or 0) > 0:
+        compensation["min_salary"] = int(draft["min_salary"])
+    elif "min_salary" in compensation:
+        compensation["min_salary"] = 0
+    _write_profile_config(slug, updated)
+
+
+def _reimport_resume(slug: str, raw_config: dict[str, Any]) -> tuple[bool, str]:
+    """Re-extract resume PDF text and rebuild the structured profile.
+
+    Writes the structured profile to profiles/<slug>/structured_profile.json so
+    the Resume card can display the parsed metadata next render. Returns
+    (success, message).
+    """
+    from candidate_profile import build_structured_profile
+    from config import extract_text_from_pdf
+    from scorer import get_llm_client, get_instructor_client
+
+    profile_cfg = raw_config.get("profile", {}) or {}
+    resume_value = profile_cfg.get("resume_file")
+    if not resume_value:
+        return False, "No resume_file configured for this profile."
+
+    profile_dir = PROFILES_DIR / slug
+    try:
+        resolved = _resolve_resume_path(str(resume_value), profile_dir)
+    except FileNotFoundError as exc:
+        return False, str(exc)
+
+    try:
+        text = extract_text_from_pdf(str(resolved))
+    except Exception as exc:
+        return False, f"PDF extraction failed: {exc}"
+
+    config = copy.deepcopy(raw_config)
+    config["_active_profile"] = slug
+    config.setdefault("profile", {})["resume"] = text
+
+    missing = _check_api_key(config)
+    if missing:
+        return False, f"Set {missing} before re-importing — the structured profile needs an LLM call."
+
+    try:
+        llm_call = get_llm_client(config)
+    except SystemExit:
+        return False, "LLM client could not be initialized; check API keys."
+    instructor_client = None
+    instructor_model = None
+    instructor_temperature = None
+    try:
+        instructor_client, instructor_model, instructor_temperature = get_instructor_client(config)
+    except Exception:
+        instructor_client = None
+
+    try:
+        if instructor_client and instructor_model:
+            structured = build_structured_profile(
+                config,
+                llm_call,
+                instructor_client,
+                model=instructor_model,
+                temperature=instructor_temperature,
+            )
+        else:
+            structured = build_structured_profile(config, llm_call)
+    except Exception as exc:
+        return False, f"Structured profile build failed: {exc}"
+
+    _write_structured_profile_cache(slug, structured)
+    return True, f"Re-imported resume: {len(structured.get('core_skills', []))} skills, {structured.get('yoe', '?')}yr."
+
+
+def _render_profile_identity_card(slug: str, draft: dict[str, Any]) -> None:
+    """Identity & contact card — kv rows + an inline editor toggle."""
+    rows = [
+        ("Name",        draft.get("name") or "Not set"),
+        ("Email",       draft.get("email") or "Not set"),
+        ("Location",    draft.get("location") or "Not set"),
+        ("Timezone",    draft.get("timezone") or "Not set"),
+        ("Auth status", draft.get("auth_status") or "Not set"),
+    ]
+    head_cols = st.columns([6.4, 1.6], gap="small")
+    with head_cols[0]:
+        st.markdown(
+            (
+                "<div class='beacon-card-head' style='border:1px solid var(--line);"
+                "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+                "background:var(--surface);padding:14px 18px'>"
+                "<div>"
+                "<div class='beacon-card-title'>Identity & contact</div>"
+                "<div class='beacon-card-sub'>How the agent introduces you</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
         )
-        _render_html_block("<div class='shell-panel-gap' aria-hidden='true'></div>")
+    edit_state_key = f"profile_identity_edit_{slug}"
+    with head_cols[1]:
+        editing = st.toggle(
+            "Edit",
+            key=edit_state_key,
+            value=False,
+            label_visibility="collapsed",
+        )
 
-        top = st.columns(2, gap="large")
-        with top[0]:
-            with panel("Candidate summary", subtitle="The candidate context passed into scoring and review flows"):
-                resume_display = f"{len(profile_cfg.get('resume') or '')} characters inline"
-                resume_pdf_bytes: bytes | None = None
-                resume_file_name: str | None = None
-                resume_value = profile_cfg.get("resume_file")
-                if resume_value:
-                    name_parts = [part for part in str(profile_cfg.get("name", "")).strip().split() if part]
-                    if len(name_parts) >= 2:
-                        friendly_filename = f"{name_parts[-1]}_{name_parts[0]}_resume.pdf"
-                    elif name_parts:
-                        friendly_filename = f"{name_parts[0]}_resume.pdf"
-                    else:
-                        friendly_filename = "resume.pdf"
-                    resume_display = f"Auto-renamed to {friendly_filename}"
-                    resume_file_name = friendly_filename
-                    try:
-                        profile_dir = PROFILES_DIR / slug
-                        resolved_resume = _resolve_resume_path(str(resume_value), profile_dir)
-                        resume_pdf_bytes = resolved_resume.read_bytes()
-                    except (FileNotFoundError, OSError):
-                        resume_display = f"Configured as {resume_value}"
+    rows_html = "".join(
+        f"<div class='kv'><span class='k'>{html.escape(label)}</span>"
+        f"<span class='v'>{html.escape(str(value))}</span></div>"
+        for label, value in rows
+    )
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:12px 22px 16px'>"
+            f"{rows_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
-                callout("info", "Profile summary", profile_cfg.get("bio") or "Add a short bio in Settings to give the scorer more context.")
-                summary_rows = [
-                    ("Name", profile_cfg.get("name", "Unknown")),
-                    ("Job type", job_type.replace("_", " ").title()),
-                    ("Resume source", resume_display),
-                ]
-                if is_intern:
-                    summary_rows.extend(
-                        [
-                            ("School", profile_cfg.get("school", "") or "Not set"),
-                            ("Major", profile_cfg.get("major", "") or "Not set"),
-                            ("Graduation year", str(profile_cfg.get("graduation_year", "") or "Not set")),
-                            ("Target season", profile_cfg.get("target_season", "") or "Not set"),
-                        ]
-                    )
-                _render_html_block(
-                    (
-                        "<div class='summary-list'>"
-                        + "".join(
-                            f"<div class='summary-row'><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong></div>"
-                            for label, value in summary_rows
-                        )
-                        + "</div>"
-                    )
-                )
-                if resume_pdf_bytes and resume_file_name:
-                    preview_cols = st.columns([0.9, 1.1], gap="small")
-                    with preview_cols[0]:
-                        if st.button("Preview resume PDF", key=f"preview_resume_{slug}", use_container_width=True):
-                            _open_resume_preview_dialog(resume_file_name, resume_pdf_bytes)
-                    with preview_cols[1]:
-                        st.download_button(
-                            "Download PDF",
-                            data=resume_pdf_bytes,
-                            file_name=resume_file_name,
-                            mime="application/pdf",
-                            key=f"download_resume_{slug}",
-                            use_container_width=True,
-                        )
+    if editing:
+        edit_cols = st.columns(2, gap="small")
+        with edit_cols[0]:
+            draft["name"] = st.text_input(
+                "Name",
+                value=draft.get("name", ""),
+                key=f"profile_identity_name_{slug}",
+            )
+            draft["location"] = st.text_input(
+                "Location",
+                value=draft.get("location", ""),
+                placeholder="San Francisco, CA",
+                key=f"profile_identity_location_{slug}",
+            )
+            draft["auth_status"] = st.text_input(
+                "Auth status",
+                value=draft.get("auth_status", ""),
+                placeholder="US citizen — no sponsorship needed",
+                key=f"profile_identity_auth_{slug}",
+            )
+        with edit_cols[1]:
+            draft["email"] = st.text_input(
+                "Email",
+                value=draft.get("email", ""),
+                placeholder="you@example.com",
+                key=f"profile_identity_email_{slug}",
+            )
+            draft["timezone"] = st.text_input(
+                "Timezone",
+                value=draft.get("timezone", ""),
+                placeholder="PT (UTC−7)",
+                key=f"profile_identity_tz_{slug}",
+            )
 
-        with top[1]:
-            with panel("Search preferences", subtitle="Location and compensation signals that shape ranking and fit"):
-                compensation_rows = [
-                    ("Remote", "Open" if loc.get("remote_ok", True) else "Not preferred"),
-                    ("Preferred locations", ", ".join(loc.get("preferred_locations", [])) or "None set"),
-                    *_compensation_rows(job_type, compensation),
-                ]
-                _render_html_block(
-                    (
-                        "<div class='summary-list'>"
-                        + "".join(
-                            f"<div class='summary-row'><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong></div>"
-                            for label, value in compensation_rows
-                        )
-                        + "</div>"
-                    )
-                )
 
-        bottom = st.columns(2, gap="large")
-        with bottom[0]:
-            with panel("Target roles and skills", subtitle="What the system is actively optimizing for"):
-                st.caption("Target titles")
-                chip_row(prefs.get("titles", []) or ["None saved"])
-                st.caption("Desired skills")
-                chip_row(prefs.get("desired_skills", []) or ["None saved"])
+def _render_profile_resume_card(
+    slug: str,
+    raw_config: dict[str, Any],
+    profile_cfg: dict[str, Any],
+    structured: dict[str, Any] | None,
+) -> None:
+    resume_value = profile_cfg.get("resume_file")
+    resume_pdf_bytes: bytes | None = None
+    resume_file_name = "resume.pdf"
+    resume_size_kb = 0
+    if resume_value:
+        name_parts = [p for p in str(profile_cfg.get("name", "")).strip().split() if p]
+        if len(name_parts) >= 2:
+            resume_file_name = f"{name_parts[-1]}_{name_parts[0]}_resume.pdf"
+        elif name_parts:
+            resume_file_name = f"{name_parts[0]}_resume.pdf"
+        try:
+            profile_dir = PROFILES_DIR / slug
+            resolved = _resolve_resume_path(str(resume_value), profile_dir)
+            resume_pdf_bytes = resolved.read_bytes()
+            resume_size_kb = max(1, len(resume_pdf_bytes) // 1024)
+        except (FileNotFoundError, OSError):
+            resume_pdf_bytes = None
 
-        with bottom[1]:
-            with panel("Source configuration", subtitle="Enabled source coverage for future runs"):
-                source_lines: list[str] = []
-                for source_name, source_cfg in raw_config.get("sources", {}).items():
-                    if source_name in {"greenhouse", "lever", "ashby", "workable"}:
-                        companies = source_cfg.get("companies", [])
-                        source_lines.append(
-                            f"{source_name.title()}: {'Enabled' if source_cfg.get('enabled', True) else 'Off'} ({len(companies)} companies)"
-                        )
-                    else:
-                        source_lines.append(f"{source_name.title()}: {'Enabled' if source_cfg.get('enabled', False) else 'Off'}")
-                if source_lines:
-                    for line in source_lines:
-                        st.write(f"- {line}")
+    head_cols = st.columns([6.4, 1.6], gap="small")
+    with head_cols[0]:
+        st.markdown(
+            (
+                "<div class='beacon-card-head' style='border:1px solid var(--line);"
+                "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+                "background:var(--surface);padding:14px 18px'>"
+                "<div>"
+                "<div class='beacon-card-title'>Resume</div>"
+                "<div class='beacon-card-sub'>Source PDF + parsed metadata</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with head_cols[1]:
+        if st.button(
+            "Replace",
+            key=f"profile_resume_replace_{slug}",
+            use_container_width=True,
+        ):
+            st.session_state[f"profile_resume_replace_open_{slug}"] = True
+
+    meta_pieces: list[str] = []
+    if resume_pdf_bytes:
+        meta_pieces.append(f"{resume_size_kb} KB")
+    if structured:
+        skills = structured.get("core_skills") or []
+        if skills:
+            meta_pieces.append(f"{len(skills)} skills extracted")
+
+    meta_label = " · ".join(meta_pieces) if meta_pieces else "No metadata yet"
+
+    if structured:
+        yoe = structured.get("yoe")
+        if yoe is None or yoe == "":
+            yoe_label = "Not extracted"
+        else:
+            yoe_label = f"{yoe} years"
+        past_roles = structured.get("past_roles") or []
+        last_role = past_roles[0] if past_roles else (structured.get("current_title") or "Not extracted")
+        education = structured.get("education") or "Not extracted"
+    else:
+        yoe_label = "Click Re-import resume above"
+        last_role = "Click Re-import resume above"
+        education = "Click Re-import resume above"
+
+    rows = [
+        ("Years exp", yoe_label),
+        ("Last role", last_role),
+        ("Education", education),
+    ]
+    rows_html = "".join(
+        f"<div class='kv'><span class='k'>{html.escape(label)}</span>"
+        f"<span class='v'>{html.escape(str(value))}</span></div>"
+        for label, value in rows
+    )
+
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:14px 22px 16px'>"
+            "<div class='resume-row'>"
+            "<div class='resume-thumb'>PDF</div>"
+            "<div class='grow'>"
+            f"<div class='name'>{html.escape(resume_file_name)}</div>"
+            f"<div class='meta'>{html.escape(meta_label)}</div>"
+            "</div>"
+            "</div>"
+            "<div style='height:14px'></div>"
+            f"{rows_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if resume_pdf_bytes:
+        action_cols = st.columns([1, 1, 4], gap="small")
+        with action_cols[0]:
+            if st.button("View PDF", key=f"profile_resume_view_{slug}", use_container_width=True):
+                _open_resume_preview_dialog(resume_file_name, resume_pdf_bytes)
+        with action_cols[1]:
+            st.download_button(
+                "Download",
+                data=resume_pdf_bytes,
+                file_name=resume_file_name,
+                mime="application/pdf",
+                key=f"profile_resume_download_{slug}",
+                use_container_width=True,
+            )
+
+    if st.session_state.get(f"profile_resume_replace_open_{slug}"):
+        upload = st.file_uploader(
+            "Upload a new resume PDF",
+            type=["pdf"],
+            key=f"profile_resume_upload_{slug}",
+            accept_multiple_files=False,
+        )
+        cancel_cols = st.columns([1, 1, 4], gap="small")
+        with cancel_cols[0]:
+            if st.button("Cancel", key=f"profile_resume_replace_cancel_{slug}", use_container_width=True):
+                st.session_state[f"profile_resume_replace_open_{slug}"] = False
+                st.rerun()
+        if upload is not None:
+            target = PROFILES_DIR / slug / "resume.pdf"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(upload.read())
+            updated = copy.deepcopy(raw_config)
+            updated.setdefault("profile", {})["resume_file"] = "resume.pdf"
+            _write_profile_config(slug, updated)
+            st.session_state[f"profile_resume_replace_open_{slug}"] = False
+            st.toast("Resume replaced. Click Re-import resume to refresh parsed metadata.")
+            st.rerun()
+
+
+def _render_profile_skills_card(
+    slug: str,
+    draft: dict[str, Any],
+) -> None:
+    skills = list(draft.get("skills") or [])
+    head_cols = st.columns([6.4, 1.6], gap="small")
+    with head_cols[0]:
+        st.markdown(
+            (
+                "<div class='beacon-card-head' style='border:1px solid var(--line);"
+                "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+                "background:var(--surface);padding:14px 18px'>"
+                "<div>"
+                "<div class='beacon-card-title'>Skills</div>"
+                "<div class='beacon-card-sub'>Used by the scorer for stack-match scoring</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with head_cols[1]:
+        st.markdown(
+            "<div style='font-family:var(--font-mono);font-size:11px;color:var(--muted);text-align:right;padding-top:10px'>"
+            f"{len(skills)} total"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    pills_html = "".join(
+        f"<span class='pill on'>{html.escape(s)}</span>" for s in skills
+    ) if skills else "<span class='pill'>No skills yet</span>"
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:16px 22px'>"
+            f"<div class='pill-grid'>{pills_html}</div>"
+            "<p style='font-size:12.5px;color:var(--muted);margin-top:14px;line-height:1.55'>"
+            "Edit below — these are the skills the scorer uses for the <b>stack_match</b> dimension. "
+            "Adding concrete tools (e.g. <i>FastAPI</i>, <i>Postgres</i>) gives the agent better signal "
+            "than soft phrases."
+            "</p>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    edit_cols = st.columns([3, 1], gap="small")
+    with edit_cols[0]:
+        new_skills = st.text_area(
+            "Skills (one per line)",
+            value="\n".join(skills),
+            key=f"profile_skills_text_{slug}",
+            label_visibility="collapsed",
+            height=140,
+            placeholder="Python\nFastAPI\nPostgreSQL\n...",
+        )
+    with edit_cols[1]:
+        if st.button("Apply skills", key=f"profile_skills_apply_{slug}", use_container_width=True):
+            draft["skills"] = _lines_to_list(new_skills)
+            st.toast(f"{len(draft['skills'])} skill(s) staged. Click Save to persist.")
+            st.rerun()
+
+
+def _render_profile_target_roles_card(slug: str, draft: dict[str, Any]) -> None:
+    titles = list(draft.get("titles") or [])
+    pills_html = "".join(
+        f"<span class='pill on'>{html.escape(t)}</span>" for t in titles
+    ) if titles else "<span class='pill'>No target roles yet</span>"
+    st.markdown(
+        (
+            "<div class='beacon-card-head' style='border:1px solid var(--line);"
+            "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+            "background:var(--surface);padding:14px 18px'>"
+            "<div>"
+            "<div class='beacon-card-title'>Target roles</div>"
+            "<div class='beacon-card-sub'>Job titles the agent prioritizes</div>"
+            "</div>"
+            "</div>"
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:16px 22px'>"
+            f"<div class='pill-grid'>{pills_html}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    edit_cols = st.columns([3, 1], gap="small")
+    with edit_cols[0]:
+        new_titles = st.text_area(
+            "Target roles (one per line)",
+            value="\n".join(titles),
+            key=f"profile_titles_text_{slug}",
+            label_visibility="collapsed",
+            height=110,
+            placeholder="Backend Engineer\nSoftware Engineer\n...",
+        )
+    with edit_cols[1]:
+        if st.button("Apply roles", key=f"profile_titles_apply_{slug}", use_container_width=True):
+            draft["titles"] = _lines_to_list(new_titles)
+            st.toast(f"{len(draft['titles'])} role(s) staged. Click Save to persist.")
+            st.rerun()
+
+
+def _render_profile_hard_prefs_card(slug: str, draft: dict[str, Any]) -> None:
+    salary = int(draft.get("min_salary") or 0)
+    salary_label = f"${salary:,} base" if salary > 0 else "Not set"
+    locations = draft.get("preferred_locations") or []
+    geo_label = ("Remote (US)" if draft.get("remote_ok") else "Onsite only")
+    if locations:
+        geo_label = f"{geo_label} · " + ", ".join(locations)
+    excluded = draft.get("excluded") or []
+    excluded_label = ", ".join(excluded) if excluded else "None"
+    sponsorship_label = draft.get("sponsorship") or "Not specified"
+
+    rows = [
+        ("Min comp",    salary_label),
+        ("Geo",         geo_label),
+        ("Sponsorship", sponsorship_label),
+        ("Excluded",    excluded_label),
+    ]
+    rows_html = "".join(
+        f"<div class='kv'><span class='k'>{html.escape(label)}</span>"
+        f"<span class='v'>{html.escape(str(value))}</span></div>"
+        for label, value in rows
+    )
+    st.markdown(
+        (
+            "<div class='beacon-card-head' style='border:1px solid var(--line);"
+            "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+            "background:var(--surface);padding:14px 18px'>"
+            "<div>"
+            "<div class='beacon-card-title'>Hard preferences</div>"
+            "<div class='beacon-card-sub'>Disqualifiers — soft scoring uses these too</div>"
+            "</div>"
+            "</div>"
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:14px 22px 16px'>"
+            f"{rows_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    with st.expander("Edit hard preferences", expanded=False):
+        prefs_cols = st.columns(2, gap="medium")
+        with prefs_cols[0]:
+            draft["min_salary"] = int(st.number_input(
+                "Minimum salary (USD/year)",
+                value=int(draft.get("min_salary") or 0),
+                step=5000,
+                min_value=0,
+                key=f"profile_hard_salary_{slug}",
+            ) or 0)
+            draft["sponsorship"] = st.text_input(
+                "Sponsorship",
+                value=draft.get("sponsorship") or "",
+                placeholder="Not required / required for H-1B / open to all",
+                key=f"profile_hard_sponsorship_{slug}",
+            )
+        with prefs_cols[1]:
+            draft["remote_ok"] = st.checkbox(
+                "Remote OK",
+                value=bool(draft.get("remote_ok", True)),
+                key=f"profile_hard_remote_{slug}",
+            )
+            existing_locs = draft.get("preferred_locations") or []
+            location_options = sorted({*LOCATION_PICKER_OPTIONS, *existing_locs})
+            draft["preferred_locations"] = list(st.multiselect(
+                "Preferred locations",
+                options=location_options,
+                default=[loc for loc in existing_locs if loc in location_options],
+                key=f"profile_hard_locations_{slug}",
+            ))
+        excluded_text = st.text_area(
+            "Excluded industries (one per line)",
+            value="\n".join(draft.get("excluded") or []),
+            placeholder="Defense\nCrypto-native\nAdtech",
+            key=f"profile_hard_excluded_{slug}",
+            height=90,
+        )
+        draft["excluded"] = _lines_to_list(excluded_text)
+
+
+def _render_profile_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any]) -> None:
+    profile_cfg = raw_config.get("profile", {}) or {}
+    draft = _ensure_profile_draft(slug, raw_config)
+    structured = _read_structured_profile_cache(slug)
+    name_label = profile_cfg.get("name") or slug.replace("_", " ").title()
+
+    head_cols = st.columns([6.4, 2.6], gap="medium")
+    with head_cols[0]:
+        _render_beacon_page_header(
+            f"Profile · {name_label}",
+            "What the agent knows about you.",
+            "Edit anything. The agent re-scores in the background when you save.",
+        )
+    with head_cols[1]:
+        action_cols = st.columns(2, gap="small")
+        with action_cols[0]:
+            if st.button(
+                "Re-import resume",
+                key=f"profile_reimport_{slug}",
+                use_container_width=True,
+                help="Re-extracts the resume PDF and rebuilds the structured profile via one LLM call.",
+            ):
+                with st.spinner("Re-importing resume…"):
+                    ok, msg = _reimport_resume(slug, raw_config)
+                if ok:
+                    _set_notice(slug, "success", msg)
+                    invalidate_dashboard_caches()
                 else:
-                    empty_state("No source configuration found", "This profile does not have source settings yet.")
+                    _set_notice(slug, "error", msg)
+                st.rerun()
+        with action_cols[1]:
+            if st.button(
+                "Save",
+                key=f"profile_save_{slug}",
+                type="primary",
+                use_container_width=True,
+            ):
+                _save_profile_draft(slug, raw_config, draft)
+                _reset_profile_draft(slug)
+                _set_notice(slug, "success", "Profile saved.")
+                invalidate_dashboard_caches()
+                st.rerun()
+
+    st.markdown("<div class='panel-grid'></div>", unsafe_allow_html=True)
+    grid_top = st.columns(2, gap="large")
+    with grid_top[0]:
+        _render_profile_identity_card(slug, draft)
+    with grid_top[1]:
+        _render_profile_resume_card(slug, raw_config, profile_cfg, structured)
+
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    _render_profile_skills_card(slug, draft)
+
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    grid_bottom = st.columns(2, gap="large")
+    with grid_bottom[0]:
+        _render_profile_target_roles_card(slug, draft)
+    with grid_bottom[1]:
+        _render_profile_hard_prefs_card(slug, draft)
 
 
 def _lines_to_list(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any], metrics: dict[str, Any]) -> None:
-    editable = apply_config_defaults(copy.deepcopy(raw_config))
-    job_type = editable.get("profile", {}).get("job_type", "fulltime")
-    is_intern = job_type == "internship"
-    editable.setdefault("scoring", {})
-    editable.setdefault("preferences", {})
-    editable["preferences"].setdefault("location", {})
-    editable["preferences"].setdefault("compensation", {})
-    editable.setdefault("sources", {})
-    editable["sources"].setdefault("greenhouse", {"enabled": True,  "companies": []})
-    editable["sources"].setdefault("lever",      {"enabled": True,  "companies": []})
-    editable["sources"].setdefault("hn",         {"enabled": False})
-    editable["sources"].setdefault("ashby",      {"enabled": False, "companies": []})
-    editable["sources"].setdefault("workable",   {"enabled": False, "companies": []})
-    editable["sources"].setdefault("himalayas",  {"enabled": False})
-    with section_shell("Settings", SECTION_COPY["Settings"]):
-        _render_tracking_status_panel(config, slug)
-        location_defaults = editable["preferences"]["location"].get("preferred_locations", [])
-        location_options = sorted({*LOCATION_PICKER_OPTIONS, *location_defaults})
-        compensation = editable["preferences"]["compensation"]
-        salary_value = int(compensation.get("min_salary", 0) or 0)
-        stipend_value = int(compensation.get("monthly_stipend", 0) or 0)
-        intern_pay_preference = _normalize_intern_pay_preference(compensation)
+_SETTINGS_DRAFT_STATE_KEY = "_beacon_settings_draft"
+_DEFAULT_WEIGHTS_PCT: dict[str, int] = {
+    "role_fit":     30,
+    "stack_match":  25,
+    "seniority":    20,
+    "location":     10,
+    "growth":       10,
+    "compensation":  5,
+}
+_WEIGHT_LABELS: list[tuple[str, str]] = [
+    ("role_fit",     "Role fit"),
+    ("stack_match",  "Stack match"),
+    ("seniority",    "Seniority"),
+    ("location",     "Location"),
+    ("growth",       "Growth"),
+    ("compensation", "Compensation"),
+]
+_SETTINGS_NOTIFICATION_ROWS: list[tuple[str, str, str]] = [
+    ("digest",  "Daily digest email",       "Top picks delivered to your inbox at the cadence below."),
+    ("slack",   "Slack DM on high-fit",     "Pings when a fit ≥ 90 lands in the queue."),
+    ("replies", "Reply detection",          "Watches your inbox and flags recruiter replies."),
+    ("agentic", "Auto-draft cover notes",   "Concierge writes drafts you review before sending."),
+]
+_SETTINGS_SOURCE_TILES: list[tuple[str, str]] = [
+    ("greenhouse", "Greenhouse"),
+    ("lever",      "Lever"),
+    ("ashby",      "Ashby"),
+    ("workable",   "Workable"),
+    ("hn",         "HN Who's Hiring"),
+    ("himalayas",  "Himalayas (remote)"),
+]
 
-        with st.expander("Search preferences", expanded=True):
-            st.caption("Keep the shortlist aligned with where and how you want to work.")
-            st.markdown("##### Scoring")
-            min_display = st.slider(
-                "Minimum display score",
+
+def _settings_draft_key(slug: str) -> str:
+    return f"{_SETTINGS_DRAFT_STATE_KEY}_{slug}"
+
+
+def _build_settings_draft(raw_config: dict[str, Any]) -> dict[str, Any]:
+    weights_raw = (raw_config.get("scoring") or {}).get("weights") or {}
+    weights_pct: dict[str, int] = {}
+    for key, default in _DEFAULT_WEIGHTS_PCT.items():
+        v = weights_raw.get(key)
+        if v is None:
+            weights_pct[key] = default
+        elif isinstance(v, (int, float)):
+            weights_pct[key] = int(round(float(v) * 100)) if float(v) <= 1.0 else int(round(float(v)))
+        else:
+            weights_pct[key] = default
+    sources = raw_config.get("sources") or {}
+    enabled: dict[str, bool] = {}
+    for key, _label in _SETTINGS_SOURCE_TILES:
+        enabled[key] = bool((sources.get(key) or {}).get("enabled", False))
+    llm_cfg = raw_config.get("llm") or {}
+    return {
+        "weights":           weights_pct,
+        "sources_enabled":   enabled,
+        "provider":          str(llm_cfg.get("provider", "groq")),
+        "model_overrides":   dict(llm_cfg.get("model") or {}),
+        "notifications": {key: False for key, _, _ in _SETTINGS_NOTIFICATION_ROWS},
+    }
+
+
+def _ensure_settings_draft(slug: str, raw_config: dict[str, Any]) -> dict[str, Any]:
+    key = _settings_draft_key(slug)
+    if key not in st.session_state:
+        st.session_state[key] = _build_settings_draft(raw_config)
+    return st.session_state[key]
+
+
+def _reset_settings_draft(slug: str) -> None:
+    st.session_state.pop(_settings_draft_key(slug), None)
+
+
+def _format_provider_model(raw_config: dict[str, Any]) -> str:
+    llm_cfg = raw_config.get("llm") or {}
+    provider = str(llm_cfg.get("provider", "unknown"))
+    model = (llm_cfg.get("model") or {}).get(provider, "unknown")
+    return f"{provider} · {model}"
+
+
+def _format_rate_limit(raw_config: dict[str, Any]) -> str:
+    llm_cfg = raw_config.get("llm") or {}
+    provider = str(llm_cfg.get("provider", ""))
+    rl = (llm_cfg.get("rate_limits") or {}).get(provider) or {}
+    rpm = rl.get("max_rpm")
+    if rpm:
+        return f"{rpm} rpm"
+    return "—"
+
+
+def _format_spend_cap(raw_config: dict[str, Any]) -> str:
+    routing = raw_config.get("routing") or {}
+    budget = routing.get("rate_limit_budget") or {}
+    if not budget:
+        return "Unbounded"
+    pieces = []
+    for provider, caps in list(budget.items())[:2]:
+        rpr = caps.get("max_requests_per_run")
+        if rpr:
+            pieces.append(f"{provider} {rpr}/run")
+    if not pieces:
+        return "Unbounded"
+    extra = len(budget) - len(pieces)
+    suffix = f" · +{extra} more" if extra > 0 else ""
+    return ", ".join(pieces) + suffix
+
+
+def _format_embeddings(raw_config: dict[str, Any]) -> str:
+    emb = raw_config.get("embeddings") or {}
+    return str(emb.get("model") or "—")
+
+
+def _settings_card_head(title: str, sub: str = "", right_html: str = "") -> str:
+    return (
+        "<div class='beacon-card-head' style='border:1px solid var(--line);"
+        "border-bottom:0;border-radius:var(--r-md) var(--r-md) 0 0;"
+        "background:var(--surface);padding:14px 18px'>"
+        "<div>"
+        f"<div class='beacon-card-title'>{html.escape(title)}</div>"
+        + (f"<div class='beacon-card-sub'>{html.escape(sub)}</div>" if sub else "")
+        + "</div>"
+        + right_html
+        + "</div>"
+    )
+
+
+def _render_settings_weights_card(slug: str, draft: dict[str, Any]) -> None:
+    weights = draft["weights"]
+    st.markdown(_settings_card_head(
+        "Scoring weights",
+        "What the agent should care about most",
+    ), unsafe_allow_html=True)
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:14px 22px 12px'>"
+        ),
+        unsafe_allow_html=True,
+    )
+    for key, label in _WEIGHT_LABELS:
+        cur = int(weights.get(key, _DEFAULT_WEIGHTS_PCT[key]))
+        cols = st.columns([1.6, 4.2, 0.7], gap="small")
+        with cols[0]:
+            st.markdown(
+                f"<div style='font-size:13px;font-weight:500;padding-top:8px'>{html.escape(label)}</div>",
+                unsafe_allow_html=True,
+            )
+        with cols[1]:
+            new_val = st.slider(
+                label,
                 min_value=0,
                 max_value=100,
-                value=int(editable["scoring"].get("min_display_score", 60)),
-                step=5,
-                help="Jobs below this score stay saved, but they will not appear in the main shortlist views.",
+                value=cur,
+                step=1,
+                key=f"settings_weight_{slug}_{key}",
+                label_visibility="collapsed",
             )
-            with st.expander("About display score", expanded=False):
-                st.write("Lower the display score only if you want to inspect weaker-fit roles more often.")
+        with cols[2]:
+            st.markdown(
+                f"<div style='font-family:var(--font-mono);font-size:12px;color:var(--muted);"
+                f"text-align:right;padding-top:8px'>{int(new_val)}%</div>",
+                unsafe_allow_html=True,
+            )
+        weights[key] = int(new_val)
+    total = sum(weights.values())
+    cap_color = "var(--ink)" if total <= 100 else "var(--warn)"
+    st.markdown(
+        (
+            f"<p style='font-size:12px;color:var(--muted);margin-top:10px;line-height:1.55'>"
+            f"Total <b style='color:{cap_color}'>{total}%</b>. "
+            "The agent normalizes if you go over."
+            "</p>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
-            pref_cols = st.columns([1.0, 1.1], gap="large")
-            with pref_cols[0]:
-                st.markdown("##### Location")
-                remote_ok = st.checkbox(
-                    "Remote OK",
-                    value=bool(editable["preferences"]["location"].get("remote_ok", True)),
-                )
-                preferred_locations = st.multiselect(
-                    "Preferred locations",
-                    options=location_options,
-                    default=[loc for loc in location_defaults if loc in location_options],
-                    help="Choose the locations you want discovery to prioritize.",
-                )
-            with pref_cols[1]:
-                st.markdown("##### Sources")
-                gh_enabled = st.checkbox(
-                    "Greenhouse",
-                    value=bool(editable["sources"]["greenhouse"].get("enabled", True)),
-                )
-                lv_enabled = st.checkbox(
-                    "Lever",
-                    value=bool(editable["sources"]["lever"].get("enabled", True)),
-                )
-                ash_enabled = st.checkbox(
-                    "Ashby",
-                    value=bool(editable["sources"]["ashby"].get("enabled", False)),
-                )
-                wl_enabled = st.checkbox(
-                    "Workable",
-                    value=bool(editable["sources"]["workable"].get("enabled", False)),
-                )
-                hn_enabled = st.checkbox(
-                    "HN Who's Hiring",
-                    value=bool(editable["sources"]["hn"].get("enabled", False)),
-                )
-                him_enabled = st.checkbox(
-                    "Himalayas (remote-only)",
-                    value=bool(editable["sources"]["himalayas"].get("enabled", False)),
-                )
 
-        with st.expander("Matching rules", expanded=False):
-            st.caption("Fine-tune titles, skills, exclusions, and source company lists when you need more control.")
-            titles_default = editable["preferences"].get("titles", [])
-            skills_default = editable["preferences"].get("desired_skills", [])
-            hard_no_default = editable["preferences"].get("hard_no_keywords", [])
-            gh_companies_default  = editable["sources"]["greenhouse"].get("companies", [])
-            lv_companies_default  = editable["sources"]["lever"].get("companies", [])
-            ash_companies_default = editable["sources"]["ashby"].get("companies", [])
-            wl_companies_default  = editable["sources"]["workable"].get("companies", [])
-            titles_text   = "\n".join(titles_default)
-            skills_text   = "\n".join(skills_default)
-            hard_no_text  = "\n".join(hard_no_default)
-            gh_companies  = "\n".join(gh_companies_default)
-            lv_companies  = "\n".join(lv_companies_default)
-            ash_companies = "\n".join(ash_companies_default)
-            wl_companies  = "\n".join(wl_companies_default)
-            edit_matching_rules = st.toggle(
-                "Edit matching rules",
-                key=f"edit_matching_rules_{slug}",
-                help="Switch between a compact summary and the full editor for titles, skills, exclusions, and source company lists.",
-            )
-            if is_intern:
-                minimum_salary = None
-                monthly_stipend = stipend_value if intern_pay_preference == "paid_only" else None
-                compensation_summary = _format_compensation_value(job_type, compensation)
-                compensation_label = "Compensation"
-            else:
-                minimum_salary = salary_value
-                monthly_stipend = None
-                compensation_summary = f"${salary_value:,}" if salary_value else "Not set"
-                compensation_label = "Minimum salary"
-
-            if not edit_matching_rules:
-                _render_summary_list(
-                    [
-                        ("Target titles",       len(titles_default)),
-                        ("Desired skills",       len(skills_default)),
-                        ("Hard-no keywords",     len(hard_no_default)),
-                        (compensation_label,     compensation_summary),
-                        ("Greenhouse companies", len(gh_companies_default)),
-                        ("Lever companies",      len(lv_companies_default)),
-                        ("Ashby companies",      len(ash_companies_default)),
-                        ("Workable companies",   len(wl_companies_default)),
-                    ]
-                )
-                st.caption("Target titles")
-                chip_row(titles_default[:8] or ["None saved"])
-                st.caption("Desired skills")
-                chip_row(skills_default[:8] or ["None saved"])
-                st.caption("Hard-no keywords")
-                chip_row(hard_no_default[:6] or ["None saved"])
-            else:
-                titles_text = st.text_area("Target titles", value=titles_text, height=120, help="One title per line.")
-                skills_text = st.text_area("Desired skills", value=skills_text, height=120, help="One skill per line.")
-                hard_no_text = st.text_area("Hard-no keywords", value=hard_no_text, height=100, help="Any posting containing these phrases will be skipped early.")
-                if is_intern:
-                    preference_labels = {
-                        "paid_only": "Paid only",
-                        "unpaid_ok": "Unpaid OK",
-                        "no_preference": "No preference",
-                    }
-                    selected_label = st.radio(
-                        "Compensation preference",
-                        list(preference_labels.values()),
-                        index=list(preference_labels.keys()).index(intern_pay_preference),
-                        horizontal=True,
-                    )
-                    intern_pay_preference = {label: value for value, label in preference_labels.items()}[selected_label]
-                    if intern_pay_preference == "paid_only":
-                        monthly_stipend = st.text_input(
-                            "Monthly stipend target",
-                            value=_optional_int_input_value(compensation.get("monthly_stipend")),
-                            placeholder="4500",
-                            help="Optional. Leave blank if the internship just needs to be paid.",
-                        )
-                    else:
-                        monthly_stipend = None
-                    minimum_salary = None
-                else:
-                    minimum_salary = st.number_input("Minimum salary", min_value=0, step=5000, value=salary_value, help="Used as a soft scoring preference, not a hard filter.")
-                    monthly_stipend = None
-                gh_companies  = st.text_area("Greenhouse companies",  value=gh_companies,  height=140, help="One company slug per line.")
-                lv_companies  = st.text_area("Lever companies",        value=lv_companies,  height=140, help="One company slug per line.")
-                ash_companies = st.text_area("Ashby companies",        value=ash_companies, height=140, help="One company slug per line.")
-                wl_companies  = st.text_area("Workable companies",     value=wl_companies,  height=140, help="One company slug per line.")
-
-        with st.expander("Cost optimization (selective routing)", expanded=False):
-            st.caption(
-                "Route low-confidence jobs to a synthetic score instead of calling the LLM. "
-                "Reduces API costs by 60–90% with minimal quality impact."
-            )
-            routing_cfg = editable.get("routing", {})
-            routing_enabled_val = st.toggle(
-                "Enable selective routing",
-                value=bool(routing_cfg.get("enabled", False)),
-                key=f"routing_enabled_{slug}",
-                help="When on, jobs below the threshold skip the LLM and get a synthetic score.",
-            )
-            # BGE-reranker-base spreads post-sigmoid scores across [0,1] more
-            # uniformly than the prior ms-marco model did (which compressed into
-            # ~0.20–0.45). llm_threshold (per-profile) overrides the legacy
-            # threshold field; show llm_threshold if present so users can tune
-            # the value the router actually uses.
-            current_threshold = float(
-                routing_cfg.get("llm_threshold")
-                if routing_cfg.get("llm_threshold") is not None
-                else routing_cfg.get("threshold", 0.18)
-            )
-            routing_threshold = st.slider(
-                "Routing threshold",
-                min_value=0.05,
-                max_value=0.90,
-                value=max(0.05, min(0.90, current_threshold)),
-                step=0.01,
-                key=f"routing_threshold_{slug}",
-                help=(
-                    "Jobs whose cross-encoder score is below this value skip the LLM. "
-                    "Lower = more LLM calls (higher quality, higher cost). "
-                    "Higher = fewer LLM calls (lower cost, may miss edge cases). "
-                    "Default 0.18 is permissive under BGE; 0.25–0.35 is a "
-                    "reasonable range to tighten for fewer LLM calls."
+def _render_settings_sources_card(
+    slug: str,
+    draft: dict[str, Any],
+    raw_config: dict[str, Any],
+    last_run: dict[str, Any] | None,
+) -> None:
+    enabled = draft["sources_enabled"]
+    last_run_count: dict[str, int] = {}
+    if last_run:
+        all_records = _cached_fetch_job_summaries(slug)
+        finished = _parse_iso(last_run.get("finished_at"))
+        started = _parse_iso(last_run.get("started_at"))
+        if finished and started:
+            for r in all_records:
+                created = _parse_iso(r.get("created_at"))
+                if created and started <= created <= finished:
+                    s = str(r.get("source") or "").lower()
+                    if s:
+                        last_run_count[s] = last_run_count.get(s, 0) + 1
+    head_right = ("<span style='font-family:var(--font-mono);font-size:11px;color:var(--muted)'>"
+                  f"{sum(1 for v in enabled.values() if v)} active"
+                  "</span>")
+    st.markdown(_settings_card_head("Sources", "Where the agent looks", head_right), unsafe_allow_html=True)
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:14px 22px 16px'>"
+        ),
+        unsafe_allow_html=True,
+    )
+    for key, label in _SETTINGS_SOURCE_TILES:
+        on = bool(enabled.get(key, False))
+        count = last_run_count.get(key, 0)
+        ct_label = f"{count} last run" if (on and count) else ("on" if on else "off")
+        tile_cls = "source-tile" if on else "source-tile off"
+        tile_cols = st.columns([5.4, 1.6], gap="small")
+        with tile_cols[0]:
+            st.markdown(
+                (
+                    f"<div class='{tile_cls}'>"
+                    f"<div class='nm'><span class='d'></span> {html.escape(label)}</div>"
+                    f"<span class='ct'>{html.escape(ct_label)}</span>"
+                    "</div>"
                 ),
-                disabled=not routing_enabled_val,
+                unsafe_allow_html=True,
             )
-            routing_quality = st.radio(
-                "Quality mode",
-                options=["fast", "quality"],
-                index=0 if routing_cfg.get("quality_mode", "fast") == "fast" else 1,
-                horizontal=True,
-                key=f"routing_quality_{slug}",
-                help=(
-                    "**fast**: cheaper/faster model for LLM-routed jobs (e.g. llama-3.1-8b-instant). "
-                    "**quality**: current configured model — best output, higher cost."
-                ),
-                disabled=not routing_enabled_val,
+        with tile_cols[1]:
+            new_val = st.toggle(
+                label,
+                key=f"settings_source_{slug}_{key}",
+                value=on,
+                label_visibility="collapsed",
             )
-            routing_log = st.checkbox(
-                "Log routing decisions",
-                value=bool(routing_cfg.get("log_routing_decisions", True)),
-                key=f"routing_log_{slug}",
-                disabled=not routing_enabled_val,
-            )
-            # Routing stats panel
-            try:
-                stats = get_routing_stats(profile=slug)
-                if stats:
-                    total = sum(stats.values())
-                    skipped = stats.get("skipped_llm", 0)
-                    called = stats.get("llm_called", 0)
-                    savings_pct = round(skipped / total * 100) if total else 0
-                    st.markdown("**Routing history (this profile)**")
-                    col_r1, col_r2, col_r3 = st.columns(3)
-                    col_r1.metric("LLM calls", called)
-                    col_r2.metric("Skipped (synthetic)", skipped)
-                    col_r3.metric("Cost savings", f"{savings_pct}%")
-                else:
-                    st.caption("No routing decisions logged yet for this profile.")
-            except Exception:
-                pass
+            if new_val != on:
+                enabled[key] = bool(new_val)
+                st.rerun()
+    if st.button(
+        "Add source",
+        key=f"settings_sources_add_{slug}",
+        help="Custom-source connectors are coming in a future chunk.",
+    ):
+        st.toast("Add-source UI is coming soon. Use the toggles above for built-in connectors.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        submitted = st.button(
-            "Save settings",
-            key=f"save_settings_{slug}",
-            type="primary",
-            help="Writes the updated config to this profile only.",
+
+def _render_settings_schedule_card(slug: str, raw_config: dict[str, Any], draft: dict[str, Any]) -> None:
+    cadence = "Daily at 04:00 UTC · plus on-demand"
+    st.markdown(_settings_card_head("Schedule & model"), unsafe_allow_html=True)
+    rows = [
+        ("Cadence",       cadence),
+        ("Scoring model", _format_provider_model(raw_config)),
+        ("Embeddings",    _format_embeddings(raw_config)),
+        ("Rate limit",    _format_rate_limit(raw_config)),
+        ("Spend cap",     _format_spend_cap(raw_config)),
+    ]
+    rows_html = "".join(
+        f"<div class='kv'><span class='k'>{html.escape(label)}</span>"
+        f"<span class='v'>{html.escape(str(value))}</span></div>"
+        for label, value in rows
+    )
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:14px 22px 12px'>"
+            f"{rows_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    with st.expander("Edit provider & model", expanded=False):
+        provider_options = ["groq", "anthropic", "gemini", "openai"]
+        cur_provider = draft.get("provider", "groq")
+        idx = provider_options.index(cur_provider) if cur_provider in provider_options else 0
+        new_provider = st.selectbox(
+            "Provider",
+            options=provider_options,
+            index=idx,
+            key=f"settings_provider_{slug}",
+            help="The default LLM provider used for scoring runs.",
         )
+        draft["provider"] = new_provider
+        existing_model = (draft.get("model_overrides") or {}).get(new_provider) or ""
+        new_model = st.text_input(
+            "Model name",
+            value=str(existing_model),
+            key=f"settings_model_{slug}",
+            placeholder="e.g. meta-llama/llama-4-scout-17b-16e-instruct",
+        )
+        draft.setdefault("model_overrides", {})[new_provider] = new_model.strip()
 
-        if submitted:
-            if is_intern:
-                try:
-                    parsed_monthly_stipend = _parse_optional_int_input(monthly_stipend) if intern_pay_preference == "paid_only" else None
-                except ValueError:
-                    callout("error", "Settings need one more detail", "Monthly stipend target must be a whole number or left blank.")
-                    return
-            editable["scoring"]["min_display_score"] = int(min_display)
-            editable["preferences"]["titles"] = _lines_to_list(titles_text)
-            editable["preferences"]["desired_skills"] = _lines_to_list(skills_text)
-            editable["preferences"]["hard_no_keywords"] = _lines_to_list(hard_no_text)
-            editable["preferences"]["location"]["remote_ok"] = remote_ok
-            editable["preferences"]["location"]["preferred_locations"] = list(preferred_locations)
-            if is_intern:
-                editable["preferences"]["compensation"] = {
-                    "intern_pay_preference": intern_pay_preference,
-                }
-                if intern_pay_preference == "paid_only" and parsed_monthly_stipend is not None:
-                    editable["preferences"]["compensation"]["monthly_stipend"] = parsed_monthly_stipend
-            else:
-                editable["preferences"]["compensation"] = {"min_salary": int(minimum_salary or 0)}
-            editable["sources"]["greenhouse"]["enabled"]  = gh_enabled
-            editable["sources"]["greenhouse"]["companies"] = _lines_to_list(gh_companies)
-            editable["sources"]["lever"]["enabled"]       = lv_enabled
-            editable["sources"]["lever"]["companies"]     = _lines_to_list(lv_companies)
-            editable["sources"]["ashby"]["enabled"]       = ash_enabled
-            editable["sources"]["ashby"]["companies"]     = _lines_to_list(ash_companies)
-            editable["sources"]["workable"]["enabled"]    = wl_enabled
-            editable["sources"]["workable"]["companies"]  = _lines_to_list(wl_companies)
-            editable["sources"]["hn"]["enabled"]          = hn_enabled
-            editable["sources"]["himalayas"]["enabled"]   = him_enabled
 
-            if not any((gh_enabled, lv_enabled, ash_enabled, wl_enabled, hn_enabled, him_enabled)):
-                callout("error", "At least one source is required", "Enable at least one source before saving.")
-                return
+def _render_settings_notifications_card(slug: str, draft: dict[str, Any]) -> None:
+    webhook_set = bool((os.environ.get("JOBAGENT_NOTIFY_WEBHOOK") or "").strip())
+    head_right = (
+        "<span style='font-family:var(--font-mono);font-size:11px;color:var(--muted)'>"
+        f"webhook {'configured' if webhook_set else 'not set'}"
+        "</span>"
+    )
+    st.markdown(_settings_card_head("Notifications & autonomy", right_html=head_right), unsafe_allow_html=True)
+    st.markdown(
+        (
+            "<div class='beacon-card' style='border-radius:0 0 var(--r-md) var(--r-md);"
+            "border-top:0;margin-top:-1px;padding:6px 22px 6px'>"
+        ),
+        unsafe_allow_html=True,
+    )
+    notif = draft.setdefault("notifications", {})
+    for key, title, sub in _SETTINGS_NOTIFICATION_ROWS:
+        row_cols = st.columns([5.4, 1.6], gap="small")
+        with row_cols[0]:
+            st.markdown(
+                (
+                    "<div class='notif-row'>"
+                    "<div>"
+                    f"<div class='label'>{html.escape(title)}</div>"
+                    f"<div class='sub'>{html.escape(sub)}</div>"
+                    "<div class='soon'>Coming soon</div>"
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        with row_cols[1]:
+            new_val = st.toggle(
+                title,
+                key=f"settings_notif_{slug}_{key}",
+                value=bool(notif.get(key)),
+                label_visibility="collapsed",
+            )
+            notif[key] = bool(new_val)
+    st.markdown(
+        (
+            "<p style='font-size:12px;color:var(--muted);margin:6px 0 12px;line-height:1.55'>"
+            "Toggles persist in this session only — there is no working backend yet. "
+            "Failure notifications are wired separately via "
+            "<code>JOBAGENT_NOTIFY_WEBHOOK</code> in the environment."
+            "</p>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
-            existing_routing = dict(editable.get("routing") or {})
-            existing_routing["enabled"] = routing_enabled_val
-            # Write llm_threshold (the per-profile override the router actually reads
-            # when both fields are present); leave any legacy threshold field intact
-            # so other tooling that still reads it keeps working.
-            existing_routing["llm_threshold"] = round(float(routing_threshold), 2)
-            existing_routing["quality_mode"] = routing_quality
-            existing_routing["log_routing_decisions"] = routing_log
-            editable["routing"] = existing_routing
-            _write_profile_config(slug, editable)
-            _set_notice(slug, "success", "Settings saved for this profile.")
+
+def _save_settings_draft(slug: str, raw_config: dict[str, Any], draft: dict[str, Any]) -> tuple[bool, str]:
+    enabled = draft["sources_enabled"]
+    if not any(enabled.values()):
+        return False, "Enable at least one source before saving."
+    weights_pct = draft["weights"]
+    total_pct = sum(weights_pct.values())
+    if total_pct == 0:
+        return False, "At least one scoring weight must be greater than zero."
+    factor = total_pct / 100.0 if total_pct > 0 else 1.0
+    weights_norm = {k: round((v / 100.0) / factor, 4) for k, v in weights_pct.items()} if factor > 0 else {
+        k: round(v / 100.0, 4) for k, v in weights_pct.items()
+    }
+    updated = copy.deepcopy(raw_config)
+    updated.setdefault("scoring", {})["weights"] = weights_norm
+    sources = updated.setdefault("sources", {})
+    for key, _label in _SETTINGS_SOURCE_TILES:
+        block = sources.setdefault(key, {})
+        block["enabled"] = bool(enabled.get(key))
+    llm_cfg = updated.setdefault("llm", {})
+    llm_cfg["provider"] = draft.get("provider", llm_cfg.get("provider", "groq"))
+    overrides = draft.get("model_overrides") or {}
+    if overrides:
+        models_section = llm_cfg.setdefault("model", {})
+        for prov, model_name in overrides.items():
+            if model_name:
+                models_section[prov] = model_name
+    _write_profile_config(slug, updated)
+    return True, "Settings saved for this profile."
+
+
+def _render_settings_tab(slug: str, config: dict[str, Any], raw_config: dict[str, Any], metrics: dict[str, Any]) -> None:
+    draft = _ensure_settings_draft(slug, raw_config)
+
+    head_cols = st.columns([6.4, 2.6], gap="medium")
+    with head_cols[0]:
+        _render_beacon_page_header(
+            "Settings",
+            "How the agent works for you.",
+            "Tune scoring weights, sources, schedule, and notifications. Changes take effect on the next run.",
+        )
+    with head_cols[1]:
+        action_cols = st.columns(2, gap="small")
+        with action_cols[0]:
+            if st.button(
+                "Reset",
+                key=f"settings_reset_{slug}",
+                use_container_width=True,
+                help="Discards in-progress changes and reverts to what's currently in config.yaml.",
+            ):
+                _reset_settings_draft(slug)
+                st.toast("Settings draft reset.")
+                st.rerun()
+        with action_cols[1]:
+            if st.button(
+                "Save",
+                key=f"settings_save_{slug}",
+                use_container_width=True,
+                type="primary",
+            ):
+                ok, msg = _save_settings_draft(slug, raw_config, draft)
+                if ok:
+                    _set_notice(slug, "success", msg)
+                    invalidate_dashboard_caches()
+                    st.rerun()
+                else:
+                    _set_notice(slug, "error", msg)
+                    st.rerun()
+
+    runs = _cached_recent_runs(slug)
+    last_run = runs[0] if runs else None
+
+    st.markdown("<div class='panel-grid'></div>", unsafe_allow_html=True)
+    grid_top = st.columns(2, gap="large")
+    with grid_top[0]:
+        _render_settings_weights_card(slug, draft)
+    with grid_top[1]:
+        _render_settings_sources_card(slug, draft, raw_config, last_run)
+
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    grid_bottom = st.columns(2, gap="large")
+    with grid_bottom[0]:
+        _render_settings_schedule_card(slug, raw_config, draft)
+    with grid_bottom[1]:
+        _render_settings_notifications_card(slug, draft)
+
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+    with st.expander("Advanced matching", expanded=False):
+        st.caption(
+            "Fine-tune hard-no keywords and per-source company allowlists. Titles and "
+            "skills now live on the Profile tab."
+        )
+        editable = apply_config_defaults(copy.deepcopy(raw_config))
+        editable.setdefault("preferences", {})
+        editable["preferences"].setdefault("compensation", {})
+        editable.setdefault("sources", {})
+        for key in ("greenhouse", "lever", "ashby", "workable"):
+            editable["sources"].setdefault(key, {"enabled": True, "companies": []})
+        editable["sources"].setdefault("hn",        {"enabled": False})
+        editable["sources"].setdefault("himalayas", {"enabled": False})
+        hard_no_default = editable["preferences"].get("hard_no_keywords", []) or []
+        gh_companies_default  = editable["sources"]["greenhouse"].get("companies", [])
+        lv_companies_default  = editable["sources"]["lever"].get("companies", [])
+        ash_companies_default = editable["sources"]["ashby"].get("companies", [])
+        wl_companies_default  = editable["sources"]["workable"].get("companies", [])
+        hard_no_text  = st.text_area(
+            "Hard-no keywords",
+            value="\n".join(hard_no_default),
+            height=100,
+            help="Any posting containing these phrases will be skipped before scoring.",
+            key=f"settings_advanced_hardno_{slug}",
+        )
+        col_a, col_b = st.columns(2, gap="medium")
+        with col_a:
+            gh_companies = st.text_area(
+                "Greenhouse companies",
+                value="\n".join(gh_companies_default),
+                height=140,
+                key=f"settings_advanced_gh_{slug}",
+                help="One company slug per line.",
+            )
+            ash_companies = st.text_area(
+                "Ashby companies",
+                value="\n".join(ash_companies_default),
+                height=140,
+                key=f"settings_advanced_ash_{slug}",
+            )
+        with col_b:
+            lv_companies = st.text_area(
+                "Lever companies",
+                value="\n".join(lv_companies_default),
+                height=140,
+                key=f"settings_advanced_lv_{slug}",
+            )
+            wl_companies = st.text_area(
+                "Workable companies",
+                value="\n".join(wl_companies_default),
+                height=140,
+                key=f"settings_advanced_wl_{slug}",
+            )
+        if st.button("Save advanced matching", key=f"settings_advanced_save_{slug}", type="primary"):
+            updated = copy.deepcopy(raw_config)
+            updated.setdefault("preferences", {})["hard_no_keywords"] = _lines_to_list(hard_no_text)
+            updated.setdefault("sources", {})
+            for key, companies_text in (
+                ("greenhouse", gh_companies),
+                ("lever",      lv_companies),
+                ("ashby",      ash_companies),
+                ("workable",   wl_companies),
+            ):
+                block = updated["sources"].setdefault(key, {})
+                block["companies"] = _lines_to_list(companies_text)
+            _write_profile_config(slug, updated)
+            _set_notice(slug, "success", "Advanced matching saved.")
             invalidate_dashboard_caches()
             st.rerun()
 
-        with st.expander("Profile actions", expanded=False):
-            callout("info", "Profile management", "Create a fresh workspace or refresh scores without removing saved jobs.")
-            profile_action_cols = st.columns([0.95, 1.05], gap="large")
-            with profile_action_cols[0]:
-                if st.button("Create new profile", key=f"settings_create_profile_{slug}", type="secondary", help="Open a quick profile-creation dialog."):
-                    _open_create_profile_dialog()
-            with profile_action_cols[1]:
-                confirm_rescore = bool(st.session_state.get(f"confirm_rescore_{slug}", False))
-                if st.button("Re-score profile", key=f"rescore_all_{slug}", disabled=not confirm_rescore):
-                    config["_active_profile"] = slug
-                    missing = _check_api_key(config)
-                    if missing:
-                        callout("error", "API key missing", f"Set {missing} before running a rescore.")
-                    else:
-                        try:
-                            with st.spinner("Resetting scores and rescoring jobs..."):
-                                run_id = start_run(profile=slug, source="dashboard_rescore")
-                                rescore_reset(profile=slug)
-                                results = score_all_jobs(config, yes=True, profile=slug)
-                                scored = [item for item in results if item.get("fit_score", 0) > 0]
-                                avg_fit = round(sum(item["fit_score"] for item in scored) / len(scored), 1) if scored else 0.0
-                                finish_run(run_id, jobs_scraped=0, jobs_filtered=0, jobs_saved=0, jobs_scored=len(scored), avg_fit_score=avg_fit, errors=[], status="complete", profile=slug)
-                            _set_notice(slug, "success", f"Re-scored {len(scored)} jobs.")
-                            invalidate_dashboard_caches()
-                            st.rerun()
-                        except Exception as exc:
-                            callout("error", "Re-score failed", str(exc))
-                st.checkbox(
-                    f"I understand this will rescore {metrics.get('db_total', metrics['total'])} jobs and replace existing scores.",
-                    key=f"confirm_rescore_{slug}",
-                )
+    with st.expander("Cost optimization (selective routing)", expanded=False):
+        editable = apply_config_defaults(copy.deepcopy(raw_config))
+        routing_cfg = editable.get("routing", {})
+        st.caption(
+            "Route low-confidence jobs to a synthetic score instead of the LLM. "
+            "Reduces API costs by 60–90% with minimal quality impact."
+        )
+        routing_enabled_val = st.toggle(
+            "Enable selective routing",
+            value=bool(routing_cfg.get("enabled", False)),
+            key=f"routing_enabled_{slug}",
+        )
+        current_threshold = float(
+            routing_cfg.get("llm_threshold")
+            if routing_cfg.get("llm_threshold") is not None
+            else routing_cfg.get("threshold", 0.18)
+        )
+        routing_threshold = st.slider(
+            "Routing threshold",
+            min_value=0.05,
+            max_value=0.90,
+            value=max(0.05, min(0.90, current_threshold)),
+            step=0.01,
+            key=f"routing_threshold_{slug}",
+            disabled=not routing_enabled_val,
+            help=(
+                "Jobs whose cross-encoder score is below this value skip the LLM. "
+                "Lower = more LLM calls. Higher = fewer."
+            ),
+        )
+        routing_quality = st.radio(
+            "Quality mode",
+            options=["fast", "quality"],
+            index=0 if routing_cfg.get("quality_mode", "fast") == "fast" else 1,
+            horizontal=True,
+            key=f"routing_quality_{slug}",
+            disabled=not routing_enabled_val,
+        )
+        routing_log = st.checkbox(
+            "Log routing decisions",
+            value=bool(routing_cfg.get("log_routing_decisions", True)),
+            key=f"routing_log_{slug}",
+            disabled=not routing_enabled_val,
+        )
+        try:
+            stats = get_routing_stats(profile=slug)
+            if stats:
+                total = sum(stats.values())
+                skipped = stats.get("skipped_llm", 0)
+                called = stats.get("llm_called", 0)
+                savings_pct = round(skipped / total * 100) if total else 0
+                col_r1, col_r2, col_r3 = st.columns(3)
+                col_r1.metric("LLM calls", called)
+                col_r2.metric("Skipped (synthetic)", skipped)
+                col_r3.metric("Cost savings", f"{savings_pct}%")
+            else:
+                st.caption("No routing decisions logged yet for this profile.")
+        except Exception:
+            pass
+        if st.button("Save routing settings", key=f"routing_save_{slug}", type="primary"):
+            updated = copy.deepcopy(raw_config)
+            existing_routing = dict(updated.get("routing") or {})
+            existing_routing["enabled"] = routing_enabled_val
+            existing_routing["llm_threshold"] = round(float(routing_threshold), 2)
+            existing_routing["quality_mode"] = routing_quality
+            existing_routing["log_routing_decisions"] = routing_log
+            updated["routing"] = existing_routing
+            _write_profile_config(slug, updated)
+            _set_notice(slug, "success", "Routing settings saved.")
+            invalidate_dashboard_caches()
+            st.rerun()
 
-        with st.expander("Danger zone", expanded=False):
-            callout("error", "Destructive action", "This removes the current profile database and run history. It cannot be undone from the UI.")
-            confirm_clear = st.checkbox(
-                f"I understand this will permanently erase {metrics.get('db_total', metrics['total'])} jobs and all run history for this profile.",
-                key=f"confirm_clear_{slug}",
+    with st.expander("Scoring · minimum display score", expanded=False):
+        editable = apply_config_defaults(copy.deepcopy(raw_config))
+        editable.setdefault("scoring", {})
+        cur = int(editable["scoring"].get("min_display_score", 60))
+        new_min = st.slider(
+            "Minimum display score",
+            min_value=0,
+            max_value=100,
+            value=cur,
+            step=5,
+            key=f"settings_min_display_{slug}",
+            help="Jobs below this score stay saved but are hidden from the Jobs tab.",
+        )
+        if st.button("Save minimum score", key=f"settings_min_display_save_{slug}"):
+            updated = copy.deepcopy(raw_config)
+            updated.setdefault("scoring", {})["min_display_score"] = int(new_min)
+            _write_profile_config(slug, updated)
+            _set_notice(slug, "success", "Minimum display score saved.")
+            invalidate_dashboard_caches()
+            st.rerun()
+
+    with st.expander("Profile actions", expanded=False):
+        callout("info", "Profile management", "Create a fresh workspace or refresh scores without removing saved jobs.")
+        profile_action_cols = st.columns([0.95, 1.05], gap="large")
+        with profile_action_cols[0]:
+            if st.button("Create new profile", key=f"settings_create_profile_{slug}", type="secondary"):
+                _open_create_profile_dialog()
+        with profile_action_cols[1]:
+            confirm_rescore = bool(st.session_state.get(f"confirm_rescore_{slug}", False))
+            if st.button("Re-score profile", key=f"rescore_all_{slug}", disabled=not confirm_rescore):
+                config["_active_profile"] = slug
+                missing = _check_api_key(config)
+                if missing:
+                    callout("error", "API key missing", f"Set {missing} before running a rescore.")
+                else:
+                    try:
+                        with st.spinner("Resetting scores and rescoring jobs..."):
+                            run_id = start_run(profile=slug, source="dashboard_rescore")
+                            rescore_reset(profile=slug)
+                            results = score_all_jobs(config, yes=True, profile=slug)
+                            scored = [item for item in results if item.get("fit_score", 0) > 0]
+                            avg_fit = round(sum(item["fit_score"] for item in scored) / len(scored), 1) if scored else 0.0
+                            finish_run(run_id, jobs_scraped=0, jobs_filtered=0, jobs_saved=0, jobs_scored=len(scored), avg_fit_score=avg_fit, errors=[], status="complete", profile=slug)
+                        _set_notice(slug, "success", f"Re-scored {len(scored)} jobs.")
+                        invalidate_dashboard_caches()
+                        st.rerun()
+                    except Exception as exc:
+                        callout("error", "Re-score failed", str(exc))
+            st.checkbox(
+                f"I understand this will rescore {metrics.get('db_total', metrics['total'])} jobs and replace existing scores.",
+                key=f"confirm_rescore_{slug}",
             )
-            if st.button("Clear profile database", key=f"clear_all_{slug}", disabled=not confirm_clear):
-                _clear_profile_jobs(slug)
-                _set_notice(slug, "success", "Profile database cleared.")
-                invalidate_dashboard_caches()
-                st.rerun()
+
+    with st.expander("Tracking & evaluation", expanded=False):
+        _render_tracking_status_panel(config, slug)
+
+    with st.expander("Danger zone", expanded=False):
+        callout("error", "Destructive action", "This removes the current profile database and run history. It cannot be undone from the UI.")
+        confirm_clear = st.checkbox(
+            f"I understand this will permanently erase {metrics.get('db_total', metrics['total'])} jobs and all run history for this profile.",
+            key=f"confirm_clear_{slug}",
+        )
+        if st.button("Clear profile database", key=f"clear_all_{slug}", disabled=not confirm_clear):
+            _clear_profile_jobs(slug)
+            _set_notice(slug, "success", "Profile database cleared.")
+            invalidate_dashboard_caches()
+            st.rerun()
 
 
 def _render_profile_dashboard(slug: str) -> None:
