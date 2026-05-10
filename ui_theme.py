@@ -6,45 +6,61 @@ from typing import Optional
 import streamlit as st
 import streamlit.components.v1 as components
 
-PAGE_TITLE = "Job Search Dashboard"
+PAGE_TITLE = "Beacon"
 
-COLOR_BG = "#e5edeb"
-COLOR_BG_ACCENT = "#dfeae8"
-COLOR_SURFACE = "rgba(255, 255, 255, 0.97)"
-COLOR_SURFACE_STRONG = "#ffffff"
-COLOR_SURFACE_MUTED = "#f2f6f4"
-COLOR_SURFACE_INVERSE = "#122226"
-COLOR_TEXT = "#142328"
-COLOR_MUTED = "#5d7077"
-COLOR_BORDER = "rgba(20, 35, 40, 0.13)"
-COLOR_BORDER_STRONG = "rgba(20, 35, 40, 0.19)"
-COLOR_ACCENT = "#0f766e"
-COLOR_ACCENT_SOFT = "#e1f3f0"
-COLOR_SUCCESS = "#13795b"
-COLOR_SUCCESS_SOFT = "#e8f7f1"
-COLOR_WARNING = "#9a5b00"
-COLOR_WARNING_SOFT = "#fff3dd"
-COLOR_DANGER = "#b42318"
-COLOR_DANGER_SOFT = "#fdecea"
-COLOR_INFO = "#2457a6"
-COLOR_INFO_SOFT = "#eaf1fc"
-COLOR_FOCUS = "rgba(15, 118, 110, 0.42)"
+# Beacon design tokens — editorial monochrome palette.
+# Default theme is "mono" (light editorial). theme-dark overrides live in the
+# CSS below; the toggle UI ships in a later chunk.
+COLOR_BG = "#f6f5f1"
+COLOR_BG_2 = "#efeee9"
+COLOR_BG_3 = "#e9e8e2"
+COLOR_SURFACE = "#ffffff"
+COLOR_INK = "#16170f"
+COLOR_INK_2 = "#3b3c34"
+COLOR_INK_3 = "#5a5b51"
+COLOR_MUTED = "#807f73"
 
-RADIUS_SM = "14px"
-RADIUS_MD = "20px"
-RADIUS_LG = "28px"
-RADIUS_XL = "36px"
-SHADOW_SOFT = "0 18px 36px rgba(17, 34, 39, 0.07)"
-SHADOW_PANEL = "0 12px 28px rgba(17, 34, 39, 0.07)"
-SPACE_2XS = "0.35rem"
-SPACE_XS = "0.55rem"
-SPACE_SM = "0.8rem"
-SPACE_MD = "1.1rem"
-SPACE_LG = "1.55rem"
-SPACE_XL = "2.1rem"
-SPACE_2XL = "2.8rem"
-FONT_DISPLAY = "'Space Grotesk', 'Segoe UI', sans-serif"
-FONT_BODY = "'IBM Plex Sans', 'Aptos', 'Segoe UI', sans-serif"
+COLOR_LINE = "rgba(22,23,15,0.08)"
+COLOR_LINE_2 = "rgba(22,23,15,0.14)"
+COLOR_LINE_3 = "rgba(22,23,15,0.20)"
+
+COLOR_ACCENT = "#16170f"
+COLOR_ACCENT_INK = "#f6f5f1"
+
+COLOR_SIGNAL = "#5b6c2e"          # success / good fit
+COLOR_SIGNAL_2 = "#7a8c45"
+COLOR_SIGNAL_SOFT = "#e7ecd7"
+COLOR_WARN = "#a05a14"             # not relevant
+COLOR_WARN_SOFT = "#f4e6cf"
+COLOR_DANGER = "#8a2a1f"
+COLOR_DANGER_SOFT = "#f0d8d2"
+COLOR_POP = "#1f3d8a"               # info / agent activity
+COLOR_POP_SOFT = "#dde4f4"
+
+COLOR_FOCUS = "rgba(22,23,15,0.18)"
+
+RADIUS_XS = "6px"
+RADIUS_SM = "8px"
+RADIUS_MD = "12px"
+RADIUS_LG = "18px"
+RADIUS_XL = "22px"
+
+SHADOW_1 = "0 1px 0 rgba(22,23,15,0.04)"
+SHADOW_2 = "0 1px 0 rgba(22,23,15,0.04), 0 8px 24px rgba(22,23,15,0.05)"
+SHADOW_POP = "0 16px 44px rgba(22,23,15,0.14)"
+
+SPACE_1 = "4px"
+SPACE_2 = "8px"
+SPACE_3 = "12px"
+SPACE_4 = "16px"
+SPACE_5 = "20px"
+SPACE_6 = "24px"
+SPACE_7 = "32px"
+SPACE_8 = "48px"
+
+FONT_DISPLAY = "'Inter Tight', ui-sans-serif, system-ui, sans-serif"
+FONT_BODY = "'Inter', ui-sans-serif, system-ui, sans-serif"
+FONT_MONO = "'JetBrains Mono', ui-monospace, monospace"
 
 _PAGE_CONFIG_APPLIED = False
 
@@ -52,63 +68,141 @@ _PAGE_CONFIG_APPLIED = False
 def _global_css() -> str:
     return f"""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 
+    /* ── Beacon design tokens (mono = default, dark = override) ───────────── */
     :root {{
-        --shell-bg: {COLOR_BG};
-        --shell-bg-accent: {COLOR_BG_ACCENT};
-        --shell-surface: {COLOR_SURFACE};
-        --shell-surface-strong: {COLOR_SURFACE_STRONG};
-        --shell-surface-muted: {COLOR_SURFACE_MUTED};
-        --shell-surface-inverse: {COLOR_SURFACE_INVERSE};
-        --shell-text: {COLOR_TEXT};
-        --shell-muted: {COLOR_MUTED};
-        --shell-border: {COLOR_BORDER};
-        --shell-border-strong: {COLOR_BORDER_STRONG};
-        --shell-accent: {COLOR_ACCENT};
-        --shell-accent-soft: {COLOR_ACCENT_SOFT};
-        --shell-success: {COLOR_SUCCESS};
-        --shell-success-soft: {COLOR_SUCCESS_SOFT};
-        --shell-warning: {COLOR_WARNING};
-        --shell-warning-soft: {COLOR_WARNING_SOFT};
-        --shell-danger: {COLOR_DANGER};
-        --shell-danger-soft: {COLOR_DANGER_SOFT};
-        --shell-info: {COLOR_INFO};
-        --shell-info-soft: {COLOR_INFO_SOFT};
+        /* Beacon raw tokens */
+        --bg: {COLOR_BG};
+        --bg-2: {COLOR_BG_2};
+        --bg-3: {COLOR_BG_3};
+        --surface: {COLOR_SURFACE};
+        --ink: {COLOR_INK};
+        --ink-2: {COLOR_INK_2};
+        --ink-3: {COLOR_INK_3};
+        --muted: {COLOR_MUTED};
+        --line: {COLOR_LINE};
+        --line-2: {COLOR_LINE_2};
+        --line-3: {COLOR_LINE_3};
+        --accent: {COLOR_ACCENT};
+        --accent-ink: {COLOR_ACCENT_INK};
+        --signal: {COLOR_SIGNAL};
+        --signal-2: {COLOR_SIGNAL_2};
+        --signal-soft: {COLOR_SIGNAL_SOFT};
+        --warn: {COLOR_WARN};
+        --warn-soft: {COLOR_WARN_SOFT};
+        --danger: {COLOR_DANGER};
+        --danger-soft: {COLOR_DANGER_SOFT};
+        --pop: {COLOR_POP};
+        --pop-soft: {COLOR_POP_SOFT};
+        --r-xs: {RADIUS_XS};
+        --r-sm: {RADIUS_SM};
+        --r-md: {RADIUS_MD};
+        --r-lg: {RADIUS_LG};
+        --r-xl: {RADIUS_XL};
+        --shadow-1: {SHADOW_1};
+        --shadow-2: {SHADOW_2};
+        --shadow-pop: {SHADOW_POP};
+        --focus: 0 0 0 3px {COLOR_FOCUS};
+        --font-display: {FONT_DISPLAY};
+        --font-body: {FONT_BODY};
+        --font-mono: {FONT_MONO};
+        --sp-1: {SPACE_1};
+        --sp-2: {SPACE_2};
+        --sp-3: {SPACE_3};
+        --sp-4: {SPACE_4};
+        --sp-5: {SPACE_5};
+        --sp-6: {SPACE_6};
+        --sp-7: {SPACE_7};
+        --sp-8: {SPACE_8};
+
+        /* Legacy --shell-* aliases — keep existing shell-* classes working
+           by pointing them at Beacon tokens. */
+        --shell-bg: var(--bg);
+        --shell-bg-accent: var(--bg-2);
+        --shell-surface: var(--surface);
+        --shell-surface-strong: var(--surface);
+        --shell-surface-muted: var(--bg-2);
+        --shell-surface-inverse: var(--ink);
+        --shell-text: var(--ink);
+        --shell-muted: var(--muted);
+        --shell-border: var(--line);
+        --shell-border-strong: var(--line-2);
+        --shell-accent: var(--ink);
+        --shell-accent-soft: var(--bg-2);
+        --shell-success: var(--signal);
+        --shell-success-soft: var(--signal-soft);
+        --shell-warning: var(--warn);
+        --shell-warning-soft: var(--warn-soft);
+        --shell-danger: var(--danger);
+        --shell-danger-soft: var(--danger-soft);
+        --shell-info: var(--pop);
+        --shell-info-soft: var(--pop-soft);
         --shell-focus: {COLOR_FOCUS};
-        --shell-radius-sm: {RADIUS_SM};
-        --shell-radius-md: {RADIUS_MD};
-        --shell-radius-lg: {RADIUS_LG};
-        --shell-radius-xl: {RADIUS_XL};
-        --shell-sidebar-top-offset: 1.9rem;
-        --shell-shadow: {SHADOW_SOFT};
-        --shell-shadow-panel: {SHADOW_PANEL};
-        --shell-space-2xs: {SPACE_2XS};
-        --shell-space-xs: {SPACE_XS};
-        --shell-space-sm: {SPACE_SM};
-        --shell-space-md: {SPACE_MD};
-        --shell-space-lg: {SPACE_LG};
-        --shell-space-xl: {SPACE_XL};
-        --shell-space-2xl: {SPACE_2XL};
-        --shell-font-display: {FONT_DISPLAY};
-        --shell-font-body: {FONT_BODY};
+        --shell-radius-sm: var(--r-sm);
+        --shell-radius-md: var(--r-md);
+        --shell-radius-lg: var(--r-lg);
+        --shell-radius-xl: var(--r-xl);
+        --shell-sidebar-top-offset: 0.9rem;
+        --shell-shadow: var(--shadow-1);
+        --shell-shadow-panel: var(--shadow-2);
+        --shell-space-2xs: var(--sp-1);
+        --shell-space-xs: var(--sp-2);
+        --shell-space-sm: var(--sp-3);
+        --shell-space-md: var(--sp-4);
+        --shell-space-lg: var(--sp-5);
+        --shell-space-xl: var(--sp-6);
+        --shell-space-2xl: var(--sp-7);
+        --shell-font-display: var(--font-display);
+        --shell-font-body: var(--font-body);
+    }}
+
+    /* Theme: dark — overrides triggered by body.theme-dark. The mono
+       defaults above ARE the editorial light theme; no body.theme-mono
+       override needed unless future variants are introduced. */
+    body.theme-dark {{
+        --bg: #0f100c;
+        --bg-2: #16170f;
+        --bg-3: #1d1e15;
+        --surface: #1b1c14;
+        --ink: #f1efe6;
+        --ink-2: #cfcdc1;
+        --ink-3: #9d9c8e;
+        --muted: #7d7c70;
+        --line: rgba(241,239,230,0.08);
+        --line-2: rgba(241,239,230,0.16);
+        --line-3: rgba(241,239,230,0.24);
+        --accent: #f1efe6;
+        --accent-ink: #0f100c;
+        --signal: #b9cf7c;
+        --signal-2: #a4ba62;
+        --signal-soft: rgba(185,207,124,0.13);
+        --warn: #e6b070;
+        --warn-soft: rgba(230,176,112,0.13);
+        --danger: #e58072;
+        --danger-soft: rgba(229,128,114,0.13);
+        --pop: #9ab0e8;
+        --pop-soft: rgba(154,176,232,0.13);
+        --shadow-2: 0 1px 0 rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.4);
+        --focus: 0 0 0 3px rgba(241,239,230,0.18);
     }}
 
     html, body, [class*="css"] {{
-        font-family: var(--shell-font-body);
-        color: var(--shell-text);
+        font-family: var(--font-body);
+        color: var(--ink);
+        font-size: 14px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
     }}
 
     body {{
-        background: var(--shell-bg);
+        background: var(--bg);
     }}
 
     .stApp {{
-        background:
-            radial-gradient(circle at top left, rgba(15, 118, 110, 0.07), transparent 25%),
-            radial-gradient(circle at top right, rgba(36, 87, 166, 0.05), transparent 22%),
-            linear-gradient(180deg, #f8fbfa 0%, var(--shell-bg) 100%);
-        color: var(--shell-text);
+        background: var(--bg);
+        color: var(--ink);
     }}
 
     header[data-testid="stHeader"] {{
@@ -210,10 +304,9 @@ def _global_css() -> str:
     }}
 
     [data-testid="stSidebar"] > div:first-child {{
-        background:
-            linear-gradient(180deg, rgba(250, 252, 252, 0.98) 0%, rgba(243, 248, 247, 0.98) 100%);
-        border-right: 1px solid var(--shell-border-strong);
-        box-shadow: 8px 0 24px rgba(17, 34, 39, 0.04);
+        background: var(--bg-2);
+        border-right: 1px solid var(--line);
+        box-shadow: none;
         box-sizing: border-box;
         max-height: 100dvh;
         overflow-y: hidden;
@@ -1817,12 +1910,422 @@ def _global_css() -> str:
             scroll-behavior: auto !important;
         }}
     }}
+
+    /* ─── Beacon raw classes ────────────────────────────────────────────────
+       These mirror the reference Beacon mock: Brand mark, ProfileMenu, NavItem,
+       RunCard pulse, Rating control + compact variant, status pills, train
+       card. Used by ui_shell sidebar primitives and dashboard tabs. */
+
+    h1, h2, h3, h4, h5 {{
+        font-family: var(--font-display);
+        letter-spacing: -0.022em;
+        color: var(--ink);
+        font-weight: 600;
+        line-height: 1.1;
+    }}
+
+    /* ── Brand mark ── */
+    .beacon-brand {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 8px;
+    }}
+    .beacon-brand-mark {{
+        width: 28px;
+        height: 28px;
+        border-radius: 8px;
+        background: var(--ink);
+        color: var(--bg);
+        display: grid;
+        place-items: center;
+        font-family: var(--font-display);
+        font-weight: 700;
+        font-size: 14px;
+        letter-spacing: -0.04em;
+    }}
+    .beacon-brand-text {{
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+    }}
+    .beacon-brand-name {{
+        font-family: var(--font-display);
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        font-size: 15.5px;
+        color: var(--ink);
+    }}
+    .beacon-brand-sub {{
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }}
+
+    /* ── Profile pill (sidebar identity card, opens popover) ── */
+    .beacon-who {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: var(--r-sm);
+        border: 1px solid var(--line);
+        background: transparent;
+        width: 100%;
+        text-align: left;
+    }}
+    .beacon-who-av {{
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        background: var(--ink);
+        color: var(--bg);
+        display: grid;
+        place-items: center;
+        font-weight: 600;
+        font-size: 12px;
+        font-family: var(--font-display);
+        flex: 0 0 auto;
+    }}
+    .beacon-who-meta {{
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        flex: 1;
+        min-width: 0;
+    }}
+    .beacon-who-name {{
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 1.1;
+        color: var(--ink);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }}
+    .beacon-who-sub {{
+        font-size: 11px;
+        color: var(--muted);
+        font-family: var(--font-mono);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }}
+
+    /* ── NavGroup (sidebar grouped sections) ── */
+    .beacon-nav-kicker {{
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        padding: 8px 8px 4px;
+        font-weight: 500;
+    }}
+
+    /* Style sidebar buttons that sit inside a `.beacon-nav-group-marker`
+       container as Beacon nav-items. The marker is a sibling rendered
+       inside the same Streamlit container as the nav buttons. */
+    [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.beacon-nav-group-marker) [data-testid="stButton"] > button,
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"]:has(> [data-testid="stMarkdownContainer"] .beacon-nav-group-marker) [data-testid="stButton"] > button {{
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 10px;
+        height: auto;
+        min-height: 34px;
+        padding: 7px 10px;
+        border-radius: var(--r-xs);
+        font-size: 13px;
+        font-weight: 500;
+        font-family: var(--font-body);
+        color: var(--ink-2);
+        text-align: left;
+        background: transparent;
+        border: 1px solid transparent;
+        box-shadow: none;
+    }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.beacon-nav-group-marker) [data-testid="stButton"] > button:hover,
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"]:has(> [data-testid="stMarkdownContainer"] .beacon-nav-group-marker) [data-testid="stButton"] > button:hover {{
+        background: rgba(22,23,15,0.04);
+        color: var(--ink);
+        transform: none;
+    }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.beacon-nav-group-marker) [data-testid="stButton"] > button[kind="primary"],
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"]:has(> [data-testid="stMarkdownContainer"] .beacon-nav-group-marker) [data-testid="stButton"] > button[kind="primary"] {{
+        background: var(--surface);
+        color: var(--ink);
+        border-color: var(--line);
+        font-weight: 600;
+        box-shadow: var(--shadow-1);
+    }}
+    body.theme-dark [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.beacon-nav-group-marker) [data-testid="stButton"] > button[kind="primary"] {{
+        background: var(--bg-3);
+    }}
+
+    /* ── Run-card (live pipeline preview pinned to sidebar bottom) ── */
+    .beacon-run-card {{
+        padding: 11px 12px;
+        border-radius: var(--r-sm);
+        background: var(--surface);
+        border: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+        margin-top: 6px;
+    }}
+    .beacon-run-status {{
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }}
+    .beacon-pulse {{
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--signal);
+        box-shadow: 0 0 0 0 rgba(91,108,46,0.55);
+        animation: beaconPulse 1.6s infinite;
+    }}
+    .beacon-pulse.warn {{ background: var(--warn); box-shadow: 0 0 0 0 rgba(160,90,20,0.55); }}
+    .beacon-pulse.danger {{ background: var(--danger); box-shadow: 0 0 0 0 rgba(138,42,31,0.55); }}
+    .beacon-pulse.muted {{ background: var(--muted); animation: none; }}
+    @keyframes beaconPulse {{
+        0% {{ box-shadow: 0 0 0 0 rgba(91,108,46,0.55); }}
+        70% {{ box-shadow: 0 0 0 7px rgba(91,108,46,0); }}
+        100% {{ box-shadow: 0 0 0 0 rgba(91,108,46,0); }}
+    }}
+    .beacon-run-line {{
+        font-size: 13px;
+        font-weight: 500;
+        line-height: 1.35;
+        color: var(--ink);
+    }}
+    .beacon-run-line .muted {{ color: var(--muted); font-weight: 400; }}
+    .beacon-run-meta {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+    }}
+    .beacon-progress {{
+        height: 5px;
+        border-radius: 3px;
+        background: rgba(22,23,15,0.06);
+        overflow: hidden;
+    }}
+    body.theme-dark .beacon-progress {{
+        background: rgba(241,239,230,0.07);
+    }}
+    .beacon-progress > div {{
+        height: 100%;
+        background: var(--signal);
+        border-radius: 3px;
+        transition: width .4s ease;
+    }}
+
+    /* "Re-run setup" footer link inside sidebar */
+    .beacon-aside-foot-marker {{ display: none; }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.beacon-aside-foot-marker) [data-testid="stButton"] > button {{
+        height: auto;
+        min-height: 28px;
+        padding: 6px 10px;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        background: transparent;
+        border: 0;
+        border-radius: 5px;
+        box-shadow: none;
+        justify-content: flex-start;
+        text-align: left;
+        font-weight: 500;
+        text-transform: none;
+        letter-spacing: 0;
+    }}
+    [data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"]:has(.beacon-aside-foot-marker) [data-testid="stButton"] > button:hover {{
+        color: var(--ink);
+        background: rgba(22,23,15,0.04);
+        border: 0;
+        transform: none;
+    }}
+
+    /* ── Status pills (used in jobs table + match rows) ── */
+    .status-pill {{
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2px 9px;
+        border-radius: 99px;
+        font-size: 11px;
+        font-weight: 500;
+        font-family: var(--font-mono);
+        background: var(--bg-2);
+        color: var(--ink-2);
+        border: 1px solid var(--line);
+        line-height: 1.4;
+        text-transform: lowercase;
+    }}
+    .status-pill.applied   {{ background: var(--pop-soft);    color: var(--pop);    border-color: transparent; }}
+    .status-pill.interest  {{ background: var(--signal-soft); color: var(--signal); border-color: transparent; }}
+    .status-pill.reply     {{ background: var(--warn-soft);   color: var(--warn);   border-color: transparent; }}
+    .status-pill.skip      {{ color: var(--muted); background: transparent; border-color: var(--line); }}
+    .status-pill.new       {{ background: var(--bg-2); color: var(--ink-2); }}
+
+    /* ── Rating segmented control (5-button labeled, with compact variant) ── */
+    .rating {{
+        display: inline-flex;
+        align-items: stretch;
+        flex-wrap: wrap;
+        background: var(--bg-2);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 3px;
+        gap: 0;
+    }}
+    .rating .rt {{
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 6px 11px;
+        border-radius: 5px;
+        font-size: 11.5px;
+        font-weight: 500;
+        color: var(--ink-2);
+        background: transparent;
+        border: 1px solid transparent;
+        cursor: pointer;
+        font-family: var(--font-body);
+        line-height: 1.2;
+        transition: background .14s ease, color .14s ease, border-color .14s ease, box-shadow .14s ease, transform .08s ease;
+    }}
+    .rating .rt:hover {{ background: rgba(22,23,15,0.06); color: var(--ink); }}
+    body.theme-dark .rating .rt:hover {{ background: rgba(241,239,230,0.07); }}
+    .rating .rt-dot {{
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--line-3);
+        transition: background .12s ease, transform .12s ease, box-shadow .14s ease;
+        flex: 0 0 auto;
+    }}
+    .rating .rt-1 .rt-dot {{ background: var(--signal); }}
+    .rating .rt-2 .rt-dot {{ background: var(--signal-2); }}
+    .rating .rt-3 .rt-dot {{ background: var(--ink-3); opacity: .55; }}
+    .rating .rt-4 .rt-dot {{ background: var(--warn); }}
+    .rating .rt-5 .rt-dot {{ background: var(--muted); opacity: .65; }}
+    .rating .rt .k {{
+        font-family: var(--font-mono);
+        font-size: 9.5px;
+        color: var(--muted);
+        margin-left: 2px;
+        letter-spacing: .04em;
+    }}
+    .rating .rt.on {{
+        background: var(--surface);
+        border-color: var(--line);
+        box-shadow: 0 1px 0 rgba(22,23,15,0.04);
+        color: var(--ink);
+        font-weight: 600;
+    }}
+    .rating .rt-1.on {{ background: var(--signal-soft); border-color: transparent; color: var(--signal); }}
+    .rating .rt-2.on {{ background: var(--signal-soft); border-color: transparent; color: var(--signal); }}
+    .rating .rt-3.on {{ background: var(--bg); border-color: var(--line-2); color: var(--ink); }}
+    .rating .rt-4.on {{ background: var(--warn-soft); border-color: transparent; color: var(--warn); }}
+    .rating .rt-5.on {{ background: transparent; border-color: var(--line-2); color: var(--muted); }}
+    .rating .rt-5.on .rt-l {{ text-decoration: line-through; text-decoration-color: var(--line-3); text-underline-offset: 2px; }}
+
+    /* compact: dot-only chips, label appears only when selected */
+    .rating.compact {{ padding: 0; background: transparent; border: 0; gap: 1px; flex-wrap: nowrap; }}
+    .rating.compact .rt {{ padding: 4px 6px; gap: 0; border-radius: 99px; border: 0; background: transparent; }}
+    .rating.compact .rt .rt-l, .rating.compact .rt .k {{ display: none; }}
+    .rating.compact .rt-dot {{ width: 9px; height: 9px; }}
+    .rating.compact .rt:hover {{ background: transparent; }}
+    .rating.compact .rt:hover .rt-dot {{ transform: scale(1.45); }}
+    .rating.compact .rt.on {{ padding: 3px 9px 3px 6px; background: var(--bg-2); border: 1px solid var(--line); box-shadow: none; }}
+    .rating.compact .rt.on .rt-l {{
+        display: inline;
+        font-size: 10.5px;
+        font-family: var(--font-mono);
+        margin-left: 7px;
+        letter-spacing: .02em;
+        text-transform: uppercase;
+    }}
+    .rating.compact .rt-1.on {{ background: var(--signal-soft); border-color: transparent; }}
+    .rating.compact .rt-2.on {{ background: var(--signal-soft); border-color: transparent; }}
+    .rating.compact .rt-4.on {{ background: var(--warn-soft); border-color: transparent; }}
+
+    /* ── Rating notes textarea (rendered next to rating buttons) ── */
+    .rating-notes-label {{
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: .08em;
+        font-weight: 500;
+        margin-top: 8px;
+    }}
+    .rating-notes-confirm {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--signal);
+        margin-top: 4px;
+    }}
+
+    /* ── Eyebrow + display headers (page-header in Beacon vocabulary) ── */
+    .shell-page-header-eyebrow,
+    .shell-section-eyebrow,
+    .shell-sidebar-kicker,
+    .shell-app-header-kicker {{
+        font-family: var(--font-mono);
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 10.5px;
+    }}
+
+    /* Drop the heavy avatar circle from page-header (Beacon doesn't use one). */
+    .shell-page-header-avatar {{ display: none; }}
+    .shell-page-header-identity {{ gap: 0; }}
     </style>
     """
 
 
 def inject_global_css() -> None:
     st.markdown(_global_css(), unsafe_allow_html=True)
+
+
+def inject_theme_class(theme: str = "mono") -> None:
+    """Set the active theme class on the parent document body.
+
+    Beacon's design tokens default to the editorial light "mono" theme via
+    `:root`. The `body.theme-dark` override exists; chunk 4 will ship the
+    runtime toggle. For now this just stamps `body.theme-mono` so future
+    swaps are a single class flip.
+    """
+    safe = "dark" if theme == "dark" else "mono"
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          const doc = window.parent && window.parent.document;
+          if (!doc || !doc.body) return;
+          doc.body.classList.remove('theme-mono', 'theme-dark');
+          doc.body.classList.add('theme-{safe}');
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def inject_sidebar_scroll_guard() -> None:
@@ -2006,6 +2509,7 @@ def apply_page_scaffold(
         _PAGE_CONFIG_APPLIED = True
 
     inject_global_css()
+    inject_theme_class("mono")
     inject_sidebar_scroll_guard()
 
     if header_title:

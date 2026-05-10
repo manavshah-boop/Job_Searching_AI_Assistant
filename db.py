@@ -61,6 +61,9 @@ def get_db_path(profile: Optional[str] = None) -> Path:
 
 # ── Data models ───────────────────────────────────────────────────────────────
 
+ALLOWED_JOB_STATUSES = ("new", "interest", "applied", "reply", "skip")
+
+
 @dataclass
 class Job:
     id: str              # {source}_{source_id}, used for dedup
@@ -72,7 +75,7 @@ class Job:
     source: str          # "greenhouse" | "lever" | "hackernews"
     score_attempts: int = 0
     score_error: Optional[str] = None
-    status: str = "new"  # new | applied | skipped
+    status: str = "new"  # one of ALLOWED_JOB_STATUSES
     scrape_qualified: int = 1       # 1 = passed filters, 0 = rejected at scrape time
     scrape_filter_reason: str = ""  # e.g. "title_blocklist: Staff", "yoe_max: 8 > 5"
 
@@ -188,6 +191,15 @@ def _migrate_db(db_path: Path) -> None:
             decided_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # One-time migration: the old status vocabulary used "skipped"; the new
+    # vocab uses "skip" (and adds "interest" / "reply"). Idempotent — once the
+    # rows are migrated, this is a no-op on subsequent runs.
+    try:
+        conn.execute("UPDATE jobs SET status = 'skip' WHERE status = 'skipped'")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -400,9 +412,15 @@ def get_routing_stats(profile: Optional[str] = None) -> dict[str, int]:
 
 
 def update_job_status(job_id: str, status: str, profile: Optional[str] = None) -> None:
-    """Update a job's status (new | applied | skipped)."""
+    """Update a job's status. `status` must be one of ALLOWED_JOB_STATUSES."""
+    normalized = str(status).strip().lower()
+    if normalized not in ALLOWED_JOB_STATUSES:
+        raise ValueError(
+            f"Invalid job status {status!r}. "
+            f"Expected one of {ALLOWED_JOB_STATUSES}."
+        )
     conn = sqlite3.connect(get_db_path(profile))
-    conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+    conn.execute("UPDATE jobs SET status = ? WHERE id = ?", (normalized, job_id))
     conn.commit()
     conn.close()
 

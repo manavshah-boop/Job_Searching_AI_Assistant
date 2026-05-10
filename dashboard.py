@@ -66,11 +66,17 @@ from match_explainer import build_match_explanation
 from user_ratings import attach_role_family_from_config, rating_counts
 from onboarding import render_onboarding, sanitize_slug
 from profile_intent import normalize_profile_intent
-from progress_tracker import ProgressTracker
+from progress_tracker import ProgressTracker, Stage, StageStatus
 from scorer import score_all_jobs
 from tracking import get_experiment_name, get_tracking_uri, mlflow_enabled
 from ui_shell import (
     badge,
+    beacon_aside_foot,
+    beacon_brand,
+    beacon_nav_group,
+    beacon_nav_kicker,
+    beacon_profile_card,
+    beacon_run_card,
     callout,
     chip_row,
     empty_state,
@@ -905,6 +911,118 @@ def _render_staleness_banner(slug: str) -> None:
     )
 
 
+def _profile_initials(name: str) -> str:
+    parts = [part for part in str(name or "").strip().split() if part]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][:1] + parts[1][:1]).upper()
+
+
+def _profile_sub_line(profile_record: dict[str, Any]) -> str:
+    job_type = str(profile_record.get("job_type") or "fulltime").replace("_", " ")
+    counts = profile_record.get("counts") or {}
+    pipeline = int(counts.get("total") or 0)
+    return f"{job_type} · {pipeline} in pipeline"
+
+
+def _format_last_run_meta(last_run: dict[str, Any]) -> str:
+    finished = str(last_run.get("finished_at") or "")[:16]
+    scored = last_run.get("jobs_scored")
+    parts: list[str] = []
+    if scored is not None:
+        parts.append(f"Scored {scored}")
+    if finished:
+        parts.append(finished.replace("T", " "))
+    return " · ".join(parts) or "Run details unavailable"
+
+
+def _render_sidebar_run_card(
+    slug: str,
+    *,
+    worker_running: bool,
+) -> str | None:
+    """Render the run-card pinned to the sidebar bottom.
+
+    Returns "view_pipeline" when the user wants to jump to the Activity tab,
+    or "run_search" when they want to start a fresh discovery from idle.
+    """
+    progress_data = _read_progress_json(slug) if worker_running else None
+    last_run = _read_last_run(slug)
+
+    if worker_running and progress_data:
+        try:
+            tracker = ProgressTracker.from_dict(progress_data)
+            running_stage = next(
+                (sp for sp in tracker.stages.values() if sp.status == StageStatus.RUNNING),
+                None,
+            )
+            stage_label = (
+                running_stage.stage.value if running_stage else "Working…"
+            )
+            pct = tracker.overall_progress_pct
+        except Exception:
+            stage_label = "Working…"
+            pct = 0.0
+        view_clicked = beacon_run_card(
+            state="running",
+            headline="Run · live",
+            detail=stage_label,
+            progress_pct=pct,
+            action_label="View pipeline →",
+            action_key=f"sidebar_view_pipeline_{slug}",
+        )
+        if view_clicked:
+            return "view_pipeline"
+        return None
+
+    if worker_running:
+        view_clicked = beacon_run_card(
+            state="running",
+            headline="Run · starting",
+            detail="Worker is spinning up — progress will appear shortly.",
+            action_label="View pipeline →",
+            action_key=f"sidebar_view_pipeline_{slug}",
+        )
+        if view_clicked:
+            return "view_pipeline"
+        return None
+
+    if last_run:
+        status = str(last_run.get("status") or "").lower()
+        if status in {"failed", "error", "crashed"}:
+            state = "fail"
+            headline = f"Last run · {status}"
+        elif status in {"complete", "success", "ok", "completed"}:
+            state = "ok"
+            headline = "Last run · ok"
+        else:
+            state = "warn"
+            headline = f"Last run · {status or 'partial'}"
+        view_clicked = beacon_run_card(
+            state=state,
+            headline=headline,
+            detail=_format_last_run_meta(last_run),
+            action_label="View pipeline →",
+            action_key=f"sidebar_view_pipeline_{slug}",
+        )
+        if view_clicked:
+            return "view_pipeline"
+        return None
+
+    start_clicked = beacon_run_card(
+        state="idle",
+        headline="No runs yet",
+        detail="Start discovery to populate your pipeline.",
+        action_label="Start discovery",
+        action_key=f"sidebar_run_search_{slug}",
+    )
+    if start_clicked:
+        return "run_search"
+    return None
+
+
 def _render_sidebar_nav(
     slug: str,
     profile_name: str,
@@ -913,60 +1031,94 @@ def _render_sidebar_nav(
     *,
     worker_running: bool = False,
 ) -> str | None:
+    """Render the Beacon-style op-aside.
+
+    Returns one of {"run_search", "create_profile", "rerun_setup"} when the
+    caller needs to act. Profile-switching, view-pipeline, and onboarding
+    re-opens are handled internally via st.rerun.
+    """
     available_profiles = list_profiles()
-    secondary_actions = [
-        {
-            "id": "create_profile",
-            "label": "Create new profile",
-            "key": f"create_profile_sidebar_{slug}",
-        }
-    ]
-    if len(available_profiles) > 1:
-        secondary_actions.append(
-            {
-                "id": "switch_profile",
-                "label": "Change profile",
-                "key": f"switch_profile_sidebar_{slug}",
-        }
-    )
+    profile_cfg = config.get("profile", {}) if isinstance(config, dict) else {}
+    job_type = str(profile_cfg.get("job_type") or "fulltime").replace("_", " ")
+    in_pipeline = int(metrics.get("db_total") or metrics.get("total") or 0)
+    sub_line = f"{job_type} · {in_pipeline} in pipeline"
+    initials = _profile_initials(profile_name)
+
+    sidebar_action: str | None = None
+
     with st.sidebar:
-        sidebar_profile_summary(profile_name)
-        _render_html_block("<div class='shell-sidebar-divider' aria-hidden='true'></div>")
-        _render_html_block("<div class='shell-sidebar-section'>")
-        _render_html_block("<div class='shell-inline-section-label shell-inline-section-label--sidebar'>Navigation</div>")
-        _prepare_dashboard_section_widget()
-        st.radio(
-            "Sections",
-            SECTION_ORDER,
-            key=SECTION_WIDGET_KEY,
-            on_change=_sync_dashboard_section_from_widget,
-            label_visibility="collapsed",
+        beacon_brand("Beacon", "job-search agent")
+        beacon_profile_card(profile_name, sub_line, initials=initials)
+
+        popover_callable = callable(getattr(st, "popover", None))
+        if popover_callable and (len(available_profiles) > 1 or True):
+            with st.popover("Switch profile  ▾", use_container_width=True):
+                for profile in available_profiles:
+                    is_current = profile["slug"] == slug
+                    profile_initials = _profile_initials(profile["name"])
+                    profile_sub = _profile_sub_line(profile)
+                    label = f"{profile_initials} · {profile['name']}"
+                    if is_current:
+                        label = f"{label}  (current)"
+                    if st.button(
+                        label,
+                        key=f"profile_pop_row_{profile['slug']}",
+                        use_container_width=True,
+                        disabled=is_current,
+                        help=profile_sub,
+                    ):
+                        st.session_state.active_profile = profile["slug"]
+                        set_active_profile(profile["slug"])
+                        st.rerun()
+                _render_html_block("<hr style='margin:6px 0;border:0;border-top:1px solid var(--line)'/>")
+                if st.button("+  Add profile", key=f"profile_pop_add_{slug}", use_container_width=True):
+                    sidebar_action = "create_profile"
+
+        # Workspace nav group
+        beacon_nav_kicker("Workspace")
+        active_section = _valid_dashboard_section(
+            st.session_state.get("dashboard_section", "Overview")
         )
-        _render_html_block("</div>")
-        _render_html_block("<div class='shell-sidebar-divider shell-sidebar-divider--section' aria-hidden='true'></div>")
-        _render_html_block("<div class='shell-sidebar-actions'>")
-        _render_html_block("<div class='shell-inline-section-label shell-inline-section-label--sidebar'>Actions</div>")
-        run_label = "Running..." if worker_running else "Start discovery"
-        primary_action = toolbar(
-            primary_actions=[
-                {
-                    "id": "run_search",
-                    "label": run_label,
-                    "key": f"run_search_sidebar_{slug}",
-                    "disabled": worker_running,
-                }
+        ws_clicked = beacon_nav_group(
+            [
+                {"id": "Overview", "label": "Overview", "icon": "◉"},
+                {"id": "Jobs", "label": "Jobs", "icon": "▦", "count": in_pipeline},
+                {"id": "Activity", "label": "Activity", "icon": "≡"},
             ],
-            class_name="shell-toolbar shell-toolbar--sidebar-primary shell-toolbar--compact",
+            active=active_section,
+            key_prefix=f"nav_ws_{slug}",
         )
-        secondary_action = None
-        for action in secondary_actions:
-            clicked_action = toolbar(
-                secondary_actions=[action],
-                class_name="shell-toolbar shell-toolbar--sidebar-subtle shell-toolbar--compact",
-            )
-            secondary_action = secondary_action or clicked_action
-        _render_html_block("</div>")
-    return primary_action or secondary_action
+        if ws_clicked and ws_clicked != active_section:
+            st.session_state.dashboard_section = ws_clicked
+            st.rerun()
+
+        # You nav group
+        beacon_nav_kicker("You")
+        you_clicked = beacon_nav_group(
+            [
+                {"id": "Profile", "label": "Profile", "icon": "○"},
+                {"id": "Settings", "label": "Settings", "icon": "✦"},
+            ],
+            active=active_section,
+            key_prefix=f"nav_you_{slug}",
+        )
+        if you_clicked and you_clicked != active_section:
+            st.session_state.dashboard_section = you_clicked
+            st.rerun()
+
+        # Run card pinned to the bottom of the aside
+        run_card_action = _render_sidebar_run_card(slug, worker_running=worker_running)
+        if run_card_action == "view_pipeline":
+            st.session_state.dashboard_section = "Activity"
+            st.rerun()
+        elif run_card_action == "run_search":
+            sidebar_action = sidebar_action or "run_search"
+
+        # Footer: re-run setup (re-opens onboarding for the active profile)
+        if beacon_aside_foot("Re-run setup", key=f"sidebar_rerun_setup_{slug}"):
+            sidebar_action = sidebar_action or "rerun_setup"
+
+    return sidebar_action
 
 
 def _source_label(source: str) -> str:
@@ -1016,13 +1168,20 @@ def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]
     retries = 0
     applied = 0
     skipped = 0
+    interest = 0
+    reply = 0
 
     for record in records:
         source_counts[record["source_label"]] = source_counts.get(record["source_label"], 0) + 1
-        if record["status"] == "applied":
+        status = str(record.get("status") or "").lower()
+        if status == "applied":
             applied += 1
-        elif record["status"] == "skipped":
+        elif status == "skip":
             skipped += 1
+        elif status == "interest":
+            interest += 1
+        elif status == "reply":
+            reply += 1
 
         if record["score_state"] == "Scored":
             scored += 1
@@ -1050,6 +1209,8 @@ def _collect_metrics(slug: str, records: list[dict[str, Any]]) -> dict[str, Any]
         "needs_retry": retries,
         "applied": applied,
         "skipped": skipped,
+        "interest": interest,
+        "reply": reply,
         "avg_fit": avg_fit,
         "source_counts": source_counts,
         # Callers inject disqualified_count, disqualified_by_reason, db_total,
@@ -1224,11 +1385,25 @@ def _set_job_status_and_refresh(slug: str, job_id: str, status: str) -> None:
 
 
 def _status_badge_tone(status: str) -> str:
+    """Map a job status to the existing shell-badge tone vocabulary.
+
+    Beacon's status pills (rendered via the .status-pill CSS class) carry
+    richer semantics — interest=signal, reply=warn, skip=muted-with-line —
+    but the legacy shell-badge palette only supports {info, success,
+    warning, danger, neutral}. We map intent here:
+        new      → info     (a fresh, unhandled posting)
+        interest → success  (you're nodding at it)
+        applied  → info     (in flight; tracked via Beacon's pop colour)
+        reply    → warning  (recruiter touched, your move)
+        skip     → neutral  (out of scope, keep it muted)
+    """
     return {
-        "applied": "success",
-        "skipped": "warning",
+        "applied": "info",
+        "interest": "success",
+        "reply": "warning",
+        "skip": "neutral",
         "new": "info",
-    }.get(status.lower(), "neutral")
+    }.get(str(status).lower(), "neutral")
 
 
 def _score_badge_tone(score_state: str) -> str:
@@ -1725,7 +1900,7 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
         elif clicked == "mark_new_detail":
             _set_job_status_and_refresh(slug, record["id"], "new")
         elif clicked == "mark_skipped_detail":
-            _set_job_status_and_refresh(slug, record["id"], "skipped")
+            _set_job_status_and_refresh(slug, record["id"], "skip")
         elif clicked == "undo_status_detail":
             restored = _undo_last_status_change(slug)
             if restored:
@@ -2002,7 +2177,7 @@ def _render_jobs_tab(records: list[dict[str, Any]], slug: str) -> None:
             elif bulk_clicked in {"bulk_applied", "bulk_skipped", "bulk_new"}:
                 target_status = {
                     "bulk_applied": "applied",
-                    "bulk_skipped": "skipped",
+                    "bulk_skipped": "skip",
                     "bulk_new": "new",
                 }[bulk_clicked]
                 changed = _apply_status_changes(slug, filtered, selected_ids, target_status)
@@ -2374,7 +2549,7 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
         elif clicked == "mark_new_detail":
             _set_job_status_and_refresh(slug, record["id"], "new")
         elif clicked == "mark_skipped_detail":
-            _set_job_status_and_refresh(slug, record["id"], "skipped")
+            _set_job_status_and_refresh(slug, record["id"], "skip")
         elif clicked == "undo_status_detail":
             restored = _undo_last_status_change(slug)
             if restored:
@@ -2673,7 +2848,7 @@ def _render_jobs_tab(
                         _set_notice(slug, "success", f"Restored {restored} status change(s).")
                         st.rerun()
                 elif bulk_clicked in {"bulk_applied", "bulk_skipped", "bulk_new"}:
-                    target_status = {"bulk_applied": "applied", "bulk_skipped": "skipped", "bulk_new": "new"}[bulk_clicked]
+                    target_status = {"bulk_applied": "applied", "bulk_skipped": "skip", "bulk_new": "new"}[bulk_clicked]
                     changed = _apply_status_changes(slug, filtered, selected_ids, target_status)
                     if changed:
                         _set_notice(slug, "success", f"Updated {changed} job(s) to {target_status}.")
@@ -3379,6 +3554,9 @@ def _render_profile_dashboard(slug: str) -> None:
             st.rerun()
     if sidebar_action == "create_profile":
         _open_create_profile_dialog()
+    if sidebar_action == "rerun_setup":
+        st.session_state.show_onboarding = True
+        st.rerun()
     if sidebar_action == "switch_profile":
         st.session_state.active_profile = None
         set_active_profile(None)
