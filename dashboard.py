@@ -63,7 +63,12 @@ from dashboard_ui import (
 from logging_config import configure_logging
 from dashboard_ratings import factor_with_badge, render_rating_panel
 from match_explainer import build_match_explanation
-from user_ratings import attach_role_family_from_config, rating_counts
+from user_ratings import (
+    RATING_OPTIONS,
+    attach_role_family_from_config,
+    get_all_user_ratings,
+    rating_counts,
+)
 from onboarding import render_onboarding, sanitize_slug
 from profile_intent import normalize_profile_intent
 from progress_tracker import ProgressTracker, Stage, StageStatus
@@ -2573,6 +2578,867 @@ def _render_job_detail(record: dict[str, Any], slug: str) -> None:
             st.text(raw_text)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Beacon UI (chunk 2): Overview / Jobs / Job-drawer
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DRAWER_STATE_KEY = "_beacon_drawer_job_id"
+_JOBS_FILTER_STATE_KEY = "_beacon_jobs_filters"
+_JOBS_SELECT_STATE_KEY = "_beacon_jobs_selected"
+_JOBS_SORT_STATE_KEY = "_beacon_jobs_sort"
+_JOBS_DATAFRAME_STATE_KEY = "_beacon_jobs_table"
+
+_DIM_LABELS: tuple[tuple[str, str, str], ...] = (
+    ("role_fit",     "Role fit",     "0.30"),
+    ("stack_match",  "Stack match",  "0.25"),
+    ("seniority",    "Seniority",    "0.20"),
+    ("location",     "Location",     "0.10"),
+    ("growth",       "Growth",       "0.10"),
+    ("compensation", "Compensation", "0.05"),
+)
+
+
+def _verdict_for_score(score: Optional[int]) -> str:
+    """Beacon's three-bucket verdict: apply / maybe / skip."""
+    if score is None:
+        return "skip"
+    if score >= 80:
+        return "apply"
+    if score >= 65:
+        return "maybe"
+    return "skip"
+
+
+def _verdict_label(verdict: str) -> str:
+    return {"apply": "Apply", "maybe": "Maybe", "skip": "Skip"}.get(verdict, verdict.title())
+
+
+def _vbadge_html(verdict: str) -> str:
+    label = _verdict_label(verdict)
+    return f"<span class='vbadge {verdict}'><span class='vd'></span>{html.escape(label)}</span>"
+
+
+def _status_pill_html(status: str) -> str:
+    s = (status or "new").lower()
+    if s not in {"new", "interest", "applied", "reply", "skip"}:
+        s = "new"
+    return f"<span class='status-pill {s}'>{html.escape(s)}</span>"
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_relative(value: Any) -> str:
+    """Compact human-readable age (e.g. '3h', '5d'). Returns '—' on bad input."""
+    dt = _parse_iso(value)
+    if dt is None:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    seconds = max(int(delta.total_seconds()), 0)
+    if seconds < 60:
+        return "just now" if seconds < 5 else f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d"
+    if days < 30:
+        return f"{days // 7}w"
+    if days < 365:
+        return f"{days // 30}mo"
+    return f"{days // 365}y"
+
+
+def _format_run_duration(started: Any, finished: Any) -> str:
+    s = _parse_iso(started)
+    f = _parse_iso(finished)
+    if s is None or f is None:
+        return "—"
+    total = max(int((f - s).total_seconds()), 0)
+    minutes, seconds = divmod(total, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _count_new_high_fit(records: list[dict[str, Any]], threshold: int = 80) -> int:
+    return sum(
+        1
+        for record in records
+        if (record.get("fit_score") or 0) >= threshold
+        and str(record.get("status") or "new").lower() == "new"
+    )
+
+
+def _compute_run_state(
+    runs: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+    *,
+    worker_running: bool,
+) -> dict[str, Any]:
+    """Reduce the most recent run + current records into a Beacon RunBanner payload."""
+    new_high_fit = _count_new_high_fit(records)
+    if worker_running:
+        return {
+            "state": "running",
+            "run_id": None,
+            "finished_ago": "in progress",
+            "duration": "—",
+            "scraped": 0,
+            "scored": 0,
+            "new_high_fit": new_high_fit,
+            "errors": 0,
+            "error_detail": "",
+        }
+    if not runs:
+        return {
+            "state": "ok",
+            "run_id": None,
+            "finished_ago": "never",
+            "duration": "—",
+            "scraped": 0,
+            "scored": 0,
+            "new_high_fit": new_high_fit,
+            "errors": 0,
+            "error_detail": "",
+        }
+    run = runs[0]
+    status_raw = str(run.get("status") or "").lower()
+    errors = run.get("errors") or []
+    error_count = len(errors)
+    if status_raw in {"failed", "error", "crashed"}:
+        state = "fail"
+    elif error_count > 0:
+        state = "partial"
+    else:
+        state = "ok"
+    finished_at = run.get("finished_at")
+    rel = _format_relative(finished_at) if finished_at else "—"
+    finished_ago = f"{rel} ago" if rel not in {"—", "just now"} else rel
+    return {
+        "state": state,
+        "run_id": run.get("run_id"),
+        "finished_ago": finished_ago,
+        "duration": _format_run_duration(run.get("started_at"), finished_at),
+        "scraped": int(run.get("jobs_scraped") or 0),
+        "scored": int(run.get("jobs_scored") or 0),
+        "new_high_fit": new_high_fit,
+        "errors": error_count,
+        "error_detail": str(errors[0]) if errors else "",
+    }
+
+
+def _render_beacon_page_header(eyebrow: str, headline: str, sub: str | None = None) -> None:
+    sub_html = f"<div class='sub'>{html.escape(sub)}</div>" if sub else ""
+    st.markdown(
+        (
+            "<header class='beacon-ph'>"
+            f"<div class='eyebrow'>{html.escape(eyebrow)}</div>"
+            f"<h1>{html.escape(headline)}</h1>"
+            f"{sub_html}"
+            "</header>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+_RUN_STATE_LABEL = {
+    "ok":      "Last run · ok",
+    "running": "Run in progress",
+    "fail":    "Last run · failed",
+    "partial": "Last run · partial",
+}
+
+
+def render_run_banner(
+    slug: str,
+    run_state: dict[str, Any],
+    *,
+    key_suffix: str = "overview",
+    worker_running: bool = False,
+) -> None:
+    """Beacon's pipeline-state banner: state line + headline + actions.
+
+    The buttons sit in a Streamlit column to the right of the banner card —
+    Streamlit can't merge widgets into raw HTML. The border-left strip
+    on the card still carries the state colour.
+    """
+    state = run_state["state"]
+    state_label = _RUN_STATE_LABEL.get(state, _RUN_STATE_LABEL["ok"])
+    finished = run_state.get("finished_ago") or "—"
+    duration = run_state.get("duration") or "—"
+    state_meta_html = f"{html.escape(state_label)} · {html.escape(finished)} · {html.escape(duration)}"
+
+    if state == "fail":
+        line_html = html.escape(
+            run_state.get("error_detail") or "A source failed mid-run. Some jobs are missing."
+        )
+    else:
+        scraped = int(run_state.get("scraped", 0) or 0)
+        scored = int(run_state.get("scored", 0) or 0)
+        new_h = int(run_state.get("new_high_fit", 0) or 0)
+        errors = int(run_state.get("errors", 0) or 0)
+        err_html = (
+            f" · <span style='color:var(--danger)'>{errors} errors</span>"
+            if errors > 0
+            else ""
+        )
+        line_html = (
+            f"Scraped <b>{scraped}</b>, scored <b>{scored}</b>, "
+            f"surfaced <b>{new_h} new high-fit</b>{err_html}"
+        )
+
+    cols = st.columns([6.4, 2.6], gap="medium")
+    with cols[0]:
+        st.markdown(
+            (
+                f"<div class='runban {html.escape(state)}'>"
+                f"<div class='rb-state'><span class='rb-dot'></span>{state_meta_html}</div>"
+                f"<div class='rb-line'>{line_html}</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with cols[1]:
+        sub = st.columns(2, gap="small")
+        with sub[0]:
+            view_clicked = st.button(
+                "View pipeline →",
+                key=f"runban_view_{key_suffix}_{slug}",
+                use_container_width=True,
+            )
+        with sub[1]:
+            run_clicked = st.button(
+                "Run again",
+                key=f"runban_run_{key_suffix}_{slug}",
+                use_container_width=True,
+                type="primary",
+                disabled=worker_running,
+            )
+    if view_clicked:
+        st.session_state.dashboard_section = "Activity"
+        st.rerun()
+    if run_clicked:
+        _queue_pipeline_run(slug)
+
+
+def render_match_row(
+    record: dict[str, Any],
+    slug: str,
+    *,
+    focused: bool = False,
+    key_prefix: str = "mr",
+) -> None:
+    """Beacon match row: 60px fit number + title/badge/meta/reason + action chips + rating."""
+    fit = record.get("fit_score")
+    fit_display = fit if fit is not None else "—"
+    verdict = _verdict_for_score(fit)
+    if isinstance(fit, (int, float)) and fit >= 80:
+        tier = ""
+    elif isinstance(fit, (int, float)) and fit >= 65:
+        tier = "mid"
+    else:
+        tier = "low"
+
+    title = html.escape(record.get("title") or "Untitled")
+    company = html.escape(record.get("company") or "")
+    location = html.escape(record.get("location") or "Location not listed")
+    src_label = record.get("source_label") or _source_label(record.get("source") or "")
+    src_html = html.escape(src_label)
+    posted = html.escape(_format_relative(record.get("created_at")))
+    reason = (record.get("one_liner") or "").strip()
+    reason_html = (
+        f"<p class='m-reason'>{html.escape(reason)}</p>" if reason else ""
+    )
+    focus_cls = "focus" if focused else ""
+
+    st.markdown(
+        (
+            f"<div class='beacon-match-row {tier} {focus_cls}'>"
+            "<div class='beacon-match-fit'>"
+            f"<div class='fit-num'>{html.escape(str(fit_display))}</div>"
+            "<div class='fit-lbl'>fit</div>"
+            "</div>"
+            "<div>"
+            "<div class='beacon-match-title-row'>"
+            f"<h3 class='m-title'>{title}</h3>"
+            f"{_vbadge_html(verdict)}"
+            "</div>"
+            "<div class='m-meta'>"
+            f"<span class='co'>{company}</span><span class='dot'></span>"
+            f"<span>{location}</span><span class='dot'></span>"
+            f"<span>{src_html}</span><span class='dot'></span>"
+            f"<span>{posted} ago</span>"
+            "</div>"
+            f"{reason_html}"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    job_id = str(record.get("id") or "")
+    cur_status = str(record.get("status") or "new").lower()
+
+    btn_cols = st.columns([1.4, 0.95, 0.95, 1.1], gap="small")
+    with btn_cols[0]:
+        applied_label = "Applied" if cur_status == "applied" else "Mark applied"
+        if st.button(
+            applied_label,
+            key=f"{key_prefix}_apply_{slug}_{job_id}",
+            type="primary" if cur_status == "applied" else "secondary",
+            use_container_width=True,
+        ):
+            update_job_status(job_id, "applied", profile=slug)
+            invalidate_dashboard_caches()
+            st.toast(f"Marked as applied: {record.get('title', '')}")
+            st.rerun()
+    with btn_cols[1]:
+        if st.button(
+            "Save",
+            key=f"{key_prefix}_save_{slug}_{job_id}",
+            use_container_width=True,
+        ):
+            update_job_status(job_id, "interest", profile=slug)
+            invalidate_dashboard_caches()
+            st.toast(f"Saved: {record.get('title', '')}")
+            st.rerun()
+    with btn_cols[2]:
+        if st.button(
+            "Skip",
+            key=f"{key_prefix}_skip_{slug}_{job_id}",
+            use_container_width=True,
+        ):
+            update_job_status(job_id, "skip", profile=slug)
+            invalidate_dashboard_caches()
+            st.toast(f"Skipped: {record.get('title', '')}")
+            st.rerun()
+    with btn_cols[3]:
+        if st.button(
+            "Open detail",
+            key=f"{key_prefix}_open_{slug}_{job_id}",
+            use_container_width=True,
+        ):
+            st.session_state[_DRAWER_STATE_KEY] = job_id
+            st.rerun()
+
+    profile_config_for_rating = load_config(profile=slug)
+    render_rating_panel(
+        slug,
+        job_id,
+        role_family=attach_role_family_from_config(slug, profile_config_for_rating),
+        key_prefix=f"{key_prefix}_rate_{slug}",
+        show_helper=False,
+    )
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+
+def _render_pipeline_side_card(slug: str, worker_running: bool, runs: list[dict[str, Any]]) -> None:
+    """Side-column live-pipeline card for the Overview screen.
+
+    Mirrors Beacon's `.ag-card`: pulse + run id + elapsed + progress bar + stages.
+    Falls back to a quiescent view when the worker isn't running.
+    """
+    run_label = "Live pipeline · idle"
+    elapsed_label = ""
+    progress_pct = 0
+    stages_html = ""
+    detail_label = "View pipeline →"
+
+    progress_data = _read_progress_json(slug) if worker_running else None
+    if worker_running and progress_data:
+        try:
+            tracker = ProgressTracker.from_dict(progress_data)
+            run_label = "Live pipeline · running"
+            elapsed = tracker.elapsed_time
+            mins, secs = divmod(int(elapsed.total_seconds()), 60)
+            elapsed_label = f"{mins:02d}:{secs:02d} elapsed"
+            progress_pct = max(0, min(100, int(tracker.overall_progress_pct)))
+            stage_rows = [
+                (Stage.DISCOVERING, "Discovery"),
+                (Stage.FETCHING, "Job board fetch"),
+                (Stage.SCRAPING, "Scraping"),
+                (Stage.SCORING, "Scoring & filtering"),
+                (Stage.EMBEDDING, "Embeddings"),
+                (Stage.FINALIZING, "Finalize"),
+            ]
+            rendered = []
+            for stage, label in stage_rows:
+                prog = tracker.stages.get(stage)
+                status = prog.status if prog else None
+                cls = "queue"
+                if status == StageStatus.COMPLETE:
+                    cls = "done"
+                elif status == StageStatus.RUNNING:
+                    cls = "run"
+                elif status == StageStatus.FAILED:
+                    cls = "fail"
+                count_html = ""
+                if prog and prog.metrics:
+                    metric_str = " · ".join(f"{k}: {v}" for k, v in list(prog.metrics.items())[:2])
+                    count_html = f"<span class='stg-count'>{html.escape(metric_str)}</span>"
+                rendered.append(
+                    "<div class='stage " + cls + "'>"
+                    "<span class='stg-icon'></span>"
+                    f"<span class='stg-name'>{html.escape(label)}</span>"
+                    f"{count_html}"
+                    "</div>"
+                )
+            stages_html = "<div class='stages'>" + "".join(rendered) + "</div>"
+        except Exception:  # noqa: BLE001 — defensive: malformed progress JSON shouldn't break overview
+            stages_html = ""
+    elif runs:
+        last = runs[0]
+        run_label = f"Live pipeline · idle (last run #{html.escape(str(last.get('run_id') or ''))})"
+        elapsed_label = (
+            f"{_format_relative(last.get('finished_at'))} ago"
+            if last.get("finished_at")
+            else ""
+        )
+        progress_pct = 100
+        detail_label = "View last run →"
+
+    st.markdown(
+        (
+            "<div class='pipeline-side-card'>"
+            "<div class='ag-head'>"
+            "<span class='ag-pulse'></span>"
+            f"<span class='ag-title'>{html.escape(run_label)}</span>"
+            f"<span class='ag-elapsed'>{html.escape(elapsed_label)}</span>"
+            "</div>"
+            f"<div class='progress'><div style='width:{progress_pct}%'></div></div>"
+            f"{stages_html}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    if st.button(detail_label, key=f"side_pipeline_view_{slug}", use_container_width=True):
+        st.session_state.dashboard_section = "Activity"
+        st.rerun()
+
+
+def _build_today_headline(metrics: dict[str, Any], records: list[dict[str, Any]], runs: list[dict[str, Any]]) -> str:
+    strong = sum(1 for r in records if (r.get("fit_score") or 0) >= 80)
+    reply_count = int(metrics.get("reply", 0) or 0)
+    error_count = 0
+    if runs:
+        error_count = len(runs[0].get("errors") or [])
+    parts = [
+        f"{strong} strong pick{'s' if strong != 1 else ''}.",
+        f"{reply_count} repl{'ies' if reply_count != 1 else 'y'}.",
+        f"{error_count} error{'s' if error_count != 1 else ''}.",
+    ]
+    return " ".join(parts)
+
+
+# ── Job Drawer (st.dialog modal) ────────────────────────────────────────────
+
+def _close_job_drawer() -> None:
+    if _DRAWER_STATE_KEY in st.session_state:
+        st.session_state[_DRAWER_STATE_KEY] = None
+
+
+def _classify_reason_tag(reason: str) -> str:
+    """Beacon's three colour bands for reasoning bullets.
+
+    - "negative" / "block" / "disq" / "miss" → red (.neg)
+    - "warn" / "concern" / "caveat" → amber (.warn)
+    - everything else → green strip (default)
+    """
+    text = (reason or "").strip().lower()
+    if not text:
+        return ""
+    for needle in ("negative:", "block:", "disq", "no-go:", "miss:"):
+        if text.startswith(needle):
+            return "neg"
+    for needle in ("warn:", "warning:", "concern:", "caveat:", "watch:"):
+        if text.startswith(needle):
+            return "warn"
+    return ""
+
+
+def _strip_reason_prefix(reason: str) -> str:
+    text = (reason or "").strip()
+    for prefix in ("positive:", "negative:", "warn:", "warning:", "block:", "concern:"):
+        if text.lower().startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
+def _render_drawer_dim_grid(record: dict[str, Any]) -> None:
+    dims = record.get("dimension_scores") or {}
+    cards: list[str] = []
+    for key, label, weight in _DIM_LABELS:
+        raw = dims.get(key)
+        try:
+            value = round(float(raw), 1) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            value = 0.0
+        bar_pct = max(0, min(100, int(value * 10)))
+        low_cls = "low" if value < 5 else ""
+        cards.append(
+            "<div class='dim " + low_cls + "'>"
+            "<div class='dim-row'>"
+            f"<span class='nm'>{html.escape(label)}</span>"
+            f"<span class='w'>w {html.escape(weight)}</span>"
+            "</div>"
+            "<div class='dim-row'>"
+            f"<span class='v'>{value:g}<small>/10</small></span>"
+            "</div>"
+            f"<div class='bar'><div style='width:{bar_pct}%'></div></div>"
+            "</div>"
+        )
+    st.markdown("<div class='dim-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+
+
+def _render_job_drawer_body(record: dict[str, Any], slug: str) -> None:
+    fit = record.get("fit_score")
+    fit_display = fit if fit is not None else "—"
+    verdict = _verdict_for_score(fit)
+    title = html.escape(record.get("title") or "Untitled")
+    company = html.escape(record.get("company") or "")
+    location = html.escape(record.get("location") or "Location not listed")
+    src_label = record.get("source_label") or _source_label(record.get("source") or "")
+    src_html = html.escape(src_label)
+    posted = html.escape(_format_relative(record.get("created_at")))
+    job_id = str(record["id"])
+
+    head_cols = st.columns([6.5, 1.0], gap="small")
+    with head_cols[0]:
+        st.markdown(
+            (
+                "<div class='drawer-head'>"
+                "<div class='beacon-match-fit'>"
+                f"<div class='fit-num'>{html.escape(str(fit_display))}</div>"
+                "<div class='fit-lbl'>fit</div>"
+                "</div>"
+                "<div style='flex:1'>"
+                "<div class='beacon-match-title-row'>"
+                f"<h3 class='m-title' style='font-size:18px;letter-spacing:-0.018em'>{title}</h3>"
+                f"{_vbadge_html(verdict)}"
+                "</div>"
+                "<div class='m-meta'>"
+                f"<span class='co'>{company}</span><span class='dot'></span>"
+                f"<span>{location}</span><span class='dot'></span>"
+                f"<span>{src_html}</span><span class='dot'></span>"
+                f"<span>{posted} ago</span>"
+                "</div>"
+                "</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+    with head_cols[1]:
+        if st.button("Close", key=f"drawer_close_top_{job_id}", use_container_width=True):
+            _close_job_drawer()
+            st.rerun()
+
+    # 1) Train Beacon — full rating panel + notes
+    st.markdown(
+        (
+            "<section class='train-card'>"
+            "<div>"
+            "<div class='train-title'>"
+            "<span class='train-ic'>●</span>How was this match?"
+            "</div>"
+            "<div class='train-sub'>Trains future scoring. Independent of whether you apply.</div>"
+            "</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
+    profile_config_for_rating = load_config(profile=slug)
+    render_rating_panel(
+        slug,
+        job_id,
+        role_family=attach_role_family_from_config(slug, profile_config_for_rating),
+        key_prefix=f"drawer_rate_{slug}",
+    )
+
+    # 2) Why the agent picked this — colour-coded reasoning bullets
+    st.markdown(
+        "<div class='beacon-card-title' style='margin-top:18px;margin-bottom:8px'>Why the agent picked this</div>",
+        unsafe_allow_html=True,
+    )
+    reasons: list[str] = list(record.get("reasons") or [])
+    flags: list[str] = list(record.get("flags") or [])
+    items: list[str] = []
+    for reason in reasons:
+        cls = _classify_reason_tag(reason)
+        items.append(f"<li class='{cls}'>{html.escape(_strip_reason_prefix(reason))}</li>")
+    for flag in flags:
+        items.append(f"<li class='warn'>{html.escape(_strip_reason_prefix(str(flag)))}</li>")
+    if not items:
+        items.append("<li>Solid overall fit on stack and seniority. No flags raised.</li>")
+    st.markdown("<ul class='reasoning'>" + "".join(items) + "</ul>", unsafe_allow_html=True)
+
+    # 3) Score breakdown — 6-dim grid
+    st.markdown(
+        "<div class='beacon-card-title' style='margin-top:18px;margin-bottom:8px'>Score breakdown</div>",
+        unsafe_allow_html=True,
+    )
+    _render_drawer_dim_grid(record)
+
+    # 4) Action row — placeholders + open posting
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    action_cols = st.columns([1.2, 1.2, 1.0, 1.4], gap="small")
+    with action_cols[0]:
+        st.button(
+            "Generate cover note",
+            key=f"drawer_cover_{job_id}",
+            disabled=True,
+            help="Coming in a later chunk.",
+            use_container_width=True,
+        )
+    with action_cols[1]:
+        st.button(
+            "Tailor resume",
+            key=f"drawer_tailor_{job_id}",
+            disabled=True,
+            help="Coming in a later chunk.",
+            use_container_width=True,
+        )
+    with action_cols[3]:
+        url = record.get("url")
+        if url:
+            st.link_button("Open posting ↗", url, use_container_width=True)
+        else:
+            st.button(
+                "Posting unavailable",
+                key=f"drawer_url_missing_{job_id}",
+                disabled=True,
+                use_container_width=True,
+            )
+
+    # Footer: prev/next stubs + Skip / Save / Mark applied
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    foot_cols = st.columns([0.9, 0.9, 4.5, 1.0, 1.0, 1.4], gap="small")
+    with foot_cols[0]:
+        st.button(
+            "← prev",
+            key=f"drawer_prev_{job_id}",
+            disabled=True,
+            help="Job navigation arrives in a later chunk.",
+            use_container_width=True,
+        )
+    with foot_cols[1]:
+        st.button(
+            "next →",
+            key=f"drawer_next_{job_id}",
+            disabled=True,
+            help="Job navigation arrives in a later chunk.",
+            use_container_width=True,
+        )
+    with foot_cols[3]:
+        if st.button("Skip", key=f"drawer_skip_{job_id}", use_container_width=True):
+            update_job_status(job_id, "skip", profile=slug)
+            invalidate_dashboard_caches()
+            st.toast(f"Skipped: {record.get('title', '')}")
+            _close_job_drawer()
+            st.rerun()
+    with foot_cols[4]:
+        if st.button("Save", key=f"drawer_save_{job_id}", use_container_width=True):
+            update_job_status(job_id, "interest", profile=slug)
+            invalidate_dashboard_caches()
+            st.toast(f"Saved: {record.get('title', '')}")
+            _close_job_drawer()
+            st.rerun()
+    with foot_cols[5]:
+        if st.button(
+            "Mark applied",
+            key=f"drawer_apply_{job_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            update_job_status(job_id, "applied", profile=slug)
+            invalidate_dashboard_caches()
+            st.toast(f"Marked as applied: {record.get('title', '')}")
+            _close_job_drawer()
+            st.rerun()
+
+
+@st.dialog("Job detail", width="large")
+def _job_drawer_dialog(slug: str) -> None:
+    job_id = st.session_state.get(_DRAWER_STATE_KEY)
+    if not job_id:
+        return
+    record = _cached_fetch_job_detail(slug, str(job_id))
+    if record is None:
+        st.error("That job is no longer available.")
+        if st.button("Close", key="drawer_missing_close"):
+            _close_job_drawer()
+            st.rerun()
+        return
+    _render_job_drawer_body(record, slug)
+
+
+def _maybe_open_drawer(slug: str) -> None:
+    """Open the drawer dialog if the session-state flag is set."""
+    if st.session_state.get(_DRAWER_STATE_KEY):
+        _job_drawer_dialog(slug)
+
+
+# ── Jobs tab helpers ────────────────────────────────────────────────────────
+
+_JOBS_DEFAULT_FILTERS: dict[str, Any] = {
+    "fit": 60,
+    "verdict": "all",
+    "rated": "all",
+    "status": "all",
+    "remote": False,
+    "search": "",
+}
+_JOBS_DEFAULT_SORT: dict[str, str] = {"key": "fit", "dir": "desc"}
+
+_VERDICT_CYCLE = ("all", "apply", "maybe", "skip")
+_RATED_CYCLE = ("all", "rated", "unrated")
+_STATUS_CYCLE = ("all", "new", "interest", "applied", "reply", "skip")
+_FIT_CYCLE = (60, 80)
+
+
+def _jobs_filter_state(slug: str) -> dict[str, Any]:
+    key = f"{_JOBS_FILTER_STATE_KEY}_{slug}"
+    if key not in st.session_state:
+        st.session_state[key] = dict(_JOBS_DEFAULT_FILTERS)
+    return st.session_state[key]
+
+
+def _jobs_sort_state(slug: str) -> dict[str, str]:
+    key = f"{_JOBS_SORT_STATE_KEY}_{slug}"
+    if key not in st.session_state:
+        st.session_state[key] = dict(_JOBS_DEFAULT_SORT)
+    return st.session_state[key]
+
+
+def _cycle_value(current: Any, options: tuple) -> Any:
+    try:
+        idx = options.index(current)
+    except ValueError:
+        return options[0]
+    return options[(idx + 1) % len(options)]
+
+
+def _filter_jobs(records: list[dict[str, Any]], filters: dict[str, Any], ratings_index: dict[str, Any]) -> list[dict[str, Any]]:
+    fit_min = int(filters.get("fit", 60) or 0)
+    verdict = filters.get("verdict", "all")
+    rated = filters.get("rated", "all")
+    status = filters.get("status", "all")
+    remote = bool(filters.get("remote", False))
+    query = (filters.get("search") or "").strip().lower()
+
+    out: list[dict[str, Any]] = []
+    for record in records:
+        score = record.get("fit_score") or 0
+        if score < fit_min:
+            continue
+        if verdict != "all" and _verdict_for_score(record.get("fit_score")) != verdict:
+            continue
+        if status != "all" and (record.get("status") or "new").lower() != status:
+            continue
+        if remote and "remote" not in (record.get("location") or "").lower():
+            continue
+        rating = ratings_index.get(str(record.get("id")))
+        if rated == "rated" and not rating:
+            continue
+        if rated == "unrated" and rating:
+            continue
+        if query:
+            haystack = " ".join(
+                str(record.get(field) or "")
+                for field in ("title", "company", "location", "one_liner")
+            ).lower()
+            if query not in haystack:
+                continue
+        out.append(record)
+    return out
+
+
+def _sort_jobs(records: list[dict[str, Any]], sort: dict[str, str], ratings_index: dict[str, Any]) -> list[dict[str, Any]]:
+    key = sort.get("key", "fit")
+    direction = sort.get("dir", "desc")
+    reverse = direction == "desc"
+    verdict_rank = {"apply": 3, "maybe": 2, "skip": 1}
+    rating_rank = {"great_match": 1, "good_match": 2, "okay_match": 3, "bad_match": 4, "should_skip": 5}
+
+    if key == "fit":
+        return sorted(records, key=lambda r: r.get("fit_score") or 0, reverse=reverse)
+    if key == "verdict":
+        return sorted(
+            records,
+            key=lambda r: verdict_rank.get(_verdict_for_score(r.get("fit_score")), 0),
+            reverse=reverse,
+        )
+    if key == "title":
+        return sorted(records, key=lambda r: (r.get("title") or "").lower(), reverse=reverse)
+    if key == "company":
+        return sorted(records, key=lambda r: (r.get("company") or "").lower(), reverse=reverse)
+    if key == "location":
+        return sorted(records, key=lambda r: (r.get("location") or "").lower(), reverse=reverse)
+    if key == "posted":
+        def _ts(r):
+            dt = _parse_iso(r.get("created_at"))
+            return dt.timestamp() if dt else 0.0
+        return sorted(records, key=_ts, reverse=reverse)
+    if key == "status":
+        return sorted(records, key=lambda r: (r.get("status") or "new").lower(), reverse=reverse)
+    if key == "rating":
+        return sorted(
+            records,
+            key=lambda r: rating_rank.get(
+                (ratings_index.get(str(r.get("id"))).label if ratings_index.get(str(r.get("id"))) else None),
+                9,
+            ),
+            reverse=not reverse,  # rated-best first when desc, unrated last
+        )
+    return records
+
+
+def _build_jobs_dataframe(
+    records: list[dict[str, Any]],
+    *,
+    ratings_index: dict[str, Any],
+) -> pd.DataFrame:
+    label_map = {opt[0]: opt[1] for opt in RATING_OPTIONS}
+    rows = []
+    for record in records:
+        rating_obj = ratings_index.get(str(record.get("id")))
+        rating_label = label_map.get(rating_obj.label, rating_obj.label) if rating_obj else ""
+        rows.append(
+            {
+                "_id": str(record.get("id") or ""),
+                "Fit": record.get("fit_score") or 0,
+                "Verdict": _verdict_label(_verdict_for_score(record.get("fit_score"))),
+                "Title": record.get("title") or "",
+                "Company": record.get("company") or "",
+                "Location": record.get("location") or "—",
+                "Posted": _format_relative(record.get("created_at")),
+                "Status": (record.get("status") or "new").title(),
+                "Rating": rating_label or "—",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab renderers (Beacon edition)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _render_overview_tab(
     slug: str,
     config: dict[str, Any],
@@ -2581,35 +3447,62 @@ def _render_overview_tab(
     runs: list[dict[str, Any]],
     metrics: dict[str, Any],
 ) -> None:
-    with section_shell("Overview", SECTION_COPY["Overview"]):
-        if metrics["total"] == 0:
-            _render_overview_action_card(slug, config)
-        else:
-            next_action = "Review jobs"
-            status_label = "Needs attention" if metrics["needs_retry"] or metrics["failed"] else "On track"
-            status_copy = (
-                "Some results or runs need follow-up before you trust the shortlist."
-                if status_label == "Needs attention"
-                else "Your latest results are ready to review."
-            )
-            _render_html_block(
+    worker_running = _worker_is_running(slug)
+    now = datetime.now()
+    today_label = now.strftime("Today · %a, %b ") + str(now.day)
+    headline = _build_today_headline(metrics, records, runs)
+    sub = "Top of feed below — clear it in under five minutes."
+    _render_beacon_page_header(today_label, headline, sub)
+
+    run_state = _compute_run_state(runs, records, worker_running=worker_running)
+    render_run_banner(slug, run_state, key_suffix="overview", worker_running=worker_running)
+
+    cols = st.columns([1.45, 1.0], gap="large")
+    scored_records = [r for r in records if r.get("fit_score") is not None]
+    scored_records.sort(key=lambda r: r.get("fit_score") or 0, reverse=True)
+    top_records = scored_records[:3]
+    with cols[0]:
+        see_all_label = f"See all {len(scored_records)} →"
+        head_cols = st.columns([6.5, 2.0], gap="small")
+        with head_cols[0]:
+            st.markdown(
                 (
-                    "<div class='overview-guidance'>"
-                    f"<div><div class='overview-guidance-kicker'>What to do next</div><div class='overview-guidance-title'>{html.escape(next_action)}</div><div class='overview-guidance-copy'>{html.escape(status_copy)}</div></div>"
-                    f"<div class='overview-guidance-status'>{badge(status_label, 'warning' if status_label == 'Needs attention' else 'success')}</div>"
+                    "<div class='beacon-card-head' style='border-bottom:1px solid var(--line);"
+                    "background:var(--surface);border:1px solid var(--line);"
+                    "border-radius:var(--r-md) var(--r-md) 0 0;padding:14px 18px'>"
+                    "<div>"
+                    "<div class='beacon-card-title'>Top picks for you</div>"
+                    "<div class='beacon-card-sub'>Ranked by overall fit</div>"
                     "</div>"
-                )
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
             )
-        _render_overview_scoreboard(metrics)
-        _render_html_block("<div class='shell-panel-gap' aria-hidden='true'></div>")
+        with head_cols[1]:
+            if st.button(see_all_label, key=f"overview_see_all_{slug}", use_container_width=True):
+                st.session_state.dashboard_section = "Jobs"
+                st.rerun()
 
-        with panel("Best opportunities", subtitle="Start here. These are the strongest roles to review next.", tone="primary"):
-            _render_best_opportunities_panel(slug, metrics, raw_config)
+        if not top_records:
+            st.markdown(
+                (
+                    "<div class='beacon-card' style='padding:24px'>"
+                    "<div class='beacon-empty'>"
+                    "<div class='ic'>·</div>"
+                    "<div class='h'>No scored jobs yet.</div>"
+                    "<div class='s'>Run the pipeline to surface your strongest picks.</div>"
+                    "</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            for record in top_records:
+                render_match_row(record, slug, key_prefix="overview_match")
+    with cols[1]:
+        _render_pipeline_side_card(slug, worker_running, runs)
 
-        with panel("Search preferences", subtitle="Current role, location, and compensation focus", tone="supporting"):
-            _render_config_summary_card(config, raw_config)
-
-        _render_overview_run_bar(runs)
+    _maybe_open_drawer(slug)
 
 
 def _render_jobs_tab(
@@ -2619,260 +3512,271 @@ def _render_jobs_tab(
     *,
     scrape_rejected_records: list[dict[str, Any]] | None = None,
 ) -> None:
-    profile_name = st.session_state.get("active_profile", slug).replace("_", " ").title()
-    with section_shell("Jobs", SECTION_COPY["Jobs"]):
-        if not records:
-            clicked = empty_state(
-                "Your review queue is empty",
-                "Start discovery to generate a curated list of scored job matches. Once complete, you can filter, compare, and manage applications directly from this view.",
-                actions=[
-                    {
-                        "id": "start_discovery_jobs_empty",
-                        "label": "Start discovery",
-                        "type": "primary",
-                        "key": f"start_discovery_jobs_empty_{slug}",
-                    }
-                ],
-                mark="Zero state",
-                icon="document",
-            )
-            if clicked == "start_discovery_jobs_empty":
-                _queue_pipeline_run(slug)
-            return
+    """Beacon Jobs screen: header + toolbar + table + keyboard hints + drawer.
 
-        with panel("Semantic search", subtitle="Proof that retrieval works: search embedded job sections directly"):
-            render_semantic_match_panel(slug, config)
+    `scrape_rejected_records` is accepted for signature compatibility with the
+    caller in `_render_profile_dashboard` but is no longer surfaced here —
+    Beacon's Jobs screen is purely the scored review queue.
+    """
+    filters = _jobs_filter_state(slug)
+    sort = _jobs_sort_state(slug)
+    ratings_index = get_all_user_ratings(slug)
 
-        source_options = sorted({record["source_label"] for record in records})
-        status_options = sorted({record["status_label"] for record in records})
-        score_state_options = sorted({record["score_state"] for record in records})
-        state_keys = _job_filter_state_keys(slug)
+    filtered = _filter_jobs(records, filters, ratings_index)
+    sorted_records = _sort_jobs(filtered, sort, ratings_index)
 
-        if state_keys["sources"] not in st.session_state:
-            reset_job_filter_state(slug, source_options, status_options, score_state_options)
+    _render_beacon_page_header(
+        f"Jobs · {len(filtered)} of {len(records)}",
+        "Your job board, scored.",
+        "Filter, sort, and triage. Click a row to open detail; bulk-select to mark many at once.",
+    )
 
-        with st.expander("Review controls", expanded=False):
-            action_cols = st.columns([1.3, 1.15, 1.0, 0.85], gap="medium")
-            search = action_cols[0].text_input(
-                "Search jobs",
-                key=state_keys["search"],
-                placeholder="Title, company, location, summary, or keywords",
-            )
-            min_fit = action_cols[1].slider(
-                "Minimum match score",
-                min_value=0,
-                max_value=100,
-                step=5,
-                key=state_keys["min_fit"],
-                help="Only show jobs with a match score at or above this value.",
-            )
-            include_full_text = action_cols[2].checkbox(
-                "Search full description",
-                key=state_keys["include_full_text"],
-                help="Include saved job description text in keyword search. Useful for specific skills or requirements.",
-            )
-            clear_filters = action_cols[3].button("Reset filters", key=f"reset_filters_{slug}", use_container_width=True)
-
-            if clear_filters:
-                reset_job_filter_state(slug, source_options, status_options, score_state_options)
-                st.rerun()
-
-            st.markdown("##### Filters")
-            filter_cols = st.columns(3, gap="medium")
-            selected_sources = filter_cols[0].multiselect(
-                "Sources",
-                source_options,
-                key=state_keys["sources"],
-                help="Choose one or more job sources to include.",
-            )
-            selected_statuses = filter_cols[1].multiselect(
-                "Statuses",
-                status_options,
-                key=state_keys["statuses"],
-                help="Choose one or more workflow statuses to show.",
-            )
-            selected_score_states = filter_cols[2].multiselect(
-                "Score states",
-                score_state_options,
-                key=state_keys["score_states"],
-                help="Choose one or more scoring states to include.",
-            )
-
-            st.checkbox(
-                "Show scrape-filtered jobs",
-                key=state_keys["show_scrape_rejected"],
-                help="Jobs rejected during scraping before any LLM scoring — usually title mismatches or YOE filters.",
-            )
-
-            with st.expander("Show/hide columns", expanded=False):
-                visible_columns = st.multiselect(
-                    "Visible optional columns",
-                    JOB_VISIBLE_OPTIONAL_COLUMNS,
-                    key=state_keys["visible_columns"],
-                    help="Choose which optional columns appear in the review table.",
-                )
-
-        selected_sources = st.session_state[state_keys["sources"]]
-        selected_statuses = st.session_state[state_keys["statuses"]]
-        selected_score_states = st.session_state[state_keys["score_states"]]
-        min_fit = st.session_state[state_keys["min_fit"]]
-        search = st.session_state[state_keys["search"]]
-        include_full_text = st.session_state[state_keys["include_full_text"]]
-        visible_columns = st.session_state[state_keys["visible_columns"]]
-        show_scrape_rejected = st.session_state.get(state_keys["show_scrape_rejected"], False)
-
-        filter_chips = build_jobs_filter_chips(
-            selected_sources,
-            source_options,
-            selected_statuses,
-            status_options,
-            selected_score_states,
-            score_state_options,
-            min_fit,
-            search,
-            include_full_text,
+    # ── Toolbar ─────────────────────────────────────────────────────────
+    st.markdown("<div class='beacon-toolbar' style='margin-bottom:0'>", unsafe_allow_html=True)
+    toolbar_cols = st.columns([3.4, 1.0, 1.2, 1.2, 1.2, 0.9, 1.4], gap="small")
+    with toolbar_cols[0]:
+        new_search = st.text_input(
+            "Search jobs",
+            value=filters.get("search", ""),
+            key=f"beacon_jobs_search_{slug}",
+            placeholder="Search title, company, keyword…",
+            label_visibility="collapsed",
         )
-        _render_html_block("<div class='filter-chip-title'>Applied filters</div>")
-        chip_row(filter_chips)
+        if new_search != filters.get("search", ""):
+            filters["search"] = new_search
+            st.rerun()
+    with toolbar_cols[1]:
+        fit_label = f"Fit ≥ {filters['fit']}"
+        if st.button(
+            fit_label,
+            key=f"beacon_jobs_fit_{slug}",
+            type="primary" if filters["fit"] != _JOBS_DEFAULT_FILTERS["fit"] else "secondary",
+            use_container_width=True,
+        ):
+            filters["fit"] = _cycle_value(filters["fit"], _FIT_CYCLE)
+            st.rerun()
+    with toolbar_cols[2]:
+        if st.button(
+            f"Verdict · {filters['verdict']}",
+            key=f"beacon_jobs_verdict_{slug}",
+            type="primary" if filters["verdict"] != "all" else "secondary",
+            use_container_width=True,
+        ):
+            filters["verdict"] = _cycle_value(filters["verdict"], _VERDICT_CYCLE)
+            st.rerun()
+    with toolbar_cols[3]:
+        if st.button(
+            f"Rated · {filters['rated']}",
+            key=f"beacon_jobs_rated_{slug}",
+            type="primary" if filters["rated"] != "all" else "secondary",
+            use_container_width=True,
+        ):
+            filters["rated"] = _cycle_value(filters["rated"], _RATED_CYCLE)
+            st.rerun()
+    with toolbar_cols[4]:
+        if st.button(
+            f"Status · {filters['status']}",
+            key=f"beacon_jobs_status_{slug}",
+            type="primary" if filters["status"] != "all" else "secondary",
+            use_container_width=True,
+        ):
+            filters["status"] = _cycle_value(filters["status"], _STATUS_CYCLE)
+            st.rerun()
+    with toolbar_cols[5]:
+        if st.button(
+            "Remote",
+            key=f"beacon_jobs_remote_{slug}",
+            type="primary" if filters["remote"] else "secondary",
+            use_container_width=True,
+        ):
+            filters["remote"] = not filters["remote"]
+            st.rerun()
+    with toolbar_cols[6]:
+        st.markdown(
+            f"<div style='text-align:right;font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:6px'>{len(sorted_records)} of {len(records)}</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        pool = list(records)
-        if show_scrape_rejected and scrape_rejected_records:
-            pool.extend(scrape_rejected_records)
-        filtered = pool
-        if selected_sources:
-            filtered = [record for record in filtered if record["source_label"] in selected_sources]
-        if selected_statuses:
-            filtered = [record for record in filtered if record["status_label"] in selected_statuses]
-        if selected_score_states:
-            filtered = [record for record in filtered if record["score_state"] in selected_score_states]
-        if min_fit > 0:
-            filtered = [record for record in filtered if record["fit_score"] is not None and record["fit_score"] >= min_fit]
-        if search.strip():
-            query = search.lower().strip()
-            raw_text_match_ids = _search_job_ids_by_raw_text(slug, query) if include_full_text else set()
-            filtered = [
-                record
-                for record in filtered
-                if (
-                    query in " ".join(
-                        [record["title"], record["company"], record["location"] or "", record["source_label"], record["one_liner"]]
-                    ).lower()
-                    or record["id"] in raw_text_match_ids
-                )
-            ]
-
-        if not filtered:
-            clicked = empty_state(
-                "No jobs match the current filters",
-                "Clear one or more applied filters, lower the minimum fit, or search less narrowly to rebuild the review queue.",
-                actions=[
-                    {
-                        "id": "clear_filtered_empty",
-                        "label": "Reset filters",
-                        "type": "primary",
-                        "key": f"clear_filtered_empty_{slug}",
-                    }
-                ],
-            )
-            if clicked == "clear_filtered_empty":
-                reset_job_filter_state(slug, source_options, status_options, score_state_options)
-                st.rerun()
-            return
-
-        _render_html_block(
+    if not records:
+        st.markdown(
             (
-                "<div class='jobs-workspace-summary'>"
-                f"<div><span>Visible results</span><strong>{len(filtered)} / {len(records)}</strong></div>"
-                f"<div><span>Scored in view</span><strong>{sum(1 for record in filtered if record['fit_score'] is not None)}</strong></div>"
-                f"<div><span>Needs attention</span><strong>{sum(1 for record in filtered if record['score_state'] in {'Failed', 'Needs retry'})}</strong></div>"
+                "<div class='beacon-empty'>"
+                "<div class='ic'>·</div>"
+                "<div class='h'>Your review queue is empty.</div>"
+                "<div class='s'>Run the pipeline to populate a curated list of scored matches.</div>"
                 "</div>"
-            )
+            ),
+            unsafe_allow_html=True,
         )
+        if st.button("Run pipeline", key=f"jobs_empty_run_{slug}", type="primary"):
+            _queue_pipeline_run(slug)
+        return
 
-        table_col, detail_col = st.columns([1.32, 1.02], gap="large")
-        frame = build_jobs_table_frame(filtered)
-        column_order = resolve_job_table_columns(visible_columns)
+    if not sorted_records:
+        st.markdown(
+            (
+                "<div class='beacon-empty'>"
+                "<div class='ic'>⌕</div>"
+                "<div class='h'>No matches.</div>"
+                "<div class='s'>Loosen the filters or run a fresh pipeline.</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        empty_cols = st.columns([1, 1, 6], gap="small")
+        with empty_cols[0]:
+            if st.button("Clear filters", key=f"jobs_empty_clear_{slug}", use_container_width=True):
+                st.session_state[f"{_JOBS_FILTER_STATE_KEY}_{slug}"] = dict(_JOBS_DEFAULT_FILTERS)
+                st.rerun()
+        with empty_cols[1]:
+            if st.button("Run pipeline", key=f"jobs_empty_run_{slug}", type="primary", use_container_width=True):
+                _queue_pipeline_run(slug)
+        return
 
-        with table_col:
-            with panel("Review queue", subtitle="Select rows for bulk actions. The first selection opens in the detail workspace"):
-                selection = st.dataframe(
-                    frame,
-                    width="stretch",
-                    hide_index=True,
-                    key=f"jobs_table_{slug}",
-                    on_select="rerun",
-                    selection_mode="multi-row",
-                    height=560,
-                    placeholder="",
-                    column_order=column_order,
-                    column_config={
-                        "id": None,
-                        "Fit": st.column_config.ProgressColumn("Fit", min_value=0, max_value=100),
-                        "ATS": st.column_config.ProgressColumn("ATS", min_value=0, max_value=100),
-                        "Posting": st.column_config.LinkColumn("Posting", display_text="Open"),
-                    },
+    # ── Sort controls ───────────────────────────────────────────────────
+    sort_cols = st.columns([0.7, 1.4, 1.0, 0.6, 8.0], gap="small")
+    sort_options = {
+        "fit": "Fit",
+        "verdict": "Verdict",
+        "title": "Title",
+        "company": "Company",
+        "location": "Location",
+        "posted": "Posted",
+        "status": "Status",
+        "rating": "Rating",
+    }
+    with sort_cols[0]:
+        st.markdown(
+            "<div style='font-family:var(--font-mono);font-size:11px;color:var(--muted);padding-top:8px'>Sort by</div>",
+            unsafe_allow_html=True,
+        )
+    with sort_cols[1]:
+        keys = list(sort_options.keys())
+        cur_key = sort.get("key", "fit")
+        idx = keys.index(cur_key) if cur_key in keys else 0
+        new_key = st.selectbox(
+            "Sort by",
+            keys,
+            index=idx,
+            key=f"beacon_jobs_sortkey_{slug}",
+            format_func=lambda k: sort_options[k],
+            label_visibility="collapsed",
+        )
+        if new_key != cur_key:
+            sort["key"] = new_key
+            st.rerun()
+    with sort_cols[2]:
+        cur_dir = sort.get("dir", "desc")
+        new_dir = st.selectbox(
+            "Direction",
+            ["desc", "asc"],
+            index=0 if cur_dir == "desc" else 1,
+            key=f"beacon_jobs_sortdir_{slug}",
+            format_func=lambda d: "↓ desc" if d == "desc" else "↑ asc",
+            label_visibility="collapsed",
+        )
+        if new_dir != cur_dir:
+            sort["dir"] = new_dir
+            st.rerun()
+
+    # ── Table (st.dataframe with multi-row selection) ───────────────────
+    frame = _build_jobs_dataframe(sorted_records, ratings_index=ratings_index)
+    selection = st.dataframe(
+        frame,
+        width="stretch",
+        hide_index=True,
+        key=f"beacon_jobs_table_{slug}",
+        on_select="rerun",
+        selection_mode="multi-row",
+        height=520,
+        placeholder="",
+        column_order=["Fit", "Verdict", "Title", "Company", "Location", "Posted", "Status", "Rating"],
+        column_config={
+            "_id": None,
+            "Fit": st.column_config.ProgressColumn("Fit", min_value=0, max_value=100, format="%d"),
+            "Verdict": st.column_config.TextColumn("Verdict"),
+            "Title": st.column_config.TextColumn("Title"),
+            "Company": st.column_config.TextColumn("Company"),
+            "Location": st.column_config.TextColumn("Location"),
+            "Posted": st.column_config.TextColumn("Posted"),
+            "Status": st.column_config.TextColumn("Status"),
+            "Rating": st.column_config.TextColumn("Rating"),
+        },
+    )
+
+    selected_rows = list(selection.selection.rows)
+    selected_ids = [str(frame.iloc[r]["_id"]) for r in selected_rows if 0 <= r < len(frame)]
+
+    # ── Bulk-action bar ─────────────────────────────────────────────────
+    if selected_ids:
+        st.markdown(
+            f"<div class='bulk-bar'><span class='ct'>{len(selected_ids)} selected</span></div>",
+            unsafe_allow_html=True,
+        )
+        bulk_cols = st.columns([1.3, 1.4, 1.0, 1.0, 6.0], gap="small")
+        with bulk_cols[0]:
+            if st.button("Mark applied", key=f"beacon_bulk_apply_{slug}", use_container_width=True):
+                changed = _apply_status_changes(slug, sorted_records, selected_ids, "applied")
+                if changed:
+                    st.toast(f"Marked {changed} job(s) as applied")
+                invalidate_dashboard_caches()
+                st.rerun()
+        with bulk_cols[1]:
+            if st.button("Mark interested", key=f"beacon_bulk_interest_{slug}", use_container_width=True):
+                changed = _apply_status_changes(slug, sorted_records, selected_ids, "interest")
+                if changed:
+                    st.toast(f"Saved {changed} job(s)")
+                invalidate_dashboard_caches()
+                st.rerun()
+        with bulk_cols[2]:
+            if st.button("Skip", key=f"beacon_bulk_skip_{slug}", use_container_width=True):
+                changed = _apply_status_changes(slug, sorted_records, selected_ids, "skip")
+                if changed:
+                    st.toast(f"Skipped {changed} job(s)")
+                invalidate_dashboard_caches()
+                st.rerun()
+        with bulk_cols[3]:
+            if st.button("Clear", key=f"beacon_bulk_clear_{slug}", use_container_width=True):
+                # Streamlit dataframes don't expose a clear-selection API; surface a one-rerun
+                # nudge via a key bump so the table re-mounts with no selection.
+                st.session_state[f"beacon_jobs_table_{slug}_nonce"] = (
+                    st.session_state.get(f"beacon_jobs_table_{slug}_nonce", 0) + 1
                 )
+                st.rerun()
 
-                selected_rows = list(selection.selection.rows)
-                selected_ids = [str(frame.iloc[row]["id"]) for row in selected_rows if 0 <= row < len(frame)]
-                _render_html_block(
-                    (
-                        "<div class='selection-banner'>"
-                        f"<div>{selected_ids and f'{len(selected_ids)} jobs selected for bulk actions' or 'No jobs selected yet'}</div>"
-                        f"<div>{'The first selected row opens in detail.' if selected_ids else 'Pick one row to inspect details, or multi-select for bulk updates.'}</div>"
-                        "</div>"
-                    )
-                )
-                bulk_clicked = toolbar(
-                    primary_actions=[],
-                    secondary_actions=[
-                        {"id": "bulk_applied", "label": "Mark applied", "key": f"bulk_applied_{slug}", "disabled": not selected_ids},
-                        {"id": "bulk_skipped", "label": "Mark skipped", "key": f"bulk_skipped_{slug}", "disabled": not selected_ids},
-                        {"id": "bulk_new", "label": "Mark new", "key": f"bulk_new_{slug}", "disabled": not selected_ids},
-                        {
-                            "id": "bulk_undo",
-                            "label": "Undo last status change",
-                            "key": f"bulk_undo_{slug}",
-                            "disabled": not (
-                                st.session_state.get("last_status_change")
-                                and st.session_state["last_status_change"].get("profile") == slug
-                            ),
-                        },
-                    ],
-                    meta="Bulk actions apply immediately to the selected rows.",
-                )
+    # ── Drawer trigger: first selected row opens the modal ──────────────
+    open_cols = st.columns([1.4, 6.6, 1.4], gap="small")
+    with open_cols[0]:
+        open_disabled = not selected_ids
+        if st.button(
+            "Open selected →",
+            key=f"beacon_jobs_open_selected_{slug}",
+            disabled=open_disabled,
+            use_container_width=True,
+        ):
+            st.session_state[_DRAWER_STATE_KEY] = selected_ids[0]
+            st.rerun()
+    with open_cols[2]:
+        if st.button("Run pipeline", key=f"beacon_jobs_run_{slug}", use_container_width=True, type="primary"):
+            _queue_pipeline_run(slug)
 
-                if bulk_clicked == "bulk_undo":
-                    restored = _undo_last_status_change(slug)
-                    if restored:
-                        _set_notice(slug, "success", f"Restored {restored} status change(s).")
-                        st.rerun()
-                elif bulk_clicked in {"bulk_applied", "bulk_skipped", "bulk_new"}:
-                    target_status = {"bulk_applied": "applied", "bulk_skipped": "skip", "bulk_new": "new"}[bulk_clicked]
-                    changed = _apply_status_changes(slug, filtered, selected_ids, target_status)
-                    if changed:
-                        _set_notice(slug, "success", f"Updated {changed} job(s) to {target_status}.")
-                    st.rerun()
+    # ── Keyboard hints (visual only) ────────────────────────────────────
+    st.markdown(
+        (
+            "<div class='kbd-hints'>"
+            "<span class='ki'><kbd>↵</kbd> open selected</span>"
+            "<span class='ki'><kbd>A</kbd> apply</span>"
+            "<span class='ki'><kbd>S</kbd> save</span>"
+            "<span class='ki'><kbd>X</kbd> skip</span>"
+            "<span class='ki'><kbd>⇧1</kbd>–<kbd>⇧5</kbd> rate</span>"
+            "<span class='ki'><kbd>/</kbd> search</span>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
-        selected_detail: Optional[dict[str, Any]] = None
-        if selected_rows:
-            selected_row = selected_rows[0]
-            if 0 <= selected_row < len(frame):
-                selected_id = str(frame.iloc[selected_row]["id"])
-                selected_detail = _cached_fetch_job_detail(slug, selected_id)
-
-        with detail_col:
-            if selected_detail is None:
-                with panel("Inspection workspace", subtitle="Choose one row to open a structured review view"):
-                    empty_state(
-                        "Select a job",
-                        "The detail workspace will show scores, reasons, watchouts, workflow controls, and secondary raw text without losing the table context.",
-                    )
-            else:
-                if len(selected_rows) > 1:
-                    with panel("Selection overview", subtitle="Bulk actions apply to all selected rows while detail stays locked to the first row"):
-                        callout("info", "Bulk selection active", f"{len(selected_rows)} jobs are selected. The first selected role is shown in detail below.")
-                _render_job_detail(selected_detail, slug)
+    _maybe_open_drawer(slug)
 
 
 def _render_activity_tab(

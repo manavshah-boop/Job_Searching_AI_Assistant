@@ -2295,6 +2295,513 @@ def _global_css() -> str:
     /* Drop the heavy avatar circle from page-header (Beacon doesn't use one). */
     .shell-page-header-avatar {{ display: none; }}
     .shell-page-header-identity {{ gap: 0; }}
+
+    /* ── Chunk 2 Beacon components ───────────────────────────────────────── */
+
+    /* Page header */
+    .beacon-ph {{
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-bottom: 18px;
+    }}
+    .beacon-ph .eyebrow {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-weight: 500;
+    }}
+    .beacon-ph h1 {{
+        font-family: var(--font-display);
+        font-size: 30px;
+        line-height: 1.05;
+        letter-spacing: -0.03em;
+        font-weight: 600;
+        color: var(--ink);
+        margin: 0;
+    }}
+    .beacon-ph .sub {{
+        margin-top: 4px;
+        color: var(--ink-2);
+        font-size: 14px;
+        max-width: 64ch;
+        line-height: 1.5;
+    }}
+
+    /* Run banner */
+    .runban {{
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 14px 18px;
+        border-radius: var(--r-md);
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--signal);
+        box-shadow: var(--shadow-1);
+    }}
+    .runban.fail {{
+        border-left-color: var(--danger);
+        background: linear-gradient(0deg, var(--danger-soft), var(--surface) 70%);
+    }}
+    .runban.partial {{ border-left-color: var(--warn); }}
+    .runban.running {{ border-left-color: var(--pop); }}
+    .runban .rb-state {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        text-transform: uppercase;
+        letter-spacing: .1em;
+        color: var(--signal);
+    }}
+    .runban.fail .rb-state {{ color: var(--danger); }}
+    .runban.partial .rb-state {{ color: var(--warn); }}
+    .runban.running .rb-state {{ color: var(--pop); }}
+    .runban .rb-dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; }}
+    @keyframes beacon-pulse {{
+        0%   {{ box-shadow: 0 0 0 0 rgba(31,61,138,0.55); }}
+        70%  {{ box-shadow: 0 0 0 7px rgba(31,61,138,0); }}
+        100% {{ box-shadow: 0 0 0 0 rgba(31,61,138,0); }}
+    }}
+    .runban.running .rb-dot {{ animation: beacon-pulse 1.6s infinite; }}
+    .runban .rb-line {{
+        font-family: var(--font-display);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 1.35;
+        color: var(--ink);
+    }}
+
+    /* Verdict badge */
+    .vbadge {{
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 3px 9px 3px 7px;
+        border-radius: 99px;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        line-height: 1;
+    }}
+    .vbadge .vd {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
+    .vbadge.apply {{ background: var(--signal-soft); color: var(--signal); }}
+    .vbadge.maybe {{ background: var(--warn-soft); color: var(--warn); }}
+    .vbadge.skip  {{ color: var(--muted); background: transparent; border: 1px solid var(--line-2); }}
+
+    /* Match row (used in Overview top picks) */
+    .beacon-match-row {{
+        display: grid;
+        grid-template-columns: 60px 1fr;
+        gap: 16px;
+        padding: 18px 4px 8px;
+        border-bottom: 1px solid var(--line);
+        align-items: flex-start;
+    }}
+    .beacon-match-row.focus {{ background: var(--bg-2); box-shadow: inset 3px 0 0 var(--ink); }}
+    .beacon-match-fit {{ display: flex; flex-direction: column; align-items: center; gap: 2px; padding-top: 1px; }}
+    .fit-num {{
+        font-family: var(--font-display);
+        font-weight: 700;
+        font-size: 26px;
+        line-height: 1;
+        letter-spacing: -0.03em;
+        color: var(--signal);
+    }}
+    .fit-lbl {{
+        font-family: var(--font-mono);
+        font-size: 9px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        margin-top: 1px;
+    }}
+    .beacon-match-row.mid .fit-num {{ color: var(--ink-2); }}
+    .beacon-match-row.low .fit-num {{ color: var(--muted); }}
+    .beacon-match-title-row {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }}
+    .m-title {{
+        font-family: var(--font-display);
+        font-weight: 600;
+        font-size: 16px;
+        line-height: 1.25;
+        letter-spacing: -0.012em;
+        color: var(--ink);
+        margin: 0;
+    }}
+    .m-meta {{
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 5px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+        line-height: 1.6;
+    }}
+    .m-meta .dot {{ width: 2.5px; height: 2.5px; border-radius: 50%; background: var(--muted); }}
+    .m-meta .co {{ color: var(--ink-2); font-weight: 500; }}
+    .m-reason {{
+        font-size: 13.5px;
+        color: var(--ink-2);
+        line-height: 1.55;
+        margin-top: 8px;
+        margin-bottom: 0;
+        max-width: 64ch;
+    }}
+
+    /* Tags + rated tag */
+    .tag {{
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2.5px 8px;
+        border-radius: 99px;
+        font-size: 11px;
+        font-weight: 500;
+        background: var(--bg-2);
+        color: var(--ink-2);
+        border: 1px solid var(--line);
+        font-family: var(--font-mono);
+    }}
+    .tag.pos {{ background: var(--signal-soft); color: var(--signal); border-color: transparent; }}
+    .tag.warn {{ background: var(--warn-soft); color: var(--warn); border-color: transparent; }}
+    .tag.pop {{ background: var(--pop-soft); color: var(--pop); border-color: transparent; }}
+    .rated-tag {{
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 2.5px 8px 2.5px 7px;
+        border-radius: 99px;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        line-height: 1;
+        background: var(--bg-2);
+        color: var(--ink-2);
+        border: 1px solid var(--line);
+    }}
+    .rated-tag .rt-dot {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
+
+    /* Drawer (st.dialog) — train card, reasoning, dim grid */
+    .train-card {{
+        background: linear-gradient(180deg, var(--surface) 0%, var(--surface) 60%, var(--bg-2) 100%);
+        border: 1px solid var(--line);
+        border-radius: var(--r-md);
+        padding: 18px 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow: var(--shadow-1);
+    }}
+    .train-title {{
+        font-family: var(--font-display);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: -0.012em;
+        line-height: 1.25;
+    }}
+    .train-title .train-ic {{ display: inline-block; margin-right: 6px; color: var(--signal); }}
+    .train-sub {{
+        font-size: 12.5px;
+        color: var(--muted);
+        line-height: 1.5;
+        margin-top: 3px;
+        max-width: 50ch;
+    }}
+    .reasoning {{
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 0;
+        margin: 0;
+        list-style: none;
+    }}
+    .reasoning li {{
+        padding: 11px 13px;
+        border: 1px solid var(--line);
+        border-radius: var(--r-sm);
+        background: var(--surface);
+        font-size: 13.5px;
+        color: var(--ink-2);
+        line-height: 1.55;
+        display: flex;
+        gap: 11px;
+    }}
+    .reasoning li::before {{
+        content: "";
+        flex: 0 0 4px;
+        background: var(--signal);
+        border-radius: 2px;
+    }}
+    .reasoning li.warn::before {{ background: var(--warn); }}
+    .reasoning li.neg::before {{ background: var(--danger); }}
+
+    .dim-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    @media (max-width: 480px) {{ .dim-grid {{ grid-template-columns: 1fr; }} }}
+    .dim {{
+        border: 1px solid var(--line);
+        border-radius: var(--r-sm);
+        background: var(--surface);
+        padding: 11px 13px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+    }}
+    .dim .dim-row {{ display: flex; justify-content: space-between; align-items: baseline; }}
+    .dim .nm {{ font-size: 12px; font-weight: 600; color: var(--ink-2); }}
+    .dim .v {{ font-family: var(--font-display); font-weight: 600; font-size: 15px; letter-spacing: -0.02em; }}
+    .dim .v small {{ font-family: var(--font-mono); font-size: 10px; color: var(--muted); margin-left: 3px; font-weight: 500; }}
+    .dim .w {{ font-family: var(--font-mono); font-size: 10px; color: var(--muted); }}
+    .dim .bar {{ height: 5px; border-radius: 3px; background: rgba(22,23,15,0.06); overflow: hidden; }}
+    .dim .bar > div {{ height: 100%; background: var(--signal); border-radius: 3px; }}
+    .dim.low .bar > div {{ background: var(--warn); }}
+
+    /* Drawer header HTML used by st.dialog body */
+    .drawer-head {{
+        display: flex;
+        align-items: flex-start;
+        gap: 14px;
+        padding-bottom: 14px;
+        border-bottom: 1px solid var(--line);
+    }}
+    .drawer-head .fit-num {{ font-size: 32px; }}
+
+    /* Jobs toolbar (search + filter chips + counter) */
+    .beacon-toolbar {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+        background: var(--bg-2);
+        border-radius: var(--r-md) var(--r-md) 0 0;
+        flex-wrap: wrap;
+    }}
+    .beacon-toolbar .right {{
+        margin-left: auto;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--muted);
+    }}
+
+    /* Filter chip-buttons (rendered via st.button targeting) */
+    .beacon-filter-row [data-testid="stButton"] > button {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        border-radius: 6px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        font-family: var(--font-body);
+        font-size: 12px;
+        color: var(--ink-2);
+        line-height: 1;
+        font-weight: 500;
+        min-height: 30px;
+        transition: background .12s ease, border-color .12s ease, color .12s ease;
+    }}
+    .beacon-filter-row [data-testid="stButton"] > button:hover {{
+        border-color: var(--line-2);
+        color: var(--ink);
+    }}
+    .beacon-filter-row.on [data-testid="stButton"] > button,
+    .beacon-filter-row [data-testid="stButton"] > button[kind="primary"] {{
+        background: var(--ink);
+        color: var(--accent-ink);
+        border-color: var(--ink);
+    }}
+
+    /* Bulk-action bar (appears when rows selected) */
+    .bulk-bar {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 14px;
+        background: var(--ink);
+        color: var(--accent-ink);
+        border-bottom: 1px solid var(--ink);
+        font-size: 12.5px;
+    }}
+    .bulk-bar .ct {{ font-family: var(--font-mono); }}
+
+    /* Beacon empty-state (used in Jobs no-match) */
+    .beacon-empty {{
+        padding: 48px 32px;
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+    }}
+    .beacon-empty .ic {{
+        width: 42px;
+        height: 42px;
+        border-radius: 50%;
+        background: var(--bg-2);
+        display: grid;
+        place-items: center;
+        margin-bottom: 6px;
+        font-family: var(--font-mono);
+        color: var(--muted);
+        font-size: 18px;
+    }}
+    .beacon-empty .h {{ font-family: var(--font-display); font-size: 16px; font-weight: 600; }}
+    .beacon-empty .s {{ font-size: 13px; color: var(--muted); max-width: 42ch; line-height: 1.5; }}
+
+    /* Keyboard hints strip */
+    .kbd-hints {{
+        display: flex;
+        gap: 14px;
+        align-items: center;
+        padding: 9px 18px;
+        flex-wrap: wrap;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        border-top: 1px solid var(--line);
+        background: var(--bg-2);
+        border-radius: 0 0 var(--r-md) var(--r-md);
+    }}
+    .kbd-hints .ki {{ display: inline-flex; align-items: center; gap: 5px; }}
+    .kbd-hints .ki kbd {{
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 3px;
+        padding: 1px 5px;
+        font: inherit;
+        color: var(--ink);
+        font-size: 10px;
+    }}
+
+    /* Live pipeline card on Overview side column */
+    .pipeline-side-card {{
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--r-md);
+        padding: 14px 16px;
+        box-shadow: var(--shadow-1);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }}
+    .pipeline-side-card .ag-head {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }}
+    .pipeline-side-card .ag-pulse {{
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--signal);
+        box-shadow: 0 0 0 0 rgba(91,108,46,0.5);
+        animation: beacon-pulse-signal 1.6s infinite;
+    }}
+    @keyframes beacon-pulse-signal {{
+        0%   {{ box-shadow: 0 0 0 0 rgba(91,108,46,0.5); }}
+        70%  {{ box-shadow: 0 0 0 7px rgba(91,108,46,0); }}
+        100% {{ box-shadow: 0 0 0 0 rgba(91,108,46,0); }}
+    }}
+    .pipeline-side-card .ag-title {{
+        font-family: var(--font-display);
+        font-size: 13.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+    }}
+    .pipeline-side-card .ag-elapsed {{
+        margin-left: auto;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--muted);
+    }}
+    .pipeline-side-card .progress {{
+        height: 5px;
+        border-radius: 3px;
+        background: rgba(22,23,15,0.06);
+        overflow: hidden;
+    }}
+    .pipeline-side-card .progress > div {{
+        height: 100%;
+        background: var(--signal);
+        border-radius: 3px;
+        transition: width .4s ease;
+    }}
+    .pipeline-side-card .stages {{ display: flex; flex-direction: column; gap: 6px; }}
+    .pipeline-side-card .stage {{
+        display: grid;
+        grid-template-columns: 14px 1fr auto;
+        gap: 10px;
+        align-items: center;
+        font-size: 12.5px;
+    }}
+    .pipeline-side-card .stg-icon {{
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 1.5px solid var(--line-2);
+        background: var(--surface);
+        flex: 0 0 auto;
+    }}
+    .pipeline-side-card .stage.done .stg-icon {{ background: var(--ink); border-color: var(--ink); }}
+    .pipeline-side-card .stage.run .stg-icon  {{ border-color: var(--signal); background: var(--signal); }}
+    .pipeline-side-card .stage.queue {{ color: var(--muted); }}
+    .pipeline-side-card .stg-name {{ font-weight: 500; color: var(--ink-2); }}
+    .pipeline-side-card .stage.run .stg-name {{ color: var(--ink); font-weight: 600; }}
+    .pipeline-side-card .stg-count {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+    }}
+
+    /* Card wrapper for the top-picks + jobs sections */
+    .beacon-card {{
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--r-md);
+        box-shadow: var(--shadow-1);
+        overflow: hidden;
+    }}
+    .beacon-card-head {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--line);
+    }}
+    .beacon-card-title {{
+        font-family: var(--font-display);
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: -0.012em;
+        color: var(--ink);
+    }}
+    .beacon-card-sub {{
+        font-size: 12.5px;
+        color: var(--muted);
+        margin-top: 2px;
+        line-height: 1.4;
+    }}
+    .beacon-card-body {{ padding: 4px 18px 8px; }}
     </style>
     """
 
