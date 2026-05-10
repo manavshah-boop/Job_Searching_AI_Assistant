@@ -53,7 +53,7 @@ from db import (
     start_run,
     update_job_status,
 )
-from dashboard_semantic import clear_semantic_panel_caches, render_semantic_match_panel
+from dashboard_semantic import clear_semantic_panel_caches
 from evaluation import evaluate_profile, export_eval_template, load_eval_labels, load_last_eval_result
 from dashboard_ui import (
     render_activity_feed,
@@ -62,8 +62,7 @@ from dashboard_ui import (
     render_source_progress,
 )
 from logging_config import configure_logging
-from dashboard_ratings import factor_with_badge, render_rating_panel
-from match_explainer import build_match_explanation
+from dashboard_ratings import render_rating_panel
 from user_ratings import (
     RATING_OPTIONS,
     attach_role_family_from_config,
@@ -358,11 +357,29 @@ def _cached_recent_runs(slug: str) -> list[dict[str, Any]]:
     return get_recent_runs(limit=20, profile=slug)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_profile_role_family(slug: str) -> Optional[str]:
+    """Resolve the role_family for a profile and cache for 5 minutes.
+
+    `attach_role_family_from_config` calls `load_config`, which re-parses the
+    profile YAML and re-extracts text from the resume PDF on every call. Without
+    this cache, every Beacon match row and drawer render would pay that cost.
+    Invalidated explicitly when the profile config changes (see
+    `_save_profile_draft` and the onboarding flow).
+    """
+    try:
+        cfg = load_config(profile=slug)
+    except Exception:
+        return None
+    return attach_role_family_from_config(slug, cfg)
+
+
 def invalidate_dashboard_caches() -> None:
     _cached_list_profiles.clear()
     _cached_fetch_job_summaries.clear()
     _cached_fetch_job_detail.clear()
     _cached_recent_runs.clear()
+    _cached_profile_role_family.clear()
     clear_semantic_panel_caches()
 
 
@@ -1512,11 +1529,10 @@ def render_match_row(
             st.session_state[_DRAWER_STATE_KEY] = job_id
             st.rerun()
 
-    profile_config_for_rating = load_config(profile=slug)
     render_rating_panel(
         slug,
         job_id,
-        role_family=attach_role_family_from_config(slug, profile_config_for_rating),
+        role_family=_cached_profile_role_family(slug),
         key_prefix=f"{key_prefix}_rate_{slug}",
         show_helper=False,
     )
@@ -1737,11 +1753,10 @@ def _render_job_drawer_body(record: dict[str, Any], slug: str) -> None:
         ),
         unsafe_allow_html=True,
     )
-    profile_config_for_rating = load_config(profile=slug)
     render_rating_panel(
         slug,
         job_id,
-        role_family=attach_role_family_from_config(slug, profile_config_for_rating),
+        role_family=_cached_profile_role_family(slug),
         key_prefix=f"drawer_rate_{slug}",
     )
 
@@ -2276,7 +2291,13 @@ def _render_jobs_tab(
             "Location": st.column_config.TextColumn("Location"),
             "Posted": st.column_config.TextColumn("Posted"),
             "Status": st.column_config.TextColumn("Status"),
-            "Rating": st.column_config.TextColumn("Rating"),
+            "Rating": st.column_config.TextColumn(
+                "Rating",
+                help=(
+                    "Your training feedback for the scorer. Select a row and "
+                    "click Open selected → to set or change a rating."
+                ),
+            ),
         },
     )
 
