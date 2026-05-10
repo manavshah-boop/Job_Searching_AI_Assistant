@@ -378,3 +378,183 @@ def sidebar_profile_summary(
         ),
         unsafe_allow_html=True,
     )
+
+
+# ── Beacon sidebar primitives ─────────────────────────────────────────────────
+# These mirror the Brand / ProfileMenu / NavItem / RunBanner components from the
+# Beacon reference HTML, adapted to render inside Streamlit's sidebar container.
+
+NavItem = dict[str, Any]
+
+
+def _initials_for(name: str) -> str:
+    """Two-letter initials, uppercased. Falls back to '?' for empty input."""
+    parts = [p for p in str(name or "").strip().split() if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][:1] + parts[1][:1]).upper()
+
+
+def beacon_brand(name: str = "Beacon", subkicker: str = "job-search agent") -> None:
+    """Render the Beacon brand mark + name in the sidebar."""
+    st.markdown(
+        (
+            "<div class='beacon-brand'>"
+            f"<div class='beacon-brand-mark' aria-hidden='true'>{html.escape(name[:1] or 'B')}</div>"
+            "<div class='beacon-brand-text'>"
+            f"<div class='beacon-brand-name'>{html.escape(name)}</div>"
+            f"<div class='beacon-brand-sub'>{html.escape(subkicker)}</div>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def beacon_profile_card(
+    name: str,
+    sub: str | None = None,
+    *,
+    initials: str | None = None,
+) -> None:
+    """Render the visible "who" card. Caller is responsible for popover wiring."""
+    chosen_initials = initials or _initials_for(name)
+    sub_html = (
+        f"<div class='beacon-who-sub'>{html.escape(sub)}</div>"
+        if sub
+        else ""
+    )
+    st.markdown(
+        (
+            "<div class='beacon-who'>"
+            f"<div class='beacon-who-av' aria-hidden='true'>{html.escape(chosen_initials)}</div>"
+            "<div class='beacon-who-meta'>"
+            f"<div class='beacon-who-name'>{html.escape(name)}</div>"
+            f"{sub_html}"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def beacon_nav_kicker(label: str) -> None:
+    """Section label shown above each nav group."""
+    st.markdown(
+        f"<div class='beacon-nav-kicker'>{html.escape(label)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def beacon_nav_group(
+    items: Sequence[NavItem],
+    *,
+    active: str | None = None,
+    key_prefix: str = "beacon_nav",
+) -> str | None:
+    """Render a vertical stack of nav buttons. Returns the clicked item id.
+
+    Each `NavItem` is `{"id": str, "label": str, "icon": str?, "count": int?}`.
+    The caller persists the active id and re-runs.
+    """
+    clicked: str | None = None
+    container = st.container()
+    with container:
+        # Marker so the CSS selector can scope sidebar button restyling to nav
+        # groups only — we don't want run-card / footer buttons to look like
+        # nav-items.
+        st.markdown(
+            "<div class='beacon-nav-group-marker' aria-hidden='true'></div>",
+            unsafe_allow_html=True,
+        )
+        for item in items:
+            item_id = str(item.get("id") or item.get("label") or "")
+            label = str(item.get("label") or item_id)
+            icon = str(item.get("icon") or "").strip()
+            count = item.get("count")
+            display = f"{icon}  {label}" if icon else label
+            if count is not None:
+                display = f"{display}   ·  {count}"
+            is_active = active == item_id
+            if st.button(
+                display,
+                key=f"{key_prefix}_{item_id}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                clicked = item_id
+    return clicked
+
+
+def beacon_run_card(
+    *,
+    state: str = "idle",
+    headline: str,
+    detail: str | None = None,
+    progress_pct: float | None = None,
+    action_label: str | None = None,
+    action_key: str | None = None,
+) -> bool:
+    """Render the live run card pinned to the sidebar bottom.
+
+    `state` ∈ {"running", "idle", "ok", "fail", "warn"} drives the pulse color.
+    Returns True if the action button was clicked.
+    """
+    pulse_class_map = {
+        "running": "",  # default green pulse
+        "ok": "",
+        "fail": "danger",
+        "warn": "warn",
+        "idle": "muted",
+    }
+    pulse_extra = pulse_class_map.get(state, "muted")
+    pulse_class = "beacon-pulse" + (f" {pulse_extra}" if pulse_extra else "")
+
+    detail_html = (
+        f"<div class='beacon-run-line'>{detail}</div>" if detail else ""
+    )
+    progress_html = ""
+    if progress_pct is not None:
+        clamped = max(0.0, min(100.0, float(progress_pct)))
+        progress_html = (
+            f"<div class='beacon-progress' aria-hidden='true'>"
+            f"<div style='width:{clamped:.1f}%'></div>"
+            "</div>"
+        )
+
+    container = st.container()
+    clicked = False
+    with container:
+        st.markdown(
+            (
+                "<div class='beacon-run-card'>"
+                "<div class='beacon-run-status'>"
+                f"<span class='{pulse_class}'></span>"
+                f"<span>{html.escape(headline)}</span>"
+                "</div>"
+                f"{detail_html}"
+                f"{progress_html}"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        if action_label and action_key:
+            if st.button(action_label, key=action_key, use_container_width=True):
+                clicked = True
+    return clicked
+
+
+def beacon_aside_foot(label: str, key: str) -> bool:
+    """Subtle footer link inside the sidebar. Returns True on click."""
+    container = st.container()
+    clicked = False
+    with container:
+        st.markdown(
+            "<div class='beacon-aside-foot-marker' aria-hidden='true'></div>",
+            unsafe_allow_html=True,
+        )
+        if st.button(label, key=key, use_container_width=True):
+            clicked = True
+    return clicked
