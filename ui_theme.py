@@ -2802,6 +2802,247 @@ def _global_css() -> str:
         line-height: 1.4;
     }}
     .beacon-card-body {{ padding: 4px 18px 8px; }}
+
+    /* ── Activity feed (chunk 3) ── */
+    .feed {{ display: flex; flex-direction: column; }}
+    .feed-row {{
+        display: grid;
+        grid-template-columns: 90px 14px 1fr auto;
+        gap: 14px;
+        padding: 13px 18px;
+        border-bottom: 1px solid var(--line);
+        align-items: flex-start;
+        font-size: 13px;
+    }}
+    .feed-row:last-child {{ border-bottom: 0; }}
+    .feed-row .ts {{ font-family: var(--font-mono); font-size: 11px; color: var(--muted); padding-top: 1px; }}
+    .feed-row .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--ink-2); margin-top: 6px; }}
+    .feed-row.info .dot    {{ background: var(--pop); }}
+    .feed-row.warn .dot    {{ background: var(--warn); }}
+    .feed-row.danger .dot  {{ background: var(--danger); }}
+    .feed-row.success .dot {{ background: var(--signal); }}
+    .feed-row .body {{ line-height: 1.5; color: var(--ink-2); }}
+    .feed-row .body b {{ color: var(--ink); font-weight: 600; }}
+    .feed-row .right {{ font-family: var(--font-mono); font-size: 11px; color: var(--muted); }}
+
+    /* Activity run header — 2-col Stages | Sources */
+    .activity-run-grid {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+        padding: 18px 20px;
+    }}
+    @media (max-width: 980px) {{ .activity-run-grid {{ grid-template-columns: 1fr; }} }}
+    .activity-run-grid .col-eyebrow {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin-bottom: 10px;
+    }}
+    .activity-stage-list {{ display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }}
+    .activity-stage {{
+        display: grid;
+        grid-template-columns: 14px 1fr auto;
+        gap: 10px;
+        align-items: center;
+    }}
+    .activity-stage .stg-icon {{
+        width: 14px; height: 14px; border-radius: 50%;
+        border: 1.5px solid var(--line-2);
+        background: var(--surface);
+    }}
+    .activity-stage.done .stg-icon  {{ background: var(--ink); border-color: var(--ink); }}
+    .activity-stage.run .stg-icon   {{ border-color: var(--signal); background: var(--signal); }}
+    .activity-stage.fail .stg-icon  {{ border-color: var(--danger); background: var(--danger); }}
+    .activity-stage.queue {{ color: var(--muted); }}
+    .activity-stage .stg-name {{ font-weight: 500; color: var(--ink-2); }}
+    .activity-stage.run .stg-name  {{ color: var(--ink); font-weight: 600; }}
+    .activity-stage .stg-count {{ font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); }}
+
+    .activity-source-list {{ display: flex; flex-direction: column; gap: 8px; }}
+    .activity-source-row {{
+        display: grid;
+        grid-template-columns: 96px 1fr 56px;
+        gap: 10px;
+        align-items: center;
+        font-size: 12px;
+    }}
+    .activity-source-row .nm {{ font-family: var(--font-mono); color: var(--ink-2); font-size: 11px; }}
+    .activity-source-row .progress {{
+        height: 5px; border-radius: 3px;
+        background: rgba(22,23,15,0.06); overflow: hidden;
+    }}
+    body.theme-dark .activity-source-row .progress {{ background: rgba(241,239,230,0.10); }}
+    .activity-source-row .progress > div {{ height: 100%; border-radius: 3px; transition: width .25s ease; }}
+    .activity-source-row .ct {{
+        font-family: var(--font-mono); font-size: 11px;
+        color: var(--muted); text-align: right;
+    }}
+
+    /* 14-day run history bar chart */
+    .history-chart {{
+        padding: 22px 26px;
+        display: grid;
+        grid-template-columns: repeat(14, 1fr);
+        gap: 8px;
+        align-items: end;
+        height: 120px;
+    }}
+    .history-chart .bar {{
+        background: var(--ink-2);
+        opacity: 0.3;
+        border-radius: 4px;
+        min-height: 6px;
+        transition: opacity .15s ease;
+    }}
+    .history-chart .bar:hover {{ opacity: 0.55; }}
+    .history-chart .bar.today {{ background: var(--ink); opacity: 1; }}
+    .history-axis {{
+        padding: 0 26px 20px;
+        display: flex;
+        justify-content: space-between;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--muted);
+    }}
+
+    /* ── Profile / Settings shared (chunk 3) ── */
+    .panel-grid {{
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 18px;
+    }}
+    @media (max-width: 980px) {{ .panel-grid {{ grid-template-columns: 1fr; }} }}
+
+    .kv {{
+        display: grid;
+        grid-template-columns: 140px 1fr;
+        gap: 8px;
+        padding: 9px 0;
+        border-bottom: 1px dashed var(--line);
+        font-size: 13px;
+    }}
+    .kv:last-child {{ border-bottom: 0; }}
+    .kv .k {{
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        padding-top: 2px;
+    }}
+    .kv .v {{ color: var(--ink-2); }}
+
+    .pill-grid {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .pill {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border-radius: 99px;
+        background: var(--bg-2);
+        border: 1px solid var(--line);
+        font-size: 12.5px;
+        color: var(--ink-2);
+    }}
+    .pill.on {{ background: var(--ink); color: var(--accent-ink); border-color: var(--ink); }}
+    .pill .x {{ opacity: 0.55; font-family: var(--font-mono); font-size: 10px; }}
+
+    /* Resume preview thumb tile */
+    .resume-thumb {{
+        width: 44px;
+        height: 56px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        display: grid;
+        place-items: center;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        flex: 0 0 auto;
+    }}
+    .resume-row {{
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }}
+    .resume-row .grow {{ flex: 1 1 auto; min-width: 0; }}
+    .resume-row .grow .name {{ font-weight: 600; font-size: 13.5px; }}
+    .resume-row .grow .meta {{ font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 2px; }}
+
+    /* Settings — sources / weights / switch (chunk 3) */
+    .source-tile {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: var(--r-sm);
+        background: var(--surface);
+    }}
+    .source-tile .nm {{ font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px; }}
+    .source-tile .nm .d {{ width: 8px; height: 8px; border-radius: 50%; background: var(--signal); }}
+    .source-tile.off .nm .d {{ background: var(--muted); }}
+    .source-tile .ct {{ font-family: var(--font-mono); font-size: 11px; color: var(--muted); }}
+
+    .switch {{
+        position: relative;
+        width: 32px;
+        height: 18px;
+        border-radius: 99px;
+        background: rgba(22,23,15,0.18);
+        flex: 0 0 auto;
+    }}
+    .switch::after {{
+        content: "";
+        position: absolute;
+        left: 2px; top: 2px;
+        width: 14px; height: 14px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        transition: left .15s;
+    }}
+    .switch.on {{ background: var(--ink); }}
+    .switch.on::after {{ left: 16px; }}
+    body.theme-dark .switch {{ background: rgba(241,239,230,0.18); }}
+    body.theme-dark .switch.on {{ background: var(--accent); }}
+    body.theme-dark .switch.on::after {{ background: var(--bg); }}
+
+    .weight-row {{
+        display: grid;
+        grid-template-columns: 120px 1fr 50px;
+        gap: 10px;
+        align-items: center;
+        padding: 7px 0;
+        font-size: 13px;
+    }}
+    .weight-row .nm {{ font-weight: 500; }}
+    .weight-row .v {{ font-family: var(--font-mono); font-size: 12px; color: var(--muted); text-align: right; }}
+
+    /* Notification rows */
+    .notif-row {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 0;
+        border-bottom: 1px dashed var(--line);
+    }}
+    .notif-row:last-child {{ border-bottom: 0; }}
+    .notif-row .label {{ font-weight: 600; font-size: 13.5px; }}
+    .notif-row .sub   {{ color: var(--muted); font-size: 12px; margin-top: 3px; }}
+    .notif-row .soon  {{
+        font-family: var(--font-mono);
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-top: 5px;
+    }}
     </style>
     """
 
