@@ -103,6 +103,7 @@ def render_rating_panel(
             if is_current:
                 clear_user_rating(profile_slug, job_id)
                 new_rating = None
+                st.toast("Rating cleared · applies on next run")
             else:
                 new_rating = set_user_rating(
                     profile_slug,
@@ -114,6 +115,7 @@ def render_rating_panel(
                     notes=current_notes or notes_default,
                     role_family=role_family,
                 )
+                st.toast(f"Rated as {display} · applies on next run")
             st.rerun()
 
     # Once a rating exists we expose Beacon's "Tell Beacon why" textarea.
@@ -194,6 +196,7 @@ def _render_rating_compact(
             if is_current:
                 clear_user_rating(profile_slug, job_id)
                 new_rating = None
+                st.toast("Rating cleared · applies on next run")
             else:
                 new_rating = set_user_rating(
                     profile_slug,
@@ -202,6 +205,7 @@ def _render_rating_compact(
                     notes=(current.notes if current else ""),
                     role_family=role_family,
                 )
+                st.toast(f"Rated as {display} · applies on next run")
             st.rerun()
     return new_rating
 
