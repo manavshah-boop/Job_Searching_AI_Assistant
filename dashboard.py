@@ -692,6 +692,163 @@ def _render_theme_bootstrap_notice() -> None:
     )
 
 
+def _render_html_block(markup: str) -> None:
+    st.markdown(markup, unsafe_allow_html=True)
+
+
+def _render_summary_list(items: list[tuple[str, Any]]) -> None:
+    markup = "".join(
+        f"<div class='summary-row'><span>{html.escape(str(label))}</span><strong>{html.escape(str(value))}</strong></div>"
+        for label, value in items
+    )
+    _render_html_block(f"<div class='summary-list'>{markup}</div>")
+
+
+def _render_tracking_status_panel(config: dict[str, Any], profile: str) -> None:
+    with panel("Experiment tracking", subtitle="Optional MLflow observability for pipeline, evaluation, and semantic runs"):
+        _render_summary_list(
+            [
+                ("MLflow", "Enabled" if mlflow_enabled(config) else "Disabled"),
+                ("Tracking URI", get_tracking_uri(config)),
+                ("Experiment", get_experiment_name(config, profile)),
+            ]
+        )
+        st.caption("Tracking is local and optional. Normal scraping, scoring, matching, and dashboard flows still work when it is off.")
+        st.code("mlflow ui --backend-store-uri ./mlruns", language="bash")
+
+
+def _queue_pipeline_run(slug: str) -> None:
+    if not _worker_is_running(slug):
+        _launch_worker(slug)
+        st.session_state["_scroll_to_progress"] = True
+    st.rerun()
+
+
+def _open_create_profile_dialog() -> None:
+    st.session_state.show_create_profile_dialog = True
+
+
+def _open_resume_preview_dialog(file_name: str, pdf_bytes: bytes) -> None:
+    st.session_state.resume_preview_name = file_name
+    st.session_state.resume_preview_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    st.session_state.show_resume_preview_dialog = True
+
+
+def _launch_create_profile_flow(profile_name: str, employment_type: str) -> None:
+    clean_name = profile_name.strip()
+    job_type = "internship" if employment_type.lower().startswith("intern") else "fulltime"
+
+    onboarding_data = {
+        "name": clean_name,
+        "profile_slug": sanitize_slug(clean_name),
+        "job_type": job_type,
+        "bio": "",
+    }
+    if job_type == "internship":
+        onboarding_data.update(
+            {
+                "target_season": "Summer",
+                "target_year": "2026",
+                "graduation_year": "2027",
+            }
+        )
+
+    st.session_state.show_create_profile_dialog = False
+    st.session_state.onboarding_data = onboarding_data
+    st.session_state.onboarding_step = 2
+    st.session_state.show_onboarding = True
+    st.rerun()
+
+
+def _create_profile_modal_body() -> None:
+    st.caption("Start with a name and search mode, then finish the rest in guided setup.")
+    with st.form("create_profile_modal_form"):
+        profile_name = st.text_input(
+            "Profile name",
+            value=st.session_state.get("quick_create_profile_name", ""),
+            placeholder="Manav Shah",
+        )
+        employment_type = st.selectbox(
+            "Employment type",
+            ["Full-time", "Internship"],
+            index=0 if st.session_state.get("quick_create_employment_type", "Full-time") == "Full-time" else 1,
+        )
+        action_cols = st.columns(2, gap="small")
+        with action_cols[0]:
+            continue_clicked = st.form_submit_button("Continue", type="primary", use_container_width=True)
+        with action_cols[1]:
+            cancel_clicked = st.form_submit_button("Cancel", use_container_width=True)
+
+    if cancel_clicked:
+        st.session_state.show_create_profile_dialog = False
+        st.rerun()
+
+    if continue_clicked:
+        clean_name = profile_name.strip()
+        if not clean_name:
+            callout("error", "Profile name required", "Add a profile name before continuing.")
+            return
+        proposed_slug = sanitize_slug(clean_name)
+        if not proposed_slug:
+            callout("error", "Profile name required", "Use letters or numbers so the workspace can be created safely.")
+            return
+        existing_profiles = {profile["slug"] for profile in list_profiles()}
+        if proposed_slug in existing_profiles:
+            callout("warning", "Profile already exists", f"A profile named '{proposed_slug}' already exists. Choose a different name.")
+            return
+        st.session_state.quick_create_profile_name = clean_name
+        st.session_state.quick_create_employment_type = employment_type
+        _launch_create_profile_flow(clean_name, employment_type)
+
+
+if callable(getattr(st, "dialog", None)):
+    @st.dialog("Create new profile")
+    def _render_create_profile_dialog() -> None:
+        _create_profile_modal_body()
+else:
+    def _render_create_profile_dialog() -> None:
+        with panel("Create new profile", subtitle="Start with a few details, then finish the rest in guided setup"):
+            _create_profile_modal_body()
+
+
+def _render_resume_preview_body() -> None:
+    file_name = st.session_state.get("resume_preview_name") or "resume.pdf"
+    encoded = st.session_state.get("resume_preview_b64")
+    if not encoded:
+        callout("error", "Resume preview unavailable", "The PDF bytes were not available for this preview.")
+        return
+
+    st.caption("Preview uses the saved PDF bytes for this profile, so it works in deployed environments too.")
+    components.html(
+        f"""
+        <iframe
+            src="data:application/pdf;base64,{encoded}#view=FitH"
+            width="100%"
+            height="720"
+            style="border: 1px solid rgba(20, 35, 40, 0.08); border-radius: 12px; background: white;"
+        ></iframe>
+        """,
+        height=740,
+    )
+    st.download_button(
+        "Download PDF",
+        data=base64.b64decode(encoded),
+        file_name=file_name,
+        mime="application/pdf",
+        use_container_width=False,
+    )
+
+
+if callable(getattr(st, "dialog", None)):
+    @st.dialog("Resume preview")
+    def _render_resume_preview_dialog() -> None:
+        _render_resume_preview_body()
+else:
+    def _render_resume_preview_dialog() -> None:
+        with panel("Resume preview", subtitle="Open or download the saved PDF resume for this profile"):
+            _render_resume_preview_body()
+
+
 def _read_profile_config(slug: str) -> dict[str, Any]:
     with open(_profile_config_path(slug), "r", encoding="utf-8") as file:
         return yaml.safe_load(file) or {}
