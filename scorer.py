@@ -386,6 +386,10 @@ def score_dimensions(
     prefs   = config.get("preferences", {})
     weights = config["scoring"]["weights"]
     max_yoe = prefs.get("filters", {}).get("max_yoe", 5)
+    # Used in the disqualifier prompt — the threshold at which a hard YOE
+    # minimum disqualifies. Example: max_yoe=4 → only "5+ years required"
+    # (or higher) triggers a YOE disqualifier.
+    max_yoe_plus_one = int(max_yoe) + 1
 
     zeroed = {
         "disqualified": False,
@@ -523,17 +527,24 @@ CANDIDATE PROFILE:
 {job.raw_text}
 
 --- TASK ---
-Step 1 — Hard disqualifier check. Be CONSERVATIVE — only disqualify when the posting EXPLICITLY contains the disqualifying language. Do not infer or assume.
-Set "disqualified" to true and fill "disqualify_reason" if ANY of the following apply:
-- Requires a security clearance — only when the JD literally mentions one of: "security clearance", "TS/SCI", "Top Secret", "government clearance", "DoD clearance", "ITAR", "polygraph". If none of those phrases appear verbatim, do NOT disqualify on this ground.
-- Explicitly requires on-site relocation with no remote option — only when the JD says "no remote", "must be on-site only", "relocation required", or similar.
-- Requires a master's degree or PhD as a hard requirement (not just preferred) — phrases like "MS required", "PhD required", "graduate degree required". Do NOT disqualify when the JD says "MS preferred" or "PhD a plus".
-- Requires more than {max_yoe} years of experience as a hard minimum{disqualifier_intern_rule}
+Step 1 — Hard disqualifier check. Default is disqualified=false. Only set disqualified=true if a verbatim phrase from the lists below appears in the JD. Do not paraphrase, infer, or generalize. If you cannot quote the exact disqualifying phrase from the JD, disqualified MUST be false.
+
+Set "disqualified" to true and fill "disqualify_reason" ONLY if you can quote a verbatim match for one of:
+
+- **Security clearance**: the JD literally contains one of "security clearance", "TS/SCI", "Top Secret", "government clearance", "DoD clearance", "ITAR", "polygraph", "active clearance". Words like "government", "federal", "defense" ALONE are NOT a disqualifier.
+
+- **No-remote / required relocation**: the JD literally contains one of "no remote", "not remote", "fully on-site only", "must be on-site", "must be onsite", "must be in office", "must be in-office", "relocation required", "this role is not remote", "remote not available", "must relocate". A JD that lists an office location but doesn't forbid remote is NOT a disqualifier.
+
+- **Graduate degree required (not preferred)**: the JD literally contains one of "MS required", "M.S. required", "Master's required", "Master's degree required", "PhD required", "Ph.D. required", "doctorate required", "graduate degree required", "advanced degree required", "must have a Master's", "must have a PhD". JDs that say "MS preferred", "PhD a plus", "Master's is nice to have" are NOT disqualifiers.
+
+- **YOE > {max_yoe} years as a hard minimum**: the JD literally contains a phrase like "{max_yoe_plus_one}+ years required", "minimum {max_yoe_plus_one} years of experience", "at least {max_yoe_plus_one} years required". JDs that say "{max_yoe_plus_one}+ years preferred", "ideally {max_yoe_plus_one} years", "{max_yoe_plus_one}+ years a plus" are NOT disqualifiers. JDs that give a range starting at or below {max_yoe} (e.g. "2-5 years") are NOT disqualifiers.{disqualifier_intern_rule}
 
 Important interpretation notes:
 - Do NOT treat "currently pursuing", "working toward", or "enrolled in" a bachelor's/master's degree as an advanced-degree disqualifier for internship candidates.
 - Do NOT disqualify internship postings just because they mention students, graduation dates, or being in school.
+- Do NOT infer disqualifiers from the company sector, the team name, or your prior knowledge of any organization — only the JD text matters.
 - When unsure, prefer disqualified=false. A bad disqualification wastes a real candidate; a missed disqualification is a small annoyance.
+- If you set disqualified=true, your disqualify_reason MUST quote the verbatim phrase from the JD that triggered it. Format: 'Reason: "<quoted JD text>"'.
 
 If disqualified, set all dimension scores to 0 and skip Step 2.
 
@@ -553,6 +564,24 @@ Scoring rules:
 - Compensation below the candidate's minimum is a flag, not a disqualifier — it is often negotiable.
 - You may only score based on information explicitly present in the job posting. Do not assume or invent details.
 - reasons must contain exactly 2 to 4 short strings, never more than 4. If you have more than 4, combine the least important ones.
+
+CALIBRATION ANCHORS — use the FULL 0–10 range per dimension and AVOID bimodal output.
+Past runs showed scores clustering at either 0 (false disqualifiers) or 8–9 (everything that passed). That is incorrect. The correct distribution is graded:
+- 9–10 : near-perfect fit on this dimension. RARE. Reserve for "every required + preferred element present, no caveats".
+- 7–8  : strong fit. Most reasonable matches land here. Some preferred items missing is OK.
+- 5–6  : partial / ambiguous fit. Some signals present, others missing. Default when uncertain.
+- 3–4  : weak fit. Most signals missing, but not a categorical mismatch.
+- 1–2  : poor fit on this specific dimension.
+- 0    : ONLY when this dimension is categorically irrelevant (e.g. role_fit for a non-engineering role being scored against an engineer).
+
+Composite fit_score guidance (the system computes this from your dimension scores; use it as a sanity check):
+- 90–100 : perfect / aspirational match. Almost never appears. Reserve for "exactly the right title, every skill matches, in-budget, in preferred location, top-tier company".
+- 70–85  : strong match — most decent-fit roles for an in-target candidate should land here.
+- 50–70  : decent / partial match. The candidate could reasonably apply but with caveats.
+- 30–50  : marginal match. Some overlap exists but key elements are missing.
+- 0–30   : not a match. Only score this low when most dimensions are genuinely poor.
+
+CRITICAL: A target-title role at a real company in the candidate's region with overlapping stack SHOULD score 60+ even if some preferred skills are missing. Do not default to 50 just because "some things are missing" — most jobs miss some things. Score what IS there, not what isn't.
 
 Location scoring rules:
 - A job's office is in one of the candidate's preferred_locations (city, state, or region) → score 7–10. Treat US states broadly: e.g. San Francisco, Palo Alto, Mountain View all satisfy "California"; Brooklyn satisfies "New York"; Bellevue/Redmond satisfy "Seattle, WA" or "Washington".
@@ -613,28 +642,131 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
             logger.error(f"LLM call failed: {e}")
             raise  # re-raise so score_all_jobs can record the error
 
+    # ── Disqualifier hallucination guards ─────────────────────────────────────
+    # The 2026-05-10 run showed the cheap fast-tier models (llama-3.1-8b-instant
+    # in particular) hallucinating disqualifiers on 22 of 27 LLM-scored jobs:
+    #   - "Requires a security clearance" on JDs with zero clearance language
+    #   - "Requires more than 4 years of experience" on JDs that say
+    #     "2-4 years preferred" or list YOE in a "nice to have" section
+    #   - "Requires a master's degree" on JDs that say "MS preferred"
+    #   - "Requires on-site relocation with no remote option" on remote-friendly JDs
+    #
+    # Each guard below requires the JD to literally contain the disqualifying
+    # phrase before we trust the LLM. When a guard fires, dims["disqualified"]
+    # is flipped to False AND the LLM-returned zero dimensions are discarded —
+    # we don't trust scores produced by an LLM that misread the JD. The caller
+    # gets a neutral fallback dimension set (see _build_guarded_fallback below)
+    # which lands near the synthetic-score range, signalling "AI flagged this
+    # for review, but the flag wasn't supported by the JD — verify manually."
+    guard_fired_reason: Optional[str] = None
     if dims.get("disqualified"):
-        reason = str(dims.get("disqualify_reason", "unknown disqualifier") or "")
-        # Post-validation: smaller fast-tier models (e.g. llama-3.1-8b-instant)
-        # occasionally hallucinate a "security clearance" disqualifier on JDs that
-        # don't mention one. Require the JD to contain at least one explicit
-        # clearance phrase before trusting it. If unsupported, override to not
-        # disqualified and let the LLM's actual dimension scores apply.
-        job_lower_check = (job.raw_text or "").lower()
+        original_reason = str(dims.get("disqualify_reason", "unknown disqualifier") or "")
+        job_text_lower = (job.raw_text or "").lower()
+        reason_l = original_reason.lower()
+
+        # Guard 1: security clearance
         clearance_phrases = (
             "security clearance", "ts/sci", "top secret", "government clearance",
-            "dod clearance", "itar", "polygraph",
+            "dod clearance", "itar", "polygraph", "active clearance",
         )
-        reason_l = reason.lower()
         if "clearance" in reason_l or "ts/sci" in reason_l or "polygraph" in reason_l:
-            if not any(p in job_lower_check for p in clearance_phrases):
-                logger.warning(
-                    "scorer | hallucinated security-clearance disqualifier suppressed for job={} (JD has no clearance keywords)",
-                    job.id,
+            if not any(p in job_text_lower for p in clearance_phrases):
+                guard_fired_reason = (
+                    f"clearance-hallucination (LLM claimed '{original_reason}' "
+                    "but JD has no clearance keywords)"
                 )
-                dims["disqualified"] = False
-                dims["disqualify_reason"] = ""
-                # Fall through to normal scoring below.
+
+        # Guard 2: YOE — only disqualify if the JD literally specifies a hard
+        # minimum exceeding max_yoe. We accept formats like "5+ years", "5 or more
+        # years", "minimum 5 years", "at least 5 years of". "Preferred"/"plus"
+        # language nearby is NOT a hard minimum.
+        if guard_fired_reason is None and (
+            "year" in reason_l and ("experience" in reason_l or "minimum" in reason_l or "yoe" in reason_l)
+        ):
+            yoe_threshold = int(max_yoe) + 1  # any "X+ years" where X > max_yoe disqualifies
+            yoe_patterns = [
+                rf"\b{yoe_threshold}\s*\+\s*years?\b",
+                rf"\b{yoe_threshold}\s*or more\s*years?\b",
+                rf"minimum\s+(?:of\s+)?{yoe_threshold}\s+years?\b",
+                rf"at\s+least\s+{yoe_threshold}\s+years?\b",
+                rf"\b{yoe_threshold}\s*-\s*\d+\s+years?\s+(?:of\s+)?(?:required|experience\s+required)\b",
+            ]
+            # Also accept any number higher than max_yoe (e.g. "8+ years")
+            any_high_yoe = re.search(
+                rf"\b([5-9]|[1-9]\d)\+\s*years?\s+(?:of\s+)?(?:experience|exp)\b",
+                job_text_lower,
+            )
+            if any_high_yoe:
+                try:
+                    found = int(any_high_yoe.group(1))
+                    if found <= max_yoe:
+                        any_high_yoe = None
+                except (ValueError, IndexError):
+                    pass
+
+            literal_yoe_disqualifier = (
+                any(re.search(p, job_text_lower) for p in yoe_patterns)
+                or any_high_yoe is not None
+            )
+            if not literal_yoe_disqualifier:
+                guard_fired_reason = (
+                    f"yoe-hallucination (LLM claimed '{original_reason}' "
+                    f"but JD does not literally require >{max_yoe} years)"
+                )
+
+        # Guard 3: advanced-degree requirements. The system prompt explicitly
+        # tells the LLM not to disqualify on "MS preferred" or "PhD a plus",
+        # but small models mishandle this regularly.
+        if guard_fired_reason is None and (
+            "master" in reason_l or "phd" in reason_l or "doctorate" in reason_l
+            or "graduate degree" in reason_l
+        ):
+            hard_degree_phrases = (
+                "ms required", "m.s. required", "master's required", "masters required",
+                "master's degree required", "masters degree required",
+                "phd required", "ph.d. required", "doctorate required",
+                "graduate degree required", "advanced degree required",
+                "must have a master", "must have a phd", "must have an ms",
+                "must have a doctorate",
+            )
+            if not any(p in job_text_lower for p in hard_degree_phrases):
+                guard_fired_reason = (
+                    f"degree-hallucination (LLM claimed '{original_reason}' "
+                    "but JD does not literally require a graduate degree)"
+                )
+
+        # Guard 4: on-site / no-remote. The system prompt's strict triggers are
+        # "no remote", "must be on-site only", "relocation required". A literal
+        # match is required.
+        if guard_fired_reason is None and (
+            "on-site" in reason_l or "onsite" in reason_l or "remote" in reason_l
+            or "relocation" in reason_l
+        ):
+            hard_onsite_phrases = (
+                "no remote", "not remote", "fully on-site only", "fully onsite only",
+                "must be on-site", "must be onsite", "must be in office",
+                "must be in-office", "relocation required", "relocation is required",
+                "this role is not remote", "remote not available",
+                "must relocate", "required to relocate",
+            )
+            if not any(p in job_text_lower for p in hard_onsite_phrases):
+                guard_fired_reason = (
+                    f"onsite-hallucination (LLM claimed '{original_reason}' "
+                    "but JD does not literally forbid remote / require relocation)"
+                )
+
+        if guard_fired_reason is not None:
+            logger.warning(
+                "scorer | disqualifier guard fired for job={} — {}; falling back "
+                "to neutral dimension estimate instead of trusting LLM zeros",
+                job.id, guard_fired_reason,
+            )
+            dims["disqualified"] = False
+            dims["disqualify_reason"] = ""
+            # Discard the LLM's dimension scores — when it misread the JD enough
+            # to invent a disqualifier, its dimension scoring is also untrustworthy.
+            dims["__guard_fired"] = True
+            dims["__guard_note"] = guard_fired_reason
 
     if dims.get("disqualified"):
         reason = dims.get("disqualify_reason", "unknown disqualifier")
@@ -651,6 +783,43 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
             "flags": [f"Disqualified — {reason}"],
             "one_liner": f"Disqualified: {reason}",
         }
+
+    # If a hallucination guard fired, override the LLM's (likely zeroed)
+    # dimension scores with a neutral estimate so the job isn't silently
+    # buried at fit_score=0. The estimate uses simple heuristics that don't
+    # need another LLM call:
+    #   - role_fit  : 7 if title contains any preferred title, else 5
+    #   - stack     : 5 + (1 per skill overlap, capped at 9)
+    #   - others    : neutral 5
+    if dims.get("__guard_fired"):
+        target_titles = [t.lower() for t in prefs.get("titles", [])]
+        job_title_l = (job.title or "").lower()
+        title_hit = any(t in job_title_l for t in target_titles if t)
+
+        skills = prefs.get("desired_skills", [])
+        job_text_l = (job.raw_text or "").lower()
+        skill_hits = sum(1 for s in skills if s.lower() in job_text_l)
+
+        fallback = {
+            "role_fit":     7 if title_hit else 5,
+            "stack_match":  max(5, min(9, 5 + skill_hits)),
+            "seniority":    5,
+            "location":     5,
+            "growth":       5,
+            "compensation": 5,
+        }
+        dims.update(fallback)
+        dims["reasons"] = [
+            "AI-flagged disqualifier was not supported by the job description",
+            "Dimension scores fall back to a neutral estimate — please verify manually",
+        ]
+        dims["flags"] = [
+            "Disqualifier override: AI misread JD — manual review recommended",
+        ]
+        dims["one_liner"] = (
+            "AI flagged a disqualifier the JD doesn't support; showing a "
+            "neutral fallback estimate — verify manually."
+        )
 
     # Weighted fit score computed in Python — not by the LLM
     try:

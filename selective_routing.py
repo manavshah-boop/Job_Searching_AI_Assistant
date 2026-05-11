@@ -452,6 +452,13 @@ class SelectiveRouter:
         job_lower = job_text.lower()
         return [s for s in skills if s.lower() in job_lower][:6]
 
+    # Hard cap on synthetic fit_score. Synthetic scores reflect "router thought
+    # this was a plausible match, but no LLM verified it" — they must always
+    # rank below an LLM-evaluated good fit so the user can trust the display
+    # threshold semantics. 55 sits just below the conventional 60 min_display,
+    # signalling "needs manual review or rerun with LLM budget".
+    _SYNTHETIC_FIT_CAP: int = 55
+
     def create_synthetic_score(
         self,
         job: Job,
@@ -461,16 +468,26 @@ class SelectiveRouter:
         title_matched: bool = False,
     ) -> dict[str, Any]:
         """
-        Create a conservative score result when the LLM is skipped.
+        Create a synthetic score for jobs that bypass the LLM.
 
-        Uses routing_score as the primary signal and matched_sections to refine
-        individual dimension scores:
-          - "requirements" matched  → better stack_match estimate
-          - "responsibilities" matched → better seniority estimate
-          - "summary" matched → confirms role_fit signal
+        Two invariants drive the design:
 
-        Dimension scores are intentionally conservative (scaled by 0.85) so that
-        LLM-scored jobs always outrank synthetic ones at equal quality.
+          1. **No static floor.** Previously, location/growth/compensation were
+             hard-coded to neutral 5–6 regardless of routing signal, producing
+             a structural floor of ~22 fit_score even for clearly-unrelated
+             jobs. The 2026-05-10 run had 96% of scored jobs cluster at 22–29
+             because of this. New behavior: every dimension scales with
+             routing_score, so a job with routing_score 0.05 lands in single
+             digits.
+          2. **Capped at SYNTHETIC_FIT_CAP (55).** Even a strong routing match
+             without LLM verification must rank below a true LLM-scored good
+             fit, so display thresholds remain meaningful.
+
+        Matched-section bumps refine specific dimensions:
+          - "requirements" matched  → stack_match lifted
+          - "responsibilities" matched → seniority lifted
+          - "summary" matched → role_fit lifted
+          - title matched (router-level signal) → role_fit + stack lifted
 
         Returns a dict matching score_job()'s return format.
         """
@@ -487,24 +504,55 @@ class SelectiveRouter:
         has_responsibilities = "responsibilities" in matched_sections
         has_summary = "summary" in matched_sections
 
-        # Conservative scale: 0.85 keeps synthetic scores visibly below LLM scores
-        scale = routing_score * 0.85
+        # Direct projection of routing signal — no 0.85 dampening, no static
+        # neutral floor. Bonuses widen the spread between matched-section and
+        # no-section jobs so the user can still see relative ranking inside
+        # the synthetic bucket.
+        scale = routing_score
 
-        # role_fit: lifted slightly if the summary section matched (confirms general fit)
+        # role_fit: small lift if the summary section matched (confirms general fit).
         role_fit_scale = scale * (1.05 if has_summary else 1.0)
-        role_fit = max(0, min(10, round(role_fit_scale * 10)))
 
-        # stack_match: lifted if requirements section matched (skills overlap detected)
-        stack_scale = scale * (1.08 if has_requirements else 0.90)
-        stack_match = max(0, min(10, round(stack_scale * 10)))
+        # stack_match: meaningful spread between "requirements matched" and not.
+        # Widened from 1.08/0.90 → 1.15/0.85 so the test_uses_matched_sections
+        # delta is visible at all routing scores, not just 0.7+.
+        stack_scale = scale * (1.15 if has_requirements else 0.85)
 
-        # seniority: lifted from neutral (5) if responsibilities matched (role context found)
-        seniority = 6 if has_responsibilities else 5
+        # seniority: widened similarly. Was a flat 6-vs-5 jump that ignored
+        # routing signal entirely.
+        seniority_scale = scale * (1.15 if has_responsibilities else 0.85)
 
-        # location / growth / compensation: neutral defaults (cross-encoder can't infer these)
-        location = 6
-        growth = 5
-        compensation = 5
+        # location / growth / compensation: the cross-encoder genuinely can't
+        # infer these. Scale them at a discount (0.70x of routing) — synthetic
+        # score should not invent strong location/comp signals when there is
+        # no actual signal. The previous static 5/5/6 inflated unrelated jobs
+        # by ~25 points purely from these three dimensions.
+        loc_scale = scale * 0.70
+        growth_scale = scale * 0.70
+        comp_scale = scale * 0.70
+
+        # Title-match boost: when the router's title check fired, that's a
+        # strong direct signal — bump role_fit and stack proportionally.
+        if title_matched:
+            role_fit_scale = min(1.0, role_fit_scale + 0.10)
+            stack_scale = min(1.0, stack_scale + 0.05)
+
+        # Tech-overlap boost: every desired_skill found in the JD text is a
+        # direct, verifiable signal that the cross-encoder may have missed.
+        # The previous synthetic path counted these only in `reasons` but
+        # never reflected them in stack_match — so a JD that literally listed
+        # half the candidate's skills could still get stack_match=1. Each hit
+        # lifts stack_scale by 0.04 (max +0.20 from 5 hits).
+        tech_overlap_count = len(self._extract_tech_overlaps(job.raw_text or ""))
+        if tech_overlap_count > 0:
+            stack_scale = min(1.0, stack_scale + 0.04 * tech_overlap_count)
+
+        role_fit     = max(0, min(10, round(role_fit_scale * 10)))
+        stack_match  = max(0, min(10, round(stack_scale * 10)))
+        seniority    = max(0, min(10, round(seniority_scale * 10)))
+        location     = max(0, min(10, round(loc_scale * 10)))
+        growth       = max(0, min(10, round(growth_scale * 10)))
+        compensation = max(0, min(10, round(comp_scale * 10)))
 
         dims: dict[str, int] = {
             "role_fit": role_fit,
@@ -515,9 +563,10 @@ class SelectiveRouter:
             "compensation": compensation,
         }
 
-        fit_score = max(0, min(100, int(
-            sum(dims[k] * weights.get(k, 0) for k in dims) * 10
-        )))
+        # Compute weighted score, then cap at SYNTHETIC_FIT_CAP. The cap is
+        # what makes display-threshold semantics ("≥60 = good") trustworthy.
+        raw_fit = int(sum(dims[k] * weights.get(k, 0) for k in dims) * 10)
+        fit_score = max(0, min(self._SYNTHETIC_FIT_CAP, raw_fit))
         ats_score = self._quick_ats(job)
 
         # Build informative reasons with specific evidence
@@ -559,7 +608,8 @@ class SelectiveRouter:
 
         # Human-readable flags — never expose raw internal field names to the UI
         synthetic_flags: list[str] = [
-            "Fast keyword estimate — not reviewed by AI. Consider a manual check."
+            f"Keyword estimate only — not reviewed by AI. Synthetic scores are "
+            f"capped at {self._SYNTHETIC_FIT_CAP}/100; rerun with LLM budget to verify."
         ]
         if not matched_sections:
             synthetic_flags.append("No strong section matches found in job description")

@@ -162,7 +162,8 @@ def test_create_synthetic_score_conservative():
     result = router.create_synthetic_score(job, routing_score=0.80)
 
     dims = result["dimension_scores"]
-    # At routing_score=0.80, role_fit (0.80 * 0.85 * 10 = 6.8 → 7) + possible summary bonus
+    # routing_score 0.80, no auto-detected sections (build_match_query unset in
+    # tests) → role_fit_value = 0.80 * 1.0 = 0.80 → 8; stack = 0.80 * 0.85 = 7.
     assert dims["role_fit"] <= 8
     assert dims["stack_match"] <= 8
 
@@ -174,6 +175,44 @@ def test_create_synthetic_score_fit_range():
     for score in [0.0, 0.3, 0.5, 0.65, 0.80, 1.0]:
         result = router.create_synthetic_score(job, routing_score=score)
         assert 0 <= result["fit_score"] <= 100
+
+
+def test_create_synthetic_score_capped_below_display_threshold():
+    """
+    Synthetic scores must never reach the display threshold (60) — even at a
+    perfect routing_score of 1.0. This is what makes "fit_score ≥ 60 = good
+    fit" semantics meaningful: those slots are reserved for LLM-verified jobs.
+
+    Prior to the 2026-05-11 fix, the static neutrals (location=6, growth=5,
+    compensation=5) gave synthetic scores a structural floor of ~22 even on
+    unrelated jobs, and routing_score=1.0 could push synthetic past 80 — both
+    bugs broke display-threshold trust.
+    """
+    router = SelectiveRouter(make_config())
+    job = make_job()
+
+    for score in [0.5, 0.7, 0.85, 1.0]:
+        result = router.create_synthetic_score(job, routing_score=score)
+        assert result["fit_score"] <= 55, (
+            f"synthetic fit {result['fit_score']} at routing={score} exceeds the "
+            f"55-cap that keeps display threshold ≥60 trustworthy"
+        )
+
+
+def test_create_synthetic_score_unrelated_job_scores_low():
+    """
+    A job with near-zero routing_score should also score low overall — there
+    must be no static floor inflating unrelated jobs. Pre-fix, the synthetic
+    score for routing=0.10 landed at ~25 because location/growth/compensation
+    were hard-coded to neutral 5–6 regardless of signal.
+    """
+    router = SelectiveRouter(make_config())
+    result = router.create_synthetic_score(make_job(), routing_score=0.05)
+    # All dimensions scale with routing_score now — no neutral floor allowed.
+    assert result["fit_score"] < 15, (
+        f"routing_score 0.05 produced fit_score {result['fit_score']}; "
+        "expected single digits — there should be no static dimension floor"
+    )
 
 
 def test_create_synthetic_score_flag():
@@ -246,7 +285,9 @@ def test_create_synthetic_score_uses_matched_sections():
 
 
 def test_create_synthetic_score_responsibilities_lifts_seniority():
-    """'responsibilities' in matched_sections should lift seniority from 5 to 6."""
+    """'responsibilities' in matched_sections should lift seniority above the
+    no-section baseline. Post-fix: the lift is scale-aware (routing × 1.15 vs
+    routing × 0.85) rather than a flat 6-vs-5 jump that ignored routing signal."""
     router = SelectiveRouter(make_config())
     job = make_job()
     result_no = router.create_synthetic_score(job, 0.70, matched_sections=[])
