@@ -60,18 +60,37 @@ def unwrap_value_objects(data: Any) -> Any:
 
 def parse_llm_response(raw: str) -> dict:
     """
-    Parse a raw LLM text response as JSON.
+    Parse a raw LLM text response as JSON object.
     Strips markdown code fences (```json ... ```) and applies unwrap_value_objects
     so any {"value": x} wrapping is removed regardless of whether the model was
     called via tool-use or plain chat completion.
 
-    Raises json.JSONDecodeError on invalid JSON (caller handles).
+    Some models occasionally return a JSON array (e.g. [{...}]) for an object-
+    typed schema. We unwrap a single-element list to its dict here so callers
+    always get a dict back. Multi-element lists or non-dict payloads raise
+    json.JSONDecodeError so the caller's existing fallback path triggers.
+
+    Raises json.JSONDecodeError on invalid JSON or non-object payload (caller handles).
     """
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
     parsed = json.loads(raw)
-    return unwrap_value_objects(parsed)
+    parsed = unwrap_value_objects(parsed)
+    if isinstance(parsed, list):
+        if len(parsed) == 1 and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+        else:
+            raise json.JSONDecodeError(
+                "LLM returned a JSON array where an object was expected",
+                raw, 0,
+            )
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError(
+            f"LLM returned {type(parsed).__name__} where an object was expected",
+            raw, 0,
+        )
+    return parsed
 
 
 def is_schema_error(exc: Exception) -> bool:
