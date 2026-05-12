@@ -3337,7 +3337,11 @@ def _reimport_resume(slug: str, raw_config: dict[str, Any]) -> tuple[bool, str]:
     try:
         llm_call = get_llm_client(config)
     except SystemExit:
+        # Older revisions of get_llm_client did sys.exit(1) on missing keys.
         return False, "LLM client could not be initialized; check API keys."
+    except Exception as exc:
+        # Current revisions raise ProviderConfigError (a RuntimeError) instead.
+        return False, f"LLM client could not be initialized: {exc}"
     instructor_client = None
     instructor_model = None
     instructor_temperature = None

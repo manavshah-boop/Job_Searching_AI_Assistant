@@ -47,6 +47,14 @@ class RateLimitReached(Exception):
     """Raised when the provider's daily RPD limit is exhausted."""
 
 
+class ProviderConfigError(RuntimeError):
+    """
+    Raised when a provider cannot be initialized (missing API key, unknown
+    provider, missing SDK). Distinct from rate limits so the fallback layer
+    can drop this provider for the rest of the run instead of retrying.
+    """
+
+
 def _resolve_api_key(env_var: str, profile: Optional[str]) -> Optional[str]:
     """Try the profile-suffixed key first, then fall back to the unsuffixed name."""
     if profile:
@@ -130,6 +138,26 @@ class RateLimiter:
 
 # ── LLM client factory ────────────────────────────────────────────────────────
 
+def _require_api_key(env_var: str, profile: Optional[str]) -> str:
+    """
+    Resolve an API key or raise ProviderConfigError.
+
+    Replaces the previous sys.exit(1) on missing keys so the fallback layer
+    can catch and drop the provider instead of killing the worker. The primary
+    provider check at startup happens earlier (main._check_api_key); by the
+    time we hit this code path we are usually building a *fallback* client
+    where a missing key just means "skip this provider, try the next one".
+    """
+    api_key = _resolve_api_key(env_var, profile)
+    if api_key:
+        return api_key
+    names = (
+        f"{env_var}_{profile.upper()} or {env_var}"
+        if profile else env_var
+    )
+    raise ProviderConfigError(f"{names} not set in environment or .env")
+
+
 def get_llm_client(config: Dict[str, Any]) -> LlmCall:
     """
     Returns a callable: (prompt: str, max_tokens: int) -> str
@@ -138,7 +166,9 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
     never knows which backend it's talking to.
 
     SDKs are imported lazily inside each branch so a missing SDK only
-    fails if that provider is actually selected.
+    fails if that provider is actually selected. Missing keys / SDKs /
+    unknown providers raise ProviderConfigError (not sys.exit) so callers
+    that maintain a fallback chain can drop this provider and keep going.
     """
     provider    = config["llm"]["provider"]
     models      = config["llm"]["model"]
@@ -146,12 +176,11 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
     profile     = config.get("_active_profile")
 
     if provider == "anthropic":
-        import anthropic
-        api_key = _resolve_api_key("ANTHROPIC_API_KEY", profile)
-        if not api_key:
-            names = f"ANTHROPIC_API_KEY_{profile.upper()} or ANTHROPIC_API_KEY" if profile else "ANTHROPIC_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            import anthropic
+        except ImportError as exc:
+            raise ProviderConfigError(f"anthropic SDK not installed: {exc}") from exc
+        api_key = _require_api_key("ANTHROPIC_API_KEY", profile)
         client = anthropic.Anthropic(api_key=api_key)
 
         def call_anthropic(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
@@ -172,13 +201,12 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         return call_anthropic
 
     elif provider == "gemini":
-        from google import genai
-        from google.genai import types as genai_types
-        api_key = _resolve_api_key("GEMINI_API_KEY", profile)
-        if not api_key:
-            names = f"GEMINI_API_KEY_{profile.upper()} or GEMINI_API_KEY" if profile else "GEMINI_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            from google import genai
+            from google.genai import types as genai_types
+        except ImportError as exc:
+            raise ProviderConfigError(f"google-genai SDK not installed: {exc}") from exc
+        api_key = _require_api_key("GEMINI_API_KEY", profile)
         client = genai.Client(api_key=api_key)
         gemini_model = models["gemini"]
 
@@ -197,12 +225,11 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         return call_gemini
 
     elif provider == "groq":
-        from groq import Groq
-        api_key = _resolve_api_key("GROQ_API_KEY", profile)
-        if not api_key:
-            names = f"GROQ_API_KEY_{profile.upper()} or GROQ_API_KEY" if profile else "GROQ_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            from groq import Groq
+        except ImportError as exc:
+            raise ProviderConfigError(f"groq SDK not installed: {exc}") from exc
+        api_key = _require_api_key("GROQ_API_KEY", profile)
         client = Groq(api_key=api_key)
 
         def call_groq(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
@@ -217,12 +244,11 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
         return call_groq
 
     elif provider == "openai":
-        from openai import OpenAI
-        api_key = _resolve_api_key("OPENAI_API_KEY", profile)
-        if not api_key:
-            names = f"OPENAI_API_KEY_{profile.upper()} or OPENAI_API_KEY" if profile else "OPENAI_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ProviderConfigError(f"openai SDK not installed: {exc}") from exc
+        api_key = _require_api_key("OPENAI_API_KEY", profile)
         client = OpenAI(api_key=api_key)
 
         def call_openai(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
@@ -236,9 +262,99 @@ def get_llm_client(config: Dict[str, Any]) -> LlmCall:
 
         return call_openai
 
-    else:
-        logger.error(f"Unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
-        sys.exit(1)
+    elif provider == "cerebras":
+        # Cerebras ships an OpenAI-compatible REST API. Prefer the official
+        # cerebras-cloud-sdk when available; fall back to the OpenAI SDK
+        # pointed at api.cerebras.ai so the fallback chain works without
+        # requiring an extra package install.
+        api_key = _require_api_key("CEREBRAS_API_KEY", profile)
+        cerebras_model = models.get("cerebras") or "llama-3.3-70b"
+        try:
+            from cerebras.cloud.sdk import Cerebras  # type: ignore[import-not-found]
+            client = Cerebras(api_key=api_key)
+
+            def call_cerebras(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+                response = client.chat.completions.create(
+                    model=cerebras_model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                usage = getattr(response, "usage", None)
+                tokens = getattr(usage, "total_tokens", 500) if usage else 500
+                return response.choices[0].message.content or "", tokens
+
+            return call_cerebras
+        except ImportError:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise ProviderConfigError(
+                    "Neither cerebras-cloud-sdk nor openai is installed; "
+                    "install one of them to use the cerebras provider"
+                ) from exc
+            client_oa = OpenAI(api_key=api_key, base_url="https://api.cerebras.ai/v1")
+
+            def call_cerebras_openai(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+                response = client_oa.chat.completions.create(
+                    model=cerebras_model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return response.choices[0].message.content or "", response.usage.total_tokens
+
+            return call_cerebras_openai
+
+    elif provider == "openrouter":
+        # OpenRouter is OpenAI-compatible, served at https://openrouter.ai/api/v1.
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ProviderConfigError(f"openai SDK not installed: {exc}") from exc
+        api_key = _require_api_key("OPENROUTER_API_KEY", profile)
+        openrouter_model = models.get("openrouter") or "openrouter/auto"
+        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+
+        def call_openrouter(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+            response = client.chat.completions.create(
+                model=openrouter_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            usage = getattr(response, "usage", None)
+            tokens = getattr(usage, "total_tokens", 500) if usage else 500
+            return response.choices[0].message.content or "", tokens
+
+        return call_openrouter
+
+    elif provider == "mistral":
+        try:
+            from mistralai import Mistral  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ProviderConfigError(f"mistralai SDK not installed: {exc}") from exc
+        api_key = _require_api_key("MISTRAL_API_KEY", profile)
+        mistral_model = models.get("mistral") or "mistral-small-latest"
+        client = Mistral(api_key=api_key)
+
+        def call_mistral(prompt: str, max_tokens: int = 700) -> Tuple[str, int]:
+            response = client.chat.complete(
+                model=mistral_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            usage = getattr(response, "usage", None)
+            tokens = getattr(usage, "total_tokens", 500) if usage else 500
+            return response.choices[0].message.content or "", tokens
+
+        return call_mistral
+
+    raise ProviderConfigError(
+        f"Unknown provider {provider!r}. "
+        "Options: anthropic, gemini, groq, openai, cerebras, openrouter, mistral"
+    )
 
 
 # ── Instructor client factory (for structured outputs) ────────────────────────
@@ -259,57 +375,60 @@ def get_instructor_client(config: Dict[str, Any]) -> Tuple[Any, str, float]:
     profile     = config.get("_active_profile")
 
     if provider == "anthropic":
-        import anthropic
-        import instructor
-        api_key = _resolve_api_key("ANTHROPIC_API_KEY", profile)
-        if not api_key:
-            names = f"ANTHROPIC_API_KEY_{profile.upper()} or ANTHROPIC_API_KEY" if profile else "ANTHROPIC_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            import anthropic
+            import instructor
+        except ImportError as exc:
+            raise ProviderConfigError(f"anthropic/instructor SDK not installed: {exc}") from exc
+        api_key = _require_api_key("ANTHROPIC_API_KEY", profile)
         client = anthropic.Anthropic(api_key=api_key)
         client = instructor.from_anthropic(client)
         return client, models["anthropic"], temperature
 
     elif provider == "gemini":
-        from google import genai
-        import instructor
-        api_key = _resolve_api_key("GEMINI_API_KEY", profile)
-        if not api_key:
-            names = f"GEMINI_API_KEY_{profile.upper()} or GEMINI_API_KEY" if profile else "GEMINI_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
-        client = genai.Client(api_key=api_key)
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise ProviderConfigError(f"google-genai SDK not installed: {exc}") from exc
+        api_key = _require_api_key("GEMINI_API_KEY", profile)
+        _ = genai.Client(api_key=api_key)  # validate key/SDK
         # Gemini doesn't have direct instructor support yet, so we use raw client
         # Fall back to get_llm_client for gemini
         return None, models["gemini"], temperature
 
     elif provider == "groq":
-        from groq import Groq
-        import instructor
-        api_key = _resolve_api_key("GROQ_API_KEY", profile)
-        if not api_key:
-            names = f"GROQ_API_KEY_{profile.upper()} or GROQ_API_KEY" if profile else "GROQ_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            from groq import Groq
+            import instructor
+        except ImportError as exc:
+            raise ProviderConfigError(f"groq/instructor SDK not installed: {exc}") from exc
+        api_key = _require_api_key("GROQ_API_KEY", profile)
         client = Groq(api_key=api_key)
         client = instructor.from_groq(client)
         return client, models["groq"], temperature
 
     elif provider == "openai":
-        from openai import OpenAI
-        import instructor
-        api_key = _resolve_api_key("OPENAI_API_KEY", profile)
-        if not api_key:
-            names = f"OPENAI_API_KEY_{profile.upper()} or OPENAI_API_KEY" if profile else "OPENAI_API_KEY"
-            logger.error("%s not set in environment or .env", names)
-            sys.exit(1)
+        try:
+            from openai import OpenAI
+            import instructor
+        except ImportError as exc:
+            raise ProviderConfigError(f"openai/instructor SDK not installed: {exc}") from exc
+        api_key = _require_api_key("OPENAI_API_KEY", profile)
         client = OpenAI(api_key=api_key)
         client = instructor.from_openai(client)
         return client, models["openai"], temperature
 
-    else:
-        logger.error(f"Unknown provider '{provider}'. Options: anthropic, gemini, groq, openai")
-        sys.exit(1)
+    # Cerebras / OpenRouter / Mistral are reached only via the fallback chain;
+    # they don't support instructor's structured-output mode yet, so we return
+    # (None, model, temperature) and the caller falls through to the raw LLM
+    # path with JSON parsing (parse_llm_response handles {"value": x} wrapping).
+    elif provider in ("cerebras", "openrouter", "mistral"):
+        return None, models.get(provider, ""), temperature
+
+    raise ProviderConfigError(
+        f"Unknown provider {provider!r}. "
+        "Options: anthropic, gemini, groq, openai, cerebras, openrouter, mistral"
+    )
 
 
 # ── 1. Keyword pre-score ──────────────────────────────────────────────────────
@@ -691,18 +810,23 @@ Return only valid JSON. No markdown fences. No preamble. No explanation.
                 rf"at\s+least\s+{yoe_threshold}\s+years?\b",
                 rf"\b{yoe_threshold}\s*-\s*\d+\s+years?\s+(?:of\s+)?(?:required|experience\s+required)\b",
             ]
-            # Also accept any number higher than max_yoe (e.g. "8+ years")
-            any_high_yoe = re.search(
-                rf"\b([5-9]|[1-9]\d)\+\s*years?\s+(?:of\s+)?(?:experience|exp)\b",
+            # Catch-all: ANY "N+ years of experience" where N > max_yoe disqualifies.
+            # Previously this was a hard-coded \b([5-9]|[1-9]\d)\+ pattern, which
+            # silently failed for intern profiles (max_yoe=2) where "3+ years"
+            # should disqualify but the regex required the leading digit to be 5–9.
+            # Sweep ALL "N+ years" matches and let the >max_yoe check filter them.
+            any_high_yoe = None
+            for match in re.finditer(
+                r"\b(\d{1,2})\s*\+\s*years?\s+(?:of\s+)?(?:experience|exp)\b",
                 job_text_lower,
-            )
-            if any_high_yoe:
+            ):
                 try:
-                    found = int(any_high_yoe.group(1))
-                    if found <= max_yoe:
-                        any_high_yoe = None
+                    found = int(match.group(1))
                 except (ValueError, IndexError):
-                    pass
+                    continue
+                if found > max_yoe:
+                    any_high_yoe = match
+                    break
 
             literal_yoe_disqualifier = (
                 any(re.search(p, job_text_lower) for p in yoe_patterns)
@@ -1057,7 +1181,23 @@ def score_all_jobs(config: Dict[str, Any], yes: bool = False, profile: Optional[
         )
 
         # Initialize per-run provider budget when rate_limit_budget is configured.
+        # When fallback_chain is configured WITHOUT rate_limit_budget (which
+        # silently disabled the fallback in the 2026-05-11 run), build a
+        # permissive default so the fallback chain is still wired up. Without
+        # this, every 429 from the primary provider kills the job instead of
+        # rolling to the next provider.
         budget_cfg = config.get("routing", {}).get("rate_limit_budget")
+        fallback_chain = config.get("routing", {}).get("fallback_chain") or []
+        if not budget_cfg and fallback_chain:
+            budget_cfg = {
+                p: {"max_requests_per_run": 999_999, "max_tokens_per_run": 999_999_999}
+                for p in fallback_chain
+            }
+            logger.warning(
+                "routing | fallback_chain set without rate_limit_budget — "
+                "using permissive defaults so 429s roll over to the next provider. "
+                "Add a rate_limit_budget block to cap per-provider spend.",
+            )
         if budget_cfg:
             _provider_budget = ProviderBudget(budget_cfg)
             logger.info(

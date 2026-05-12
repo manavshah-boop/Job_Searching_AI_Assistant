@@ -77,13 +77,46 @@ def _release_lock(profile: str) -> None:
 
 
 def _write_progress(profile: str, tracker: ProgressTracker) -> None:
+    """
+    Atomically write the live progress JSON.
+
+    On Windows, os.replace() can fail with PermissionError / WinError 5 when the
+    dashboard reader has the destination open. Retry a few times with a small
+    backoff before giving up — losing one progress tick is fine, dropping every
+    tick (as the 2026-05-03 manav run did) leaves the dashboard frozen.
+    """
     path = _progress_path(profile)
     tmp = path.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(tracker.to_dict(), indent=2), encoding="utf-8")
-        os.replace(tmp, path)
     except Exception as exc:
-        logger.warning("Could not write progress JSON: {}", exc)
+        logger.warning("Could not write progress tmp file: {}", exc)
+        return
+
+    last_exc: Exception | None = None
+    for delay in (0.0, 0.05, 0.15, 0.4):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            continue
+        except OSError as exc:
+            # Windows reports the dashboard-held-handle case as WinError 5
+            # (Access is denied) which surfaces as OSError, not PermissionError.
+            if getattr(exc, "winerror", None) in (5, 32):
+                last_exc = exc
+                continue
+            logger.warning("Could not replace progress JSON: {}", exc)
+            return
+    logger.warning("Could not write progress JSON after retries: {}", last_exc)
+    # Best-effort: drop the tmp file so it doesn't accumulate.
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _write_status(

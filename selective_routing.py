@@ -213,26 +213,46 @@ class SelectiveRouter:
 
     # ── Match query ───────────────────────────────────────────────────────────
 
+    # BGE-reranker-base was trained on short MS-MARCO-style queries (typically
+    # <30 tokens). The 2026-05-11 run used reranker.build_profile_match_query —
+    # a paragraph-long profile descriptor — which caused every (query, JD) pair
+    # to tokenize past the 512-token window with the JD half truncated to
+    # nothing meaningful. Result: 328/362 jobs scored exactly 0.500 (sigmoid(0)).
+    # The router needs a focused recall-pass query; the reranker keeps its own
+    # longer query for the precision pass.
+    _ROUTER_QUERY_MAX_CHARS = 240
+
     def build_match_query(self) -> str:
-        """Build the profile query used to score each job via cross-encoder."""
-        try:
-            from reranker import build_profile_match_query
-            query = build_profile_match_query(self._config)
-        except Exception as exc:
-            logger.warning("selective_routing | build_match_query failed ({}), using fallback", exc)
-            prefs = self._config.get("preferences", {})
-            titles = prefs.get("titles", [])
-            skills = prefs.get("desired_skills", [])
-            parts: list[str] = []
-            if titles:
-                parts.append(f"Looking for: {', '.join(titles[:4])}")
-            if skills:
-                parts.append(f"Skills: {', '.join(skills[:8])}")
-            query = ". ".join(parts) or "software engineer"
+        """
+        Build a SHORT focused query for the cross-encoder router.
+
+        Format: "Looking for: <title1>, <title2>. Skills: <skill1>, <skill2>, ..."
+        Capped at ~240 chars so the 512-token window has room for the JD.
+        """
+        prefs = self._config.get("preferences", {})
+        titles = [t for t in prefs.get("titles", []) if t]
+        skills = [s for s in prefs.get("desired_skills", []) if s]
+
+        parts: list[str] = []
+        if titles:
+            parts.append(f"Looking for: {', '.join(titles[:4])}")
+        if skills:
+            parts.append(f"Skills: {', '.join(skills[:8])}")
+        query = ". ".join(parts) or "software engineer"
+
+        if len(query) > self._ROUTER_QUERY_MAX_CHARS:
+            query = query[: self._ROUTER_QUERY_MAX_CHARS].rsplit(",", 1)[0].strip()
+
         self._match_query = query
         return query
 
     # ── Routing score ─────────────────────────────────────────────────────────
+
+    # Flat post-sigmoid clusters (|score - 0.5| < 0.005 across the first ~20
+    # jobs) almost always indicate a misconfigured cross-encoder. We warn ONCE
+    # per run when this pattern is detected so future drift is caught early.
+    _FLAT_SCORE_WARN_THRESHOLD = 0.005
+    _FLAT_SCORE_WARN_SAMPLE = 20
 
     def compute_routing_score(self, job: Job, match_query: str) -> float:
         """
@@ -252,7 +272,8 @@ class SelectiveRouter:
                 [(match_query, truncated)],
                 show_progress_bar=False,
             )
-            score = round(float(_sigmoid(float(raw_scores[0]))), 4)
+            raw_logit = float(raw_scores[0])
+            score = round(float(_sigmoid(raw_logit)), 4)
         except Exception as exc:
             logger.warning(
                 "selective_routing | cross-encoder failed for job={} ({}), defaulting to 0.5",
@@ -261,10 +282,32 @@ class SelectiveRouter:
             self._counts["error"] += 1
             return 0.5  # fail-open: uncertain jobs go to LLM
 
+        # Track the first N raw logits so we can detect a misconfigured encoder.
+        if not hasattr(self, "_recent_raw_logits"):
+            self._recent_raw_logits = []
+            self._flat_score_warned = False
+        if len(self._recent_raw_logits) < self._FLAT_SCORE_WARN_SAMPLE:
+            self._recent_raw_logits.append(raw_logit)
+            if (
+                len(self._recent_raw_logits) == self._FLAT_SCORE_WARN_SAMPLE
+                and not self._flat_score_warned
+            ):
+                spread = max(self._recent_raw_logits) - min(self._recent_raw_logits)
+                if spread < (self._FLAT_SCORE_WARN_THRESHOLD * 2):
+                    logger.warning(
+                        "selective_routing | cross-encoder produced flat scores "
+                        "across first {} jobs (logit spread={:.4f}). "
+                        "Routing is effectively disabled — check that match_query "
+                        "fits in the model's input window and that the model output "
+                        "isn't already a probability.",
+                        self._FLAT_SCORE_WARN_SAMPLE, spread,
+                    )
+                    self._flat_score_warned = True
+
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
         logger.debug(
-            "selective_routing | job={} score={:.3f} latency_ms={}",
-            job.id, score, latency_ms,
+            "selective_routing | job={} score={:.3f} raw_logit={:.4f} latency_ms={}",
+            job.id, score, raw_logit, latency_ms,
         )
         return score
 

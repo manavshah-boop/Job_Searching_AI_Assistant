@@ -182,19 +182,19 @@ def get_or_discover_slugs(config: dict, profile: Optional[str] = None) -> dict:
     wl_all    = wl_priority    + [s for s in wl_cached    if s not in wl_priority]
 
     logger.info(
-        "[greenhouse] %d companies (%d priority, %d cached)",
+        "[greenhouse] {} companies ({} priority, {} cached)",
         len(gh_all), len(gh_priority), len(gh_cached),
     )
     logger.info(
-        "[lever] %d companies (%d priority, %d cached)",
+        "[lever] {} companies ({} priority, {} cached)",
         len(lv_all), len(lv_priority), len(lv_cached),
     )
     logger.info(
-        "[ashby] %d companies (%d priority, %d cached)",
+        "[ashby] {} companies ({} priority, {} cached)",
         len(ashby_all), len(ashby_priority), len(ashby_cached),
     )
     logger.info(
-        "[workable] %d companies (%d priority, %d cached)",
+        "[workable] {} companies ({} priority, {} cached)",
         len(wl_all), len(wl_priority), len(wl_cached),
     )
 

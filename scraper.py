@@ -93,7 +93,7 @@ def _get_with_retry(
                 raise
             backoff = min(base_backoff * (2 ** (attempt - 1)), max_backoff)
             logger.warning(
-                "GET %s attempt %d/%d failed (%s) — retrying in %.1fs",
+                "GET {} attempt {}/{} failed ({}) — retrying in {:.1f}s",
                 url, attempt, max_attempts, exc, backoff,
             )
             _sleep(backoff)
@@ -103,7 +103,7 @@ def _get_with_retry(
 
         if status == 429:
             if attempt >= max_attempts:
-                logger.warning("GET %s — HTTP 429 after %d attempts, giving up", url, attempt)
+                logger.warning("GET {} — HTTP 429 after {} attempts, giving up", url, attempt)
                 return response
             retry_after = _parse_retry_after(response.headers.get("Retry-After"))
             if retry_after is not None:
@@ -114,7 +114,7 @@ def _get_with_retry(
                 backoff = min(base_backoff * (2 ** attempt), max_backoff)
                 reason = "no Retry-After"
             logger.warning(
-                "GET %s — HTTP 429 (%s) attempt %d/%d, retrying in %.1fs",
+                "GET {} — HTTP 429 ({}) attempt {}/{}, retrying in {:.1f}s",
                 url, reason, attempt, max_attempts, backoff,
             )
             _sleep(backoff)
@@ -122,11 +122,11 @@ def _get_with_retry(
 
         if 500 <= status < 600:
             if attempt >= max_attempts:
-                logger.warning("GET %s — HTTP %d after %d attempts, giving up", url, status, attempt)
+                logger.warning("GET {} — HTTP {} after {} attempts, giving up", url, status, attempt)
                 return response
             backoff = min(base_backoff * (2 ** (attempt - 1)), max_backoff)
             logger.warning(
-                "GET %s — HTTP %d attempt %d/%d, retrying in %.1fs",
+                "GET {} — HTTP {} attempt {}/{}, retrying in {:.1f}s",
                 url, status, attempt, max_attempts, backoff,
             )
             _sleep(backoff)
@@ -441,7 +441,7 @@ def _truncate_with_log(text: str, max_chars: int, job_id: Optional[str] = None) 
     truncated = extract_job_context(text, max_chars=max_chars)
     if text and len(truncated) < len(text):
         logger.debug(
-            "description truncated | job_id=%s | %d -> %d chars",
+            "description truncated | job_id={} | {} -> {} chars",
             job_id or "?",
             len(text),
             len(truncated),
@@ -617,7 +617,7 @@ def passes_filters(
             pass  # explicit US mention
         else:
             if debug:
-                logger.debug("[SKIP] no US/remote signal in HN post | %s", title)
+                logger.debug("[SKIP] no US/remote signal in HN post | {}", title)
             return False, "non_us_location"
 
     return True, ""
@@ -642,9 +642,9 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
     jobs_filtered = 0
     errors = []
 
-    logger.info("Scraping %s Greenhouse companies...", len(companies))
-    logger.info("Looking for: %s", ", ".join(preferred_titles))
-    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+    logger.info("Scraping {} Greenhouse companies...", len(companies))
+    logger.info("Looking for: {}", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: {}", ", ".join(hard_no_keywords))
 
     for company_slug in companies:
         companies_checked += 1
@@ -689,13 +689,13 @@ def scrape_greenhouse(config: Dict[str, Any], slugs: Optional[List[str]] = None,
                 # HIGH-3: also drop rows with empty title or URL — both are required
                 # downstream (title filtering, dashboard click-through).
                 if raw_id in (None, "", 0):
-                    logger.warning("greenhouse | %s skipped row with missing id", company_slug)
+                    logger.warning("greenhouse | {} skipped row with missing id", company_slug)
                     continue
                 if not title:
-                    logger.warning("greenhouse | %s skipped row id=%s with empty title", company_slug, raw_id)
+                    logger.warning("greenhouse | {} skipped row id={} with empty title", company_slug, raw_id)
                     continue
                 if not url:
-                    logger.warning("greenhouse | %s skipped row id=%s with empty url", company_slug, raw_id)
+                    logger.warning("greenhouse | {} skipped row id={} with empty url", company_slug, raw_id)
                     continue
 
                 # Skip if title doesn't match
@@ -751,16 +751,16 @@ Description:
                     company_new_count += 1
 
             status = "[+]" if company_new_count > 0 else "[-]"
-            logger.info("%s %s -> %d new jobs", status, company_slug, company_new_count)
+            logger.info("{} {} -> {} new jobs", status, company_slug, company_new_count)
 
         except Exception as e:
             errors.append(f"[!] {company_slug}: {str(e)}")
-            logger.error("%s %s -> ERROR: %s", "[!]", company_slug, str(e))
+            logger.error("{} {} -> ERROR: {}", "[!]", company_slug, str(e))
 
-    logger.info("Greenhouse companies checked: %d", companies_checked)
-    logger.info("New jobs saved: %d", new_jobs_saved)
+    logger.info("Greenhouse companies checked: {}", companies_checked)
+    logger.info("New jobs saved: {}", new_jobs_saved)
     if errors:
-        logger.warning("Errors (%d):", len(errors))
+        logger.warning("Errors ({}):", len(errors))
         for error in errors:
             logger.warning(error)
 
@@ -795,9 +795,9 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
     jobs_filtered = 0
     errors = []
 
-    logger.info("Scraping %s Lever companies...", len(companies))
-    logger.info("Looking for: %s", ", ".join(preferred_titles))
-    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+    logger.info("Scraping {} Lever companies...", len(companies))
+    logger.info("Looking for: {}", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: {}", ", ".join(hard_no_keywords))
 
     max_age = timedelta(days=_configured_max_job_age_days(config))
 
@@ -833,13 +833,13 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                 # HIGH-1/3: skip rows with missing required fields rather than
                 # crashing the whole company scrape on a KeyError.
                 if raw_id in (None, "", 0):
-                    logger.warning("lever | %s skipped row with missing id", slug)
+                    logger.warning("lever | {} skipped row with missing id", slug)
                     continue
                 if not title:
-                    logger.warning("lever | %s skipped row id=%s with empty title", slug, raw_id)
+                    logger.warning("lever | {} skipped row id={} with empty title", slug, raw_id)
                     continue
                 if not url:
-                    logger.warning("lever | %s skipped row id=%s with empty url", slug, raw_id)
+                    logger.warning("lever | {} skipped row id={} with empty url", slug, raw_id)
                     continue
 
                 # Skip if title doesn't match
@@ -908,16 +908,16 @@ def scrape_lever(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     company_new_count += 1
 
             status = "[+]" if company_new_count > 0 else "[-]"
-            logger.info("%s %s -> %d new jobs", status, slug, company_new_count)
+            logger.info("{} {} -> {} new jobs", status, slug, company_new_count)
 
         except Exception as e:
             errors.append(f"[!] {slug}: {str(e)}")
-            logger.error("%s %s -> ERROR: %s", "[!]", slug, str(e))
+            logger.error("{} {} -> ERROR: {}", "[!]", slug, str(e))
 
-    logger.info("Lever companies checked: %d", companies_checked)
-    logger.info("New jobs saved: %d", new_jobs_saved)
+    logger.info("Lever companies checked: {}", companies_checked)
+    logger.info("New jobs saved: {}", new_jobs_saved)
     if errors:
-        logger.warning("Errors (%d):", len(errors))
+        logger.warning("Errors ({}):", len(errors))
         for error in errors:
             logger.warning(error)
 
@@ -957,8 +957,8 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
     errors = []
 
     logger.info("Scraping HN Who's Hiring...")
-    logger.info("Looking for: %s", ", ".join(preferred_titles))
-    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+    logger.info("Looking for: {}", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: {}", ", ".join(hard_no_keywords))
 
     try:
         with httpx.Client(timeout=10.0) as client:
@@ -1008,8 +1008,8 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             thread_id = thread['objectID']
             thread_title = thread['title']
 
-            logger.info("Found thread: %s", thread_title)
-            logger.info("Thread ID: %s", thread_id)
+            logger.info("Found thread: {}", thread_title)
+            logger.info("Thread ID: {}", thread_id)
 
             # Step 2: Fetch top-level comments using HN Firebase API
             hn_api_base = "https://hacker-news.firebaseio.com/v0"
@@ -1031,13 +1031,13 @@ def scrape_hn(config: Dict[str, Any], profile: Optional[str] = None) -> Dict[str
             thread_data = response.json()
             comment_ids = thread_data.get('kids', [])
 
-            logger.info("Found %d top-level comments", len(comment_ids))
+            logger.info("Found {} top-level comments", len(comment_ids))
 
             # MED-9: warn when the configured cap drops posts. Default cap is 100;
             # threads near the end of the month frequently exceed it.
             if len(comment_ids) > max_comments:
                 logger.warning(
-                    "HN cap hit: thread has %d comments, processing first %d "
+                    "HN cap hit: thread has {} comments, processing first {} "
                     "(set sources.hn.max_comments to raise the cap)",
                     len(comment_ids),
                     max_comments,
@@ -1111,17 +1111,17 @@ Thread: {thread_title}
                 ), profile=profile):
                     new_jobs_saved += 1
 
-        logger.info("Saved %d new HN jobs", new_jobs_saved)
+        logger.info("Saved {} new HN jobs", new_jobs_saved)
 
     except Exception as e:
         errors.append(f"[!] HN scraping error: {str(e)}")
-        logger.error("HN scraping error: %s", e)
+        logger.error("HN scraping error: {}", e)
 
     # Summary
-    logger.info("Thread found: %s", 'Yes' if not errors else 'No')
-    logger.info("New jobs saved: %d", new_jobs_saved)
+    logger.info("Thread found: {}", 'Yes' if not errors else 'No')
+    logger.info("New jobs saved: {}", new_jobs_saved)
     if errors:
-        logger.warning("Errors (%d):", len(errors))
+        logger.warning("Errors ({}):", len(errors))
         for error in errors:
             logger.warning(error)
 
@@ -1216,9 +1216,9 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
     jobs_filtered = 0
     errors = []
 
-    logger.info("Scraping %s Ashby companies...", len(companies))
-    logger.info("Looking for: %s", ", ".join(preferred_titles))
-    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+    logger.info("Scraping {} Ashby companies...", len(companies))
+    logger.info("Looking for: {}", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: {}", ", ".join(hard_no_keywords))
 
     max_age = timedelta(days=max_job_age_days)
 
@@ -1251,10 +1251,10 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
 
                 # HIGH-3: skip rows missing title or URL — both are required downstream.
                 if not title:
-                    logger.warning("ashby | %s skipped row with empty title", resolved_slug)
+                    logger.warning("ashby | {} skipped row with empty title", resolved_slug)
                     continue
                 if not job_url:
-                    logger.warning("ashby | %s skipped row title=%r with empty url", resolved_slug, title)
+                    logger.warning("ashby | {} skipped row title={!r} with empty url", resolved_slug, title)
                     continue
 
                 if not title_matches(title, preferred_titles):
@@ -1306,16 +1306,16 @@ def scrape_ashby(config: Dict[str, Any], slugs: Optional[List[str]] = None, prof
                     company_new_count += 1
 
             status = "[+]" if company_new_count > 0 else "[-]"
-            logger.info("%s %s -> %d new jobs", status, company_slug, company_new_count)
+            logger.info("{} {} -> {} new jobs", status, company_slug, company_new_count)
 
         except Exception as e:
             errors.append(f"[!] {company_slug}: {str(e)}")
-            logger.error("%s %s -> ERROR: %s", "[!]", company_slug, str(e))
+            logger.error("{} {} -> ERROR: {}", "[!]", company_slug, str(e))
 
-    logger.info("Ashby companies checked: %d", companies_checked)
-    logger.info("New jobs saved: %d", new_jobs_saved)
+    logger.info("Ashby companies checked: {}", companies_checked)
+    logger.info("New jobs saved: {}", new_jobs_saved)
     if errors:
-        logger.warning("Errors (%d):", len(errors))
+        logger.warning("Errors ({}):", len(errors))
         for error in errors:
             logger.warning(error)
 
@@ -1415,9 +1415,9 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
     jobs_filtered = 0
     errors = []
 
-    logger.info("Scraping %s Workable companies...", len(companies))
-    logger.info("Looking for: %s", ", ".join(preferred_titles))
-    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+    logger.info("Scraping {} Workable companies...", len(companies))
+    logger.info("Looking for: {}", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: {}", ", ".join(hard_no_keywords))
 
     for slug in companies:
         companies_checked += 1
@@ -1451,10 +1451,10 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
 
                 # HIGH-3: skip rows missing required title or URL.
                 if not title:
-                    logger.warning("workable | %s skipped row with empty title", slug)
+                    logger.warning("workable | {} skipped row with empty title", slug)
                     continue
                 if not job_url:
-                    logger.warning("workable | %s skipped row title=%r with empty url", slug, title)
+                    logger.warning("workable | {} skipped row title={!r} with empty url", slug, title)
                     continue
 
                 if not title_matches(title, preferred_titles):
@@ -1509,16 +1509,16 @@ def scrape_workable(config: Dict[str, Any], slugs: Optional[List[str]] = None, p
                     company_new_count += 1
 
             status = "[+]" if company_new_count > 0 else "[-]"
-            logger.info("%s %s -> %d new jobs", status, slug, company_new_count)
+            logger.info("{} {} -> {} new jobs", status, slug, company_new_count)
 
         except Exception as e:
             errors.append(f"[!] {slug}: {str(e)}")
-            logger.error("%s %s -> ERROR: %s", "[!]", slug, str(e))
+            logger.error("{} {} -> ERROR: {}", "[!]", slug, str(e))
 
-    logger.info("Workable companies checked: %d", companies_checked)
-    logger.info("New jobs saved: %d", new_jobs_saved)
+    logger.info("Workable companies checked: {}", companies_checked)
+    logger.info("New jobs saved: {}", new_jobs_saved)
     if errors:
-        logger.warning("Errors (%d):", len(errors))
+        logger.warning("Errors ({}):", len(errors))
         for error in errors:
             logger.warning(error)
 
@@ -1582,8 +1582,8 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
     errors = []
 
     logger.info("Scraping Himalayas remote jobs...")
-    logger.info("Looking for: %s", ", ".join(preferred_titles))
-    logger.info("Hard no keywords: %s", ", ".join(hard_no_keywords))
+    logger.info("Looking for: {}", ", ".join(preferred_titles))
+    logger.info("Hard no keywords: {}", ", ".join(hard_no_keywords))
 
     try:
         with httpx.Client(timeout=10.0) as client:
@@ -1601,7 +1601,7 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
 
         data = response.json()
         postings = data.get("jobs", [])
-        logger.info("Himalayas: %d jobs returned", len(postings))
+        logger.info("Himalayas: {} jobs returned", len(postings))
 
         for posting in postings:
             if _is_posted_at_older_than(posting.get("pubDate"), max_age):
@@ -1617,7 +1617,7 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
                 logger.warning("himalayas | skipped row with empty title")
                 continue
             if not job_url:
-                logger.warning("himalayas | skipped row title=%r with empty url", title)
+                logger.warning("himalayas | skipped row title={!r} with empty url", title)
                 continue
 
             if not title_matches(title, preferred_titles):
@@ -1673,11 +1673,11 @@ def scrape_himalayas(config: Dict[str, Any], profile: Optional[str] = None) -> D
 
     except Exception as e:
         errors.append(f"[!] Himalayas: {str(e)}")
-        logger.error("Himalayas scraping error: %s", e)
+        logger.error("Himalayas scraping error: {}", e)
 
-    logger.info("New Himalayas jobs saved: %d", new_jobs_saved)
+    logger.info("New Himalayas jobs saved: {}", new_jobs_saved)
     if errors:
-        logger.warning("Errors (%d):", len(errors))
+        logger.warning("Errors ({}):", len(errors))
         for error in errors:
             logger.warning(error)
 
